@@ -1,0 +1,62 @@
+[project]
+name = "pokemon-tcg-ai-battle"
+version = "0.1.0"
+description = "ポケモンカードゲーム AI エージェント (Kaggle PTCG AI Battle Challenge Simulation)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # 数値計算・データハンドリング
+    "numpy>=1.26",
+    "pandas>=2.2",
+    # Kaggle（対戦環境 / CLI）
+    "kaggle-environments>=1.32",
+    "kaggle>=1.7",
+    # 可視化
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    # Notebook / 進捗
+    "jupyterlab>=4.0",
+    "ipykernel>=6.29",
+    "ipywidgets>=8.1",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
+# RL 学習用
+rl = [
+    # PyTorch (CUDA 12.6 対応 wheel)
+    "torch>=2.7",
+    # 強化学習フレームワーク
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.4",
+    "sb3-contrib>=2.4",
+    # 学習ログ可視化
+    "tensorboard>=2.18",
+]
+
+[tool.uv]
+default-groups = ["dev", "rl"]
+environments = [
+    "sys_platform == 'linux' and python_version == '3.12'",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

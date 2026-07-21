@@ -1,0 +1,9 @@
+{
+  "features": {
+    "ghcr.io/atsushi11o7/devcontainer-features/base-utils:2": {
+      "version": "2.0.0",
+      "resolved": "ghcr.io/atsushi11o7/devcontainer-features/base-utils@sha256:f270d2c90091be15e172498724c28d7239a3e5e4c497a35cd15be32e28af685d",
+      "integrity": "sha256:f270d2c90091be15e172498724c28d7239a3e5e4c497a35cd15be32e28af685d"
+    }
+  }
+}

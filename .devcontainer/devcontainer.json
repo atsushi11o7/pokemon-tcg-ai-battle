@@ -1,0 +1,42 @@
+{
+  "name": "pokemon-tcg-ai-battle",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/atsushi11o7/devcontainer-features/base-utils:2": {
+      "locale": "C.UTF-8",
+      "timezone": "Asia/Tokyo"
+    }
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": [
+    "--gpus", "all",
+    "--shm-size=8gb",
+    "--env-file", "${localWorkspaceFolder}/.env"
+  ],
+  "mounts": [
+    "source=claude-config,target=/root/.claude,type=volume"
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/root/.claude",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "python.defaultInterpreterPath": "/opt/venv/bin/python"
+      }
+    }
+  },
+  "remoteUser": "root"
+}
