@@ -9,3 +9,6 @@ data/
 outputs/
 results/
 docs/
+
+*.tar.gz
+submission/**/cg/
