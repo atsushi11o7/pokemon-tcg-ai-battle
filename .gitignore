@@ -11,4 +11,4 @@ results/
 docs/
 
 *.tar.gz
-submission/**/cg/
+submission/
