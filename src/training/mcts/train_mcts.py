@@ -1,18 +1,17 @@
 """Determinized MCTSの自己対戦(selfplay.py)で集めたデータで、価値・方策ネットワークを学習する。
 
 自己対戦→学習→(更新したネットワークで)自己対戦、を繰り返すAlphaZero的なループ。
-BCの学習済み重みを初期値として使うが(`network.new_network_from_bc`)、1ラウンド目から
-方策・価値の両方をこの自己対戦ループ自身が更新していく(BCの重みは出発点に過ぎず、
-凍結したpriorとして使い続けるわけではない)。
+ネットワークは完全ランダム初期化から開始する。
 
 Usage:
     uv run python src/training/mcts/train_mcts.py
 """
 
+import copy
+import random
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader, Dataset
@@ -20,23 +19,47 @@ from torch.utils.data import DataLoader, Dataset
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from network import PolicyValueNet, new_network_from_bc  # noqa: E402
-from selfplay import Sample, play_selfplay_game  # noqa: E402
+from determinize import (  # noqa: E402
+    load_opponent_deck_pool,
+    sample_opponent_active_guess,
+    sample_opponent_hidden,
+    sample_own_hidden,
+)
+from network import PolicyValueNet, SparseBatch  # noqa: E402
+from search import run_mcts  # noqa: E402
+from selfplay import Sample, make_eval_fn, play_selfplay_game  # noqa: E402
 
-sys.path.insert(0, str(ROOT / "src" / "training" / "bc"))
-from features import OPTION_DIM, STATE_DIM  # noqa: E402
-from train_bc import HIDDEN_DIM  # noqa: E402
+sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
+from cg.api import (  # noqa: E402
+    Observation,
+    SelectType,
+    search_begin,
+    search_end,
+    to_observation_class,
+)
+
+sys.path.insert(0, str(ROOT / "src" / "evaluation"))
+from match_runner import evaluate as match_evaluate  # noqa: E402
 
 DECK_PATH = ROOT / "submission" / "01_rule_based" / "deck.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 
-GAMES_PER_ROUND = 20
-N_ROUNDS = 3
+GAMES_PER_ROUND = 200  # Transformerはdense MLP版より1試合あたり約4倍遅い(実測2.2秒/試合)ため縮小
+N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
 SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数
-EPOCHS_PER_ROUND = 5
+EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 SEED = 0
+EVAL_GAMES_PER_ROUND = 10  # ラウンドごとのアリーナ戦・ランダム相手戦の試合数
+GATING_WIN_RATE = 0.5  # 候補ネットワークをbest_networkとして採用する最低勝率
+
+# ネットワーク構成(公式サンプルコードの`MyModel(128, 2, 256, 1, 1)`と同じ規模)
+D_MODEL = 128
+NUM_HEADS = 2
+D_FEEDFORWARD = 256
+NUM_LAYERS_ENCODER = 1
+NUM_LAYERS_DECODER = 1
 
 
 def read_deck() -> list[int]:
@@ -65,37 +88,53 @@ class SelfplayDataset(Dataset):
         return self.samples[idx]
 
 
-def _collate(
-    batch: list[Sample],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """可変長の選択肢群・方策教師信号を、バッチ内の最大選択肢数までゼロ埋めする。
+def _collate(batch: list[Sample]):
+    """可変長の行動群を、バッチ内の最大行動数までパディング(空行動)し、疎ベクトルを連結する。
+
+    エンコーダ側は全サンプル共通で`sparse_features.NUM_WORDS_ENCODER`個のトークンなので
+    パディング不要だが、デコーダ側(行動の数)は局面ごとに異なるため、
+    `SparseBatch.add_empty_word`で埋める(公式サンプルコードの`LearnInput`と同じ扱い)。
 
     Args:
         batch: `Sample`のリスト。
 
     Returns:
-        tuple: (states, options, mask, policy_targets, value_labels)。
-            states: 形状`(batch, state_dim)`。
-            options: 形状`(batch, max_options, option_dim)`(パディング済み)。
-            mask: 形状`(batch, max_options)`のbool。パディングした位置はFalse。
-            policy_targets: 形状`(batch, max_options)`の教師分布(パディング部分は0)。
+        tuple: (index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec,
+            mask, policy_targets, value_labels)。
+            mask: 形状`(batch, max_actions)`のbool。パディングした行動位置はFalse。
+            policy_targets: 形状`(batch, max_actions)`の教師分布(パディング部分は0)。
             value_labels: 形状`(batch,)`の価値の教師信号。
     """
-    states = torch.from_numpy(np.stack([s.state_vec for s in batch]))
-    max_options = max(s.option_vecs.shape[0] for s in batch)
-    option_dim = batch[0].option_vecs.shape[1]
+    max_actions = max(len(s.policy_target) for s in batch)
 
-    options = torch.zeros(len(batch), max_options, option_dim, dtype=torch.float32)
-    mask = torch.zeros(len(batch), max_options, dtype=torch.bool)
-    policy_targets = torch.zeros(len(batch), max_options, dtype=torch.float32)
+    encoder_batch = SparseBatch()
+    decoder_batch = SparseBatch()
+    mask = torch.zeros(len(batch), max_actions, dtype=torch.bool)
+    policy_targets = torch.zeros(len(batch), max_actions, dtype=torch.float32)
+
     for i, sample in enumerate(batch):
-        n = sample.option_vecs.shape[0]
-        options[i, :n] = torch.from_numpy(sample.option_vecs)
+        encoder_batch.add(sample.encoder_sv)
+        decoder_batch.add(sample.decoder_sv)
+        n = len(sample.policy_target)
         mask[i, :n] = True
         policy_targets[i, :n] = torch.tensor(sample.policy_target, dtype=torch.float32)
+        for _ in range(max_actions - n):
+            decoder_batch.add_empty_word()
 
+    index_enc, value_enc, offset_enc = encoder_batch.to_tensors()
+    index_dec, value_dec, offset_dec = decoder_batch.to_tensors()
     value_labels = torch.tensor([s.label for s in batch], dtype=torch.float32)
-    return states, options, mask, policy_targets, value_labels
+    return (
+        index_enc,
+        value_enc,
+        offset_enc,
+        index_dec,
+        value_dec,
+        offset_dec,
+        mask,
+        policy_targets,
+        value_labels,
+    )
 
 
 def _masked_policy_loss(
@@ -103,13 +142,10 @@ def _masked_policy_loss(
 ) -> torch.Tensor:
     """パディング部分を除外した上で、方策の教師分布(訪問回数の正規化)に対する交差エントロピーを計算する。
 
-    BCの`masked_cross_entropy`と異なり、正解が1つのラベルではなく確率分布(MCTSの訪問回数)
-    なので、one-hotではなく分布同士の交差エントロピーとして計算する。
-
     Args:
-        scores: 形状`(batch, max_options)`の生スコア(`PolicyValueNet.forward`の出力)。
-        mask: 形状`(batch, max_options)`のbool。パディングした位置はFalse。
-        policy_targets: 形状`(batch, max_options)`の教師分布(パディング部分は0)。
+        scores: 形状`(batch, max_actions)`の生スコア(`PolicyValueNet.forward`の出力)。
+        mask: 形状`(batch, max_actions)`のbool。パディングした位置はFalse。
+        policy_targets: 形状`(batch, max_actions)`の教師分布(パディング部分は0)。
 
     Returns:
         torch.Tensor: バッチ平均の交差エントロピー損失(スカラー)。
@@ -136,18 +172,31 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
     for epoch in range(epochs):
         total_policy_loss = 0.0
         total_value_loss = 0.0
-        for states, options, mask, policy_targets, value_labels in loader:
-            scores, values = network(states, options)
+        for (
+            index_enc,
+            value_enc,
+            offset_enc,
+            index_dec,
+            value_dec,
+            offset_dec,
+            mask,
+            policy_targets,
+            value_labels,
+        ) in loader:
+            values, scores = network(
+                index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec
+            )
             policy_loss = _masked_policy_loss(scores, mask, policy_targets)
-            value_loss = functional.mse_loss(values, value_labels)
+            value_loss = functional.mse_loss(values.squeeze(-1), value_labels)
             loss = policy_loss + value_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_policy_loss += policy_loss.item() * states.shape[0]
-            total_value_loss += value_loss.item() * states.shape[0]
+            batch_size = value_labels.shape[0]
+            total_policy_loss += policy_loss.item() * batch_size
+            total_value_loss += value_loss.item() * batch_size
 
         n = len(dataset)
         print(
@@ -157,43 +206,152 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
     network.eval()
 
 
-def run_training_loop(deck: list[int]) -> PolicyValueNet:
-    """自己対戦→学習を`N_ROUNDS`回繰り返すメインループ。
+def _random_agent_factory(deck: list[int]):
+    """`match_runner.evaluate`用の、完全ランダムなagent()関数を作る。
 
     Args:
-        deck: 自己対戦に使う60枚のデッキリスト。
+        deck: デッキ提出時に返す60枚のデッキリスト。
 
     Returns:
-        PolicyValueNet: 最終ラウンド終了時点のネットワーク。
+        Callable[[dict], list[int]]: ランダムに選ぶagent関数。
+    """
+
+    def agent(obs_dict: dict) -> list[int]:
+        obs = to_observation_class(obs_dict)
+        if obs.select is None:
+            return deck
+        sel = obs.select
+        count = random.randint(sel.minCount, sel.maxCount)
+        return random.sample(range(len(sel.option)), count)
+
+    return agent
+
+
+def make_mcts_eval_agent(network: PolicyValueNet, our_deck: list[int]):
+    """`network`で、`match_runner.evaluate`用のagent()関数を作る。
+
+    本番のagent()(`trained_agent.py`)と同じ構成(自分のデッキは既知、
+    相手はカード出現頻度から推測)。
+
+    Args:
+        network: 評価対象の`PolicyValueNet`(eval modeにしておくこと)。
+        our_deck: こちらの60枚のデッキリスト。
+
+    Returns:
+        Callable[[dict], list[int]]: `match_runner.evaluate`に渡せるagent関数。
+    """
+    eval_fn = make_eval_fn(network, [our_deck, our_deck])
+
+    def agent(obs_dict: dict) -> list[int]:
+        obs: Observation = to_observation_class(obs_dict)
+        if obs.select is None:
+            return our_deck
+        sel = obs.select
+        if not (
+            sel.type in (SelectType.MAIN, SelectType.EVOLVE)
+            and sel.minCount == sel.maxCount == 1
+            and len(sel.option) >= 2
+        ):
+            count = random.randint(sel.minCount, sel.maxCount)
+            return random.sample(range(len(sel.option)), count)
+
+        state = obs.current
+        your_index = state.yourIndex
+        me = state.players[your_index]
+        opp = state.players[1 - your_index]
+        your_deck, your_prize = sample_own_hidden(our_deck, me.deckCount, len(me.prize))
+        opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
+            opp.deckCount, opp.handCount, len(opp.prize)
+        )
+        opponent_active: list[int] = []
+        if opp.active and opp.active[0] is None:
+            opponent_active = [sample_opponent_active_guess()]
+
+        root_state = search_begin(
+            obs,
+            your_deck=your_deck,
+            your_prize=your_prize,
+            opponent_deck=opponent_deck,
+            opponent_prize=opponent_prize,
+            opponent_hand=opponent_hand,
+            opponent_active=opponent_active,
+        )
+        try:
+            select, _policy_target, _root_value, _actions = run_mcts(
+                root_state, your_index, eval_fn, SEARCH_COUNT
+            )
+        finally:
+            search_end()
+        return select
+
+    return agent
+
+
+def run_training_loop(deck: list[int]) -> PolicyValueNet:
+    """自己対戦→学習→アリーナ評価を`N_ROUNDS`回繰り返すメインループ。
+
+    各ラウンド、`best_network`で自己対戦したデータで候補ネットワークを学習し、
+    `best_network`とのミラー戦(両者とも`deck`を使用)に勝ち越した場合のみ
+    `best_network`を候補で置き換える(AlphaZeroのアリーナ/ゲーティング)。
+    ランダム相手との勝率も、汎化の絶対的な下限の目安として毎ラウンド測る。
+    対戦相手には`determinize.load_opponent_deck_pool`で集めた実在デッキをランダムに使う。
+
+    Args:
+        deck: 本番でも使う、こちらの60枚のデッキリスト。
+
+    Returns:
+        PolicyValueNet: 最終ラウンド終了時点の`best_network`。
     """
     torch.manual_seed(SEED)
-    network = new_network_from_bc(STATE_DIM, OPTION_DIM, HIDDEN_DIM)
-    network.eval()
+    best_network = PolicyValueNet(
+        D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
+    )
+    best_network.eval()
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    opponent_deck_pool = load_opponent_deck_pool()
+    print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
 
     for round_index in range(N_ROUNDS):
         print(f"=== round {round_index + 1}/{N_ROUNDS}: self-play ===")
         all_samples: list[Sample] = []
         results = {0: 0, 1: 0, 2: 0}
         for game_index in range(GAMES_PER_ROUND):
-            samples, winner = play_selfplay_game(network, deck, SEARCH_COUNT)
+            samples, winner = play_selfplay_game(
+                best_network, deck, opponent_deck_pool, SEARCH_COUNT
+            )
             all_samples.extend(samples)
             results[winner] += 1
-            print(
-                f"  game {game_index + 1}/{GAMES_PER_ROUND}  "
-                f"winner={winner}  samples={len(samples)}"
-            )
+            if (game_index + 1) % 20 == 0 or game_index + 1 == GAMES_PER_ROUND:
+                print(f"  game {game_index + 1}/{GAMES_PER_ROUND}  results_so_far={results}")
         print(f"  round results: {results}  total_samples={len(all_samples)}")
 
         print(f"=== round {round_index + 1}/{N_ROUNDS}: training ===")
-        train_one_round(network, all_samples, EPOCHS_PER_ROUND)
+        candidate_network = copy.deepcopy(best_network)
+        train_one_round(candidate_network, all_samples, EPOCHS_PER_ROUND)
+
+        print(f"=== round {round_index + 1}/{N_ROUNDS}: arena vs best_network ===")
+        candidate_agent = make_mcts_eval_agent(candidate_network, deck)
+        best_agent = make_mcts_eval_agent(best_network, deck)
+        arena_result = match_evaluate(candidate_agent, best_agent, n_episodes=EVAL_GAMES_PER_ROUND)
+        accepted = arena_result["win_rate"] > GATING_WIN_RATE
+        print(f"  candidate vs best: {arena_result}  accepted={accepted}")
+
+        if accepted:
+            best_network = candidate_network
+
+        print(f"=== round {round_index + 1}/{N_ROUNDS}: eval vs random ===")
+        eval_agent = make_mcts_eval_agent(best_network, deck)
+        vs_random = match_evaluate(
+            eval_agent, _random_agent_factory(deck), n_episodes=EVAL_GAMES_PER_ROUND
+        )
+        print(f"  vs random: {vs_random}")
 
         checkpoint_path = CHECKPOINT_DIR / f"round{round_index + 1}.pt"
-        torch.save(network.state_dict(), checkpoint_path)
+        torch.save(best_network.state_dict(), checkpoint_path)
         print(f"  saved checkpoint to {checkpoint_path}")
 
-    return network
+    return best_network
 
 
 if __name__ == "__main__":

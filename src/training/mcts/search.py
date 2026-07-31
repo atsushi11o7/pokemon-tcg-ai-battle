@@ -1,10 +1,8 @@
 """Determinized MCTSの探索木本体(PUCTによる選択、ノード展開、バックプロパゲーション)。
 
-隠れ情報は呼び出し側が`determinize.py`で1つの仮説に固定した上で`search_begin`を
-呼んでおき、その結果得られる`SearchState`を根ノードとして木探索する。
-公式サンプルコード(reinforcement-learning-and-mcts-sample-code.ipynb)のNode/Child/
-create_nodeの構造を踏襲しつつ、局面の評価は外部から`eval_fn`として受け取れる形にしている
-(公式サンプルの`eval_nn`に相当。方策の事前分布と価値を1回の呼び出しでまとめて返す)。
+呼び出し側が`determinize.py`で隠れ情報を1つの仮説に固定した上で`search_begin`を呼び、
+その結果得られる`SearchState`を根ノードとして木探索する。局面の評価(事前確率・価値)は
+外部から`eval_fn`として受け取る。
 """
 
 import itertools
@@ -104,11 +102,12 @@ def create_node(parent: "Node | None", search_state, your_index: int, eval_fn) -
         parent: 親ノード(根ノードを作る場合はNone)。
         search_state: このノードのもとになる`SearchState`(`search_begin`/`search_step`の戻り値)。
         your_index: 探索の根本になっているプレイヤーのインデックス(勝敗の基準)。
-        eval_fn: `(obs) -> (list[float] | None, float)`。`obs.current.yourIndex`視点での
-            (合法な選択肢群に対する事前確率, 局面の価値)を返す関数。事前確率は
-            単一選択(`minCount==maxCount==1`)以外の場合、またはNone、または列挙した
-            行動数と長さが合わない場合は一様分布にフォールバックする。
-            (公式サンプルコードの`eval_nn`に相当)。
+        eval_fn: `(obs, actions) -> (list[float] | None, float)`。`obs.current.yourIndex`
+            視点での(列挙済み行動`actions`に対する事前確率, 局面の価値)を返す関数。
+            事前確率がNone、または列挙した行動数と長さが合わない場合は一様分布に
+            フォールバックする。(公式サンプルコードの`eval_nn`に相当。行動群を渡すのは、
+            疎な特徴量エンコーディング(`sparse_features.get_decoder_input`)が
+            列挙済みの行動そのものを必要とするため)。
 
     Returns:
         Node: 作成したノード。
@@ -128,13 +127,8 @@ def create_node(parent: "Node | None", search_state, your_index: int, eval_fn) -
         return node
 
     actions = _enumerate_actions(obs.select)
-    probs, value = eval_fn(obs)
-    if (
-        obs.select.minCount != 1
-        or obs.select.maxCount != 1
-        or probs is None
-        or len(probs) != len(actions)
-    ):
+    probs, value = eval_fn(obs, actions)
+    if probs is None or len(probs) != len(actions):
         probs = [1.0 / len(actions)] * len(actions)
 
     for action, prob in zip(actions, probs, strict=True):
@@ -182,7 +176,7 @@ def _select_child(node: "Node", your_index: int) -> "Child":
 
 def run_mcts(
     root_state, your_index: int, eval_fn, search_count: int
-) -> tuple[list[int], list[float], float]:
+) -> tuple[list[int], list[float], float, list[list[int]]]:
     """根の`SearchState`からPUCTで`search_count`回のシミュレーションを行う。
 
     Args:
@@ -192,14 +186,18 @@ def run_mcts(
         search_count: シミュレーション回数(MCTSのイテレーション数)。
 
     Returns:
-        tuple[list[int], list[float], float]: (select, policy_target, root_value)。
+        tuple[list[int], list[float], float, list[list[int]]]:
+            (select, policy_target, root_value, actions)。
             select: 根から見て最も訪問回数の多い子の選択(`search_step`にそのまま渡せる形式)。
-            policy_target: `root.children`と同じ順序に並んだ、訪問回数を正規化した分布
+            policy_target: `actions`と同じ順序に並んだ、訪問回数を正規化した分布
                 (自己対戦の学習で方策の教師信号として使う)。
             root_value: 探索全体で洗練された根ノードの平均value(`your_index`視点。
                 自己対戦の学習で価値の教師信号のもとになる)。
+            actions: 根で列挙された行動一覧(`policy_target`と同じ順序。学習時に
+                `sparse_features.get_decoder_input`へそのまま渡せる)。
     """
     root = create_node(None, root_state, your_index, eval_fn)
+    actions = [child.select for child in root.children]
 
     for _ in range(search_count):
         current = root
@@ -221,8 +219,8 @@ def run_mcts(
     if total_visits == 0:
         # 1回もシミュレーションが展開されなかった場合(search_count=0等)のフォールバック
         policy_target = [1.0 / len(root.children)] * len(root.children)
-        return root.children[0].select, policy_target, root_value
+        return root.children[0].select, policy_target, root_value, actions
 
     policy_target = [v / total_visits for v in visits]
     best_index = max(range(len(root.children)), key=lambda i: visits[i])
-    return root.children[best_index].select, policy_target, root_value
+    return root.children[best_index].select, policy_target, root_value, actions
