@@ -14,7 +14,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features import OPTION_DIM, STATE_DIM, encode_option, encode_state  # noqa: E402
 from train_bc import HIDDEN_DIM, MODEL_PATH, PolicyNet  # noqa: E402
 

@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader, Dataset, Subset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features import OPTION_DIM, STATE_DIM  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[3]

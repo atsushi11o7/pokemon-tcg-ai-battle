@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features import encode_option, encode_state  # noqa: E402
 
 sys.path.insert(
