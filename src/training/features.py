@@ -1,8 +1,11 @@
-"""ObservationをBehavior Cloning用の固定長ベクトルに変換する特徴量エンジニアリング。
+"""Observationを固定長ベクトルに変換する特徴量エンジニアリング(BC・MCTS共通)。
 
 方針(フォーラムの助言を参考): 「盤面全体」「場のポケモン(エンティティ)」「選択肢」を
 別々にベクトル化する。カードの識別子そのもの(cardId)は種類が多すぎるため埋め込まず、
 CardDataから引ける静的な特徴量(HP・進化段階・ex等)に落とし込む。
+
+デッキや学習手法に依存しない汎用的な数値化なので、`bc/`(Behavior Cloning)と
+`mcts/`(Determinized MCTS)の両方から共通で使う。
 """
 
 import sys
@@ -10,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 SAMPLE_SUBMISSION_DIR = ROOT / "data" / "sample_submission" / "sample_submission"
 sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 

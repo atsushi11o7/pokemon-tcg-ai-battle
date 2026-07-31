@@ -9,6 +9,7 @@ data/
 outputs/
 results/
 docs/
+logs/
 
 *.tar.gz
 submission/
