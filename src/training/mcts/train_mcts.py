@@ -19,12 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from determinize import (  # noqa: E402
-    load_opponent_deck_pool,
-    sample_opponent_active_guess,
-    sample_opponent_hidden,
-    sample_own_hidden,
-)
+from determinize import load_opponent_deck_pool, search_begin_kwargs  # noqa: E402
 from network import PolicyValueNet, SparseBatch  # noqa: E402
 from search import run_mcts  # noqa: E402
 from selfplay import Sample, make_eval_fn, play_selfplay_game  # noqa: E402
@@ -32,7 +27,6 @@ from selfplay import Sample, make_eval_fn, play_selfplay_game  # noqa: E402
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import (  # noqa: E402
     Observation,
-    SelectType,
     search_begin,
     search_end,
     to_observation_class,
@@ -44,7 +38,7 @@ from match_runner import evaluate as match_evaluate  # noqa: E402
 DECK_PATH = ROOT / "submission" / "01_rule_based" / "deck.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 
-GAMES_PER_ROUND = 200  # Transformerはdense MLP版より1試合あたり約4倍遅い(実測2.2秒/試合)ため縮小
+GAMES_PER_ROUND = 200  # 全選択を探索するようになった分、1試合あたり約3.5秒(以前は2.2秒)
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
 SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数
 EPOCHS_PER_ROUND = 3
@@ -246,39 +240,11 @@ def make_mcts_eval_agent(network: PolicyValueNet, our_deck: list[int]):
         obs: Observation = to_observation_class(obs_dict)
         if obs.select is None:
             return our_deck
-        sel = obs.select
-        if not (
-            sel.type in (SelectType.MAIN, SelectType.EVOLVE)
-            and sel.minCount == sel.maxCount == 1
-            and len(sel.option) >= 2
-        ):
-            count = random.randint(sel.minCount, sel.maxCount)
-            return random.sample(range(len(sel.option)), count)
 
-        state = obs.current
-        your_index = state.yourIndex
-        me = state.players[your_index]
-        opp = state.players[1 - your_index]
-        your_deck, your_prize = sample_own_hidden(our_deck, me.deckCount, len(me.prize))
-        opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
-            opp.deckCount, opp.handCount, len(opp.prize)
-        )
-        opponent_active: list[int] = []
-        if opp.active and opp.active[0] is None:
-            opponent_active = [sample_opponent_active_guess()]
-
-        root_state = search_begin(
-            obs,
-            your_deck=your_deck,
-            your_prize=your_prize,
-            opponent_deck=opponent_deck,
-            opponent_prize=opponent_prize,
-            opponent_hand=opponent_hand,
-            opponent_active=opponent_active,
-        )
+        root_state = search_begin(obs, **search_begin_kwargs(obs, our_deck))
         try:
             select, _policy_target, _root_value, _actions = run_mcts(
-                root_state, your_index, eval_fn, SEARCH_COUNT
+                root_state, obs.current.yourIndex, eval_fn, SEARCH_COUNT
             )
         finally:
             search_end()

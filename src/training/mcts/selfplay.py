@@ -1,8 +1,9 @@
 """Determinized MCTSによる自己対戦で、方策・価値ネットワークの学習データを集める。
 
-`cg.game`で直接対戦を回し、MAIN/EVOLVEの単一選択のたびにMCTS探索を行う。探索結果
-(訪問回数分布)を方策の教師信号、ゲーム終了後に補正した価値推定を価値の教師信号として、
-1試合分の学習サンプルを作る。
+`cg.game`で直接対戦を回し、あらゆる選択(セットアップ・サーチ効果・YES/NO確認等も含む)の
+たびにMCTS探索を行う。選択肢が実質1つしかない局面も同じ探索木の枠組みで扱う(子が1つの
+木として自然に処理される)。探索結果(訪問回数分布)を方策の教師信号、ゲーム終了後に
+補正した価値推定を価値の教師信号として、1試合分の学習サンプルを作る。
 
 対戦相手には実在デッキ(`determinize.load_opponent_deck_pool`)からランダムに選んだ
 ものを使い、こちらの固定デッキ(`our_deck`)側の意思決定のみを学習サンプルとして集める。
@@ -28,7 +29,7 @@ from search import run_mcts  # noqa: E402
 from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
-from cg.api import SelectType, search_begin, search_end, to_observation_class  # noqa: E402
+from cg.api import search_begin, search_end, to_observation_class  # noqa: E402
 from cg.game import battle_finish, battle_select, battle_start  # noqa: E402
 
 LAMBDA = (
@@ -37,7 +38,7 @@ LAMBDA = (
 
 
 class Sample:
-    """1回のMAIN/EVOLVE単一選択について集めた学習サンプル。"""
+    """1回の選択(2択以上)について集めた学習サンプル。"""
 
     def __init__(self, encoder_sv, decoder_sv, policy_target: list[float], value: float) -> None:
         """
@@ -126,19 +127,6 @@ def _search_begin_kwargs(obs, my_true_deck: list[int]) -> dict:
     }
 
 
-def _fallback_random(sel) -> list[int]:
-    """探索の対象外の選択(セットアップ・サーチ等)に対して、ランダムに選ぶ。
-
-    Args:
-        sel: 今回の選択肢一式。
-
-    Returns:
-        list[int]: `minCount`以上`maxCount`以下の個数だけランダムに選んだindexのリスト。
-    """
-    count = random.randint(sel.minCount, sel.maxCount)
-    return random.sample(range(len(sel.option)), count)
-
-
 def _assign_labels(samples: list[Sample], winner: int, player_index: int) -> None:
     """1プレイヤー分のサンプルに、ゲーム終了後の結果を使って価値の教師信号を付ける。
 
@@ -195,26 +183,18 @@ def play_selfplay_game(
     obs = to_observation_class(obs_dict)
 
     while obs.current.result < 0:
-        sel = obs.select
-        if (
-            sel.type in (SelectType.MAIN, SelectType.EVOLVE)
-            and sel.minCount == sel.maxCount == 1
-            and (len(sel.option) >= 2)
-        ):
-            your_index = obs.current.yourIndex
-            root_state = search_begin(obs, **_search_begin_kwargs(obs, decks[your_index]))
-            try:
-                select, policy_target, root_value, actions = run_mcts(
-                    root_state, your_index, eval_fn, search_count
-                )
-            finally:
-                search_end()
-            if your_index == our_seat:
-                encoder_sv = get_encoder_input(obs, our_deck)
-                decoder_sv = get_decoder_input(obs, actions)
-                samples.append(Sample(encoder_sv, decoder_sv, policy_target, root_value))
-        else:
-            select = _fallback_random(sel)
+        your_index = obs.current.yourIndex
+        root_state = search_begin(obs, **_search_begin_kwargs(obs, decks[your_index]))
+        try:
+            select, policy_target, root_value, actions = run_mcts(
+                root_state, your_index, eval_fn, search_count
+            )
+        finally:
+            search_end()
+        if your_index == our_seat:
+            encoder_sv = get_encoder_input(obs, our_deck)
+            decoder_sv = get_decoder_input(obs, actions)
+            samples.append(Sample(encoder_sv, decoder_sv, policy_target, root_value))
         obs = to_observation_class(battle_select(select))
 
     battle_finish()
