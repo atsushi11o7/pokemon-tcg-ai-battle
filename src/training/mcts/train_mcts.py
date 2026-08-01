@@ -346,7 +346,11 @@ def _run_selfplay_round(
     """
     all_samples: list[Sample] = []
     results = {0: 0, 1: 0, 2: 0}
-    with multiprocessing.Pool(
+    # "fork"(デフォルト)だと、親プロセスで既にimport済みのtorchが持つ内部スレッドが
+    # forkの瞬間にロックを保持していた場合、そのロックは子プロセスに引き継がれたまま
+    # 二度と解放されずデッドロックしうる(PyTorch公式が警告している既知の問題)。
+    # "spawn"は子プロセスをまっさらな状態から起動するため、この問題を避けられる。
+    with multiprocessing.get_context("spawn").Pool(
         processes=NUM_SELFPLAY_WORKERS,
         initializer=_init_selfplay_worker,
         initargs=(network.state_dict(), deck, opponent_deck_pool, search_count),
