@@ -3,6 +3,7 @@
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -14,6 +15,7 @@ sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 from cg.api import (  # noqa: E402
     AreaType,
     Card,
+    EnergyType,
     Observation,
     OptionType,
     PlayerState,
@@ -24,8 +26,10 @@ from cg.api import (  # noqa: E402
 )
 
 _card_table: dict[int, object] | None = None
+_attack_table: dict[int, object] | None = None
 _card_count: int | None = None
 _attack_count: int | None = None
+_energy_type_count: int | None = None
 
 
 def card_table() -> dict[int, object]:
@@ -52,6 +56,18 @@ def card_count() -> int:
     return _card_count
 
 
+def attack_table() -> dict[int, object]:
+    """全ワザのマスタデータを、attackIdをキーにした辞書として取得する(遅延ロード・キャッシュ)。
+
+    Returns:
+        dict[int, object]: attackIdをキーにした`Attack`。
+    """
+    global _attack_table
+    if _attack_table is None:
+        _attack_table = {a.attackId: a for a in all_attack()}
+    return _attack_table
+
+
 def attack_count() -> int:
     """ワザマスタの最大attackId+1(埋め込みテーブルのサイズ)を取得する(遅延ロード・キャッシュ)。
 
@@ -62,6 +78,47 @@ def attack_count() -> int:
     if _attack_count is None:
         _attack_count = max(a.attackId for a in all_attack()) + 1
     return _attack_count
+
+
+def energy_type_count() -> int:
+    """`EnergyType`の取りうる値の数(埋め込みテーブルのサイズ)を取得する(遅延ロード・キャッシュ)。
+
+    Returns:
+        int: 最大`EnergyType`値 + 1。
+    """
+    global _energy_type_count
+    if _energy_type_count is None:
+        _energy_type_count = max(int(e) for e in EnergyType) + 1
+    return _energy_type_count
+
+
+def _energy_type_counts(cards: "list[Card] | None") -> dict[int, int]:
+    """エネルギーカードのリストから、タイプ別の枚数を集計する。
+
+    Args:
+        cards: エネルギーカードのリスト(`poke.energyCards`等)。
+
+    Returns:
+        dict[int, int]: `EnergyType`の値をキーにした枚数。
+    """
+    counts: dict[int, int] = {}
+    if cards is not None:
+        for card in cards:
+            energy_type = int(card_table()[card.id].energyType)
+            counts[energy_type] = counts.get(energy_type, 0) + 1
+    return counts
+
+
+def _add_energy_counts(sv: "SparseVector", base_offset: int, counts: dict[int, int]) -> None:
+    """タイプ別のエネルギー枚数を、正規化してデコーダの`base_offset`以降に書き込む。
+
+    Args:
+        sv: 書き込み先の`SparseVector`。
+        base_offset: エネルギータイプ0番の絶対インデックス。
+        counts: `EnergyType`の値をキーにした枚数(`_energy_type_counts`やCounterの戻り値)。
+    """
+    for energy_type, count in counts.items():
+        sv.add(base_offset + energy_type, count / 3)
 
 
 # --- デコーダ側の先頭ブロック(NUMBER/YES/NO/SPECIAL_CONDITION/空選択)のレイアウト -------
@@ -87,35 +144,92 @@ def _decoder_attack_offset() -> int:
     return DECODER_HEAD_SIZE
 
 
+def _decoder_attack_numeric_offset() -> int:
+    """デコーダの疎ベクトルにおける、ATTACK技の数値特徴(ダメージ・エネルギー内訳)の先頭インデックス。
+
+    ATTACK特徴(attackIdのone-hot、attack_count個)の直後に配置する。
+
+    Returns:
+        int: ATTACKのone-hotブロックの直後のインデックス。
+    """
+    return _decoder_attack_offset() + attack_count()
+
+
+# ATTACK技の数値特徴のブロック内レイアウト: ダメージ1 + 必要エネルギー(タイプ別) + 現在の付与エネルギー(タイプ別)
+_DECODER_ATTACK_DAMAGE_INDEX = 0
+
+
+def _decoder_attack_required_energy_offset() -> int:
+    return _DECODER_ATTACK_DAMAGE_INDEX + 1
+
+
+def _decoder_attack_attached_energy_offset() -> int:
+    return _decoder_attack_required_energy_offset() + energy_type_count()
+
+
+def _decoder_attack_numeric_size() -> int:
+    """ATTACK技の数値特徴ブロックの幅(ダメージ1 + 必要/現在エネルギーのタイプ別内訳)。"""
+    return _decoder_attack_attached_energy_offset() + energy_type_count()
+
+
+def _decoder_switch_numeric_offset() -> int:
+    """デコーダの疎ベクトルにおける、交代先候補の数値特徴(残りHP・エネルギー内訳)の先頭インデックス。
+
+    ATTACK数値特徴ブロックの直後に配置する。
+
+    Returns:
+        int: ATTACK数値特徴ブロックの直後のインデックス。
+    """
+    return _decoder_attack_numeric_offset() + _decoder_attack_numeric_size()
+
+
+# 交代先候補の数値特徴のブロック内レイアウト: 残りHP1 + 現在の付与エネルギー(タイプ別)
+_DECODER_SWITCH_HP_INDEX = 0
+
+
+def _decoder_switch_energy_offset() -> int:
+    return _DECODER_SWITCH_HP_INDEX + 1
+
+
+def _decoder_switch_numeric_size() -> int:
+    """交代先候補の数値特徴ブロックの幅(残りHP1 + 現在の付与エネルギーのタイプ別内訳)。"""
+    return _decoder_switch_energy_offset() + energy_type_count()
+
+
 def _decoder_card_offset() -> int:
     """デコーダの疎ベクトルにおける、カード参照系特徴の先頭インデックス。
 
-    ATTACK特徴(attack_count個)の直後に配置する。
+    ATTACK特徴・ATTACK数値特徴・交代先数値特徴の直後に配置する。
 
     Returns:
-        int: ATTACK特徴ブロックの直後のインデックス。
+        int: それらのブロックの直後のインデックス。
     """
-    return _decoder_attack_offset() + attack_count()
+    return _decoder_switch_numeric_offset() + _decoder_switch_numeric_size()
+
+
+# ポケモン1体分の追加特徴(ex/megaEx/弱点/抵抗力/にげるコスト)のブロック幅
+def _pokemon_extra_size() -> int:
+    return 2 + 2 * energy_type_count() + 1
 
 
 def encoder_size() -> int:
     """エンコーダ側の疎ベクトルの総次元数(EmbeddingBagの語彙数)。
 
-    `get_encoder_input`が書き込む全ブロックの合計サイズ(`43 + 17 * card_count()`)。
+    `get_encoder_input`が書き込む全ブロックの合計サイズ。
     値は`get_encoder_input`呼び出し後の`SparseVector.pos`と実測一致することを確認済み。
 
     Returns:
         int: エンコーダ側の疎ベクトルの総次元数。
     """
-    return 43 + 17 * card_count()
+    return 43 + 17 * card_count() + 4 * _pokemon_extra_size()
 
 
 def decoder_size() -> int:
     """デコーダの疎ベクトルの総次元数(EmbeddingBagの語彙数)。
 
-    先頭ブロック(NUMBER/YES/NO/SPECIAL_CONDITION/空選択) + ATTACK特徴 +
-    (decoder_mainの8種 + SelectContextの種類数+ 1)個のカード参照ブロック、
-    という構成(公式サンプルコードと同じレイアウト)。
+    先頭ブロック(NUMBER/YES/NO/SPECIAL_CONDITION/空選択) + ATTACK特徴(one-hot) +
+    ATTACK数値特徴 + 交代先数値特徴 + (decoder_mainの8種 + SelectContextの種類数+ 1)個の
+    カード参照ブロック、という構成。
 
     Returns:
         int: デコーダの疎ベクトルの総次元数。
@@ -212,10 +326,23 @@ def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float) -> Non
     sv.add_pos(card_count())
 
 
+def add_energy_type(sv: SparseVector, energy_type: "EnergyType | None") -> None:
+    """1つのエネルギータイプ(またはNone)を、one-hotとしてエンコーダに書き込む。
+
+    Args:
+        sv: 書き込み先の`SparseVector`。
+        energy_type: 対象のエネルギータイプ。無い場合はNone。
+    """
+    if energy_type is not None:
+        sv.add(int(energy_type), 1)
+    sv.add_pos(energy_type_count())
+
+
 def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
     """場の1枠分(ポケモン1体、または空き枠)をエンコーダに書き込む。
 
-    存在フラグ・HP比・カードID・付いている道具/エネルギーカードをまとめて書き込む。
+    存在フラグ・HP比・カードID・付いている道具/エネルギーカードに加えて、
+    サイド価値(ex/megaEx)・弱点・抵抗力・にげるコストも書き込む。
 
     Args:
         sv: 書き込み先の`SparseVector`。
@@ -223,13 +350,19 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
     """
     if poke is None:
         sv.add_single(1)
-        sv.add_pos(1 + 3 * card_count())
+        sv.add_pos(1 + 3 * card_count() + _pokemon_extra_size())
     else:
         sv.add_single(0)
         sv.add_single(poke.hp / 400)
         add_card(sv, poke)
         add_cards(sv, poke.tools, 1.0)
         add_cards(sv, poke.energyCards, 0.5)
+        card = card_table()[poke.id]
+        sv.add_single(card.ex)
+        sv.add_single(card.megaEx)
+        add_energy_type(sv, card.weakness)
+        add_energy_type(sv, card.resistance)
+        sv.add_single(card.retreatCost / 4)
 
 
 def add_player(sv: SparseVector, ps: PlayerState) -> None:
@@ -424,6 +557,15 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 sv.add(9 + min(o.number, 4), 1)
             elif o.type == OptionType.ATTACK:
                 sv.add(_decoder_attack_offset() + o.attackId, 1)
+                attack = attack_table()[o.attackId]
+                numeric_offset = _decoder_attack_numeric_offset()
+                sv.add(numeric_offset + _DECODER_ATTACK_DAMAGE_INDEX, attack.damage / 400)
+                required_offset = numeric_offset + _decoder_attack_required_energy_offset()
+                _add_energy_counts(sv, required_offset, Counter(int(e) for e in attack.energies))
+                attached_offset = numeric_offset + _decoder_attack_attached_energy_offset()
+                _add_energy_counts(
+                    sv, attached_offset, _energy_type_counts(ps.active[0].energyCards)
+                )
             elif o.type == OptionType.PLAY:
                 decoder_main(sv, 0, ps.hand[o.index])
             elif o.type == OptionType.ATTACH:
@@ -439,7 +581,13 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
             elif o.type == OptionType.RETREAT:
                 decoder_main(sv, 7, ps.active[0])
             elif o.type == OptionType.CARD:
-                decoder_card(sv, context, get_card(obs, o.area, o.index, o.playerIndex))
+                target = get_card(obs, o.area, o.index, o.playerIndex)
+                decoder_card(sv, context, target)
+                if context == SelectContext.SWITCH and isinstance(target, Pokemon):
+                    numeric_offset = _decoder_switch_numeric_offset()
+                    sv.add(numeric_offset + _DECODER_SWITCH_HP_INDEX, target.hp / 400)
+                    energy_offset = numeric_offset + _decoder_switch_energy_offset()
+                    _add_energy_counts(sv, energy_offset, _energy_type_counts(target.energyCards))
             elif o.type == OptionType.TOOL_CARD:
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.tools[o.toolIndex])
