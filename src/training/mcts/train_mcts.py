@@ -361,7 +361,7 @@ def _run_selfplay_round(
     return all_samples, results
 
 
-def run_training_loop(deck: list[int]) -> PolicyValueNet:
+def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None) -> PolicyValueNet:
     """自己対戦→学習→アリーナ評価を`N_ROUNDS`回繰り返すメインループ。
 
     各ラウンド、`best_network`で自己対戦したデータで候補ネットワークを学習し、
@@ -377,6 +377,8 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
 
     Args:
         deck: 本番でも使う、こちらの60枚のデッキリスト。
+        warmstart_checkpoint: 指定があれば、ランダム初期化の代わりにこのチェックポイントを
+            `best_network`の初期値として使う(`bc_pretrain.py`が保存したものを想定)。
 
     Returns:
         PolicyValueNet: 最終ラウンド終了時点の`best_network`。
@@ -385,6 +387,9 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
     best_network = PolicyValueNet(
         D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
     )
+    if warmstart_checkpoint is not None:
+        best_network.load_state_dict(torch.load(warmstart_checkpoint, weights_only=True))
+        print(f"warm-started best_network from {warmstart_checkpoint}")
     best_network.eval()
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -453,4 +458,7 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
 
 
 if __name__ == "__main__":
-    run_training_loop(read_deck())
+    from bc_pretrain import BC_CHECKPOINT_PATH
+
+    warmstart = BC_CHECKPOINT_PATH if BC_CHECKPOINT_PATH.exists() else None
+    run_training_loop(read_deck(), warmstart_checkpoint=warmstart)
