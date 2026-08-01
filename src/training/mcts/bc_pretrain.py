@@ -78,17 +78,16 @@ def extract_samples_from_episode(episode: dict, our_deck: list[int]) -> list[Sam
         our_deck: エンコーダに渡す「自分のデッキ」(今採用している60枚のカードID)。
 
     Returns:
-        list[Sample]: labelまで埋めた学習サンプル(値はその対局の最終結果+1/-1/0、
-            探索によるTD補正は無し)。
+        list[Sample]: labelまで埋めた学習サンプル(値は常に+1、探索によるTD補正は無し)。
     """
     seat = _find_archetype_seat(episode)
     if seat is None:
         return []
 
     rewards = episode.get("rewards")
-    if rewards is None or rewards[seat] not in (-1, 0, 1):
-        return []
-    value = float(rewards[seat])
+    if rewards is None or rewards[seat] != 1:
+        return []  # 負け/引き分けの対局は模倣元として使わない(下手な手も学習してしまうため)
+    value = 1.0
 
     samples: list[Sample] = []
     for step in episode["steps"]:

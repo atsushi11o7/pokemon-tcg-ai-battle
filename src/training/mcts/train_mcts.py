@@ -12,6 +12,7 @@ import multiprocessing
 import os
 import random
 import sys
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -47,6 +48,7 @@ GAMES_PER_ROUND = 200  # 並列自己対戦(SEARCH_COUNT=50)で実測1ラウン�
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
 SEARCH_COUNT = 50  # 1手あたりのMCTSシミュレーション回数(並列化・GPU化で得た余裕分を投入)
 NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # 自己対戦を並列実行するプロセス数
+SELFPLAY_GAME_TIMEOUT_SECONDS = 300  # 1試合がこれを超えて終わらなければフリーズとみなして諦める
 EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
@@ -55,6 +57,7 @@ EVAL_GAMES_PER_ROUND = 10  # ラウンドごとのアリーナ戦・ランダム
 GATING_WIN_RATE = 0.5  # 候補ネットワークを採用する最低勝率(対戦相手ごとに判定)
 CHECKPOINT_POOL_SIZE = 3  # ゲーティングで保持する過去に採用されたネットワークの数
 GATING_POOL_SAMPLE = 2  # 1ラウンドで追加サンプリングする過去ネットワーク数
+REPLAY_BUFFER_ROUNDS = 5  # 学習に使う直近ラウンド数(公式サンプルは常に1ラウンド分のみ)
 
 # ネットワーク構成(公式サンプルコードの`MyModel(128, 2, 256, 1, 1)`と同じ規模)
 D_MODEL = 128
@@ -346,6 +349,7 @@ def _run_selfplay_round(
     """
     all_samples: list[Sample] = []
     results = {0: 0, 1: 0, 2: 0}
+    timed_out = 0
     # "fork"(デフォルト)だと、親プロセスで既にimport済みのtorchが持つ内部スレッドが
     # forkの瞬間にロックを保持していた場合、そのロックは子プロセスに引き継がれたまま
     # 二度と解放されずデッドロックしうる(PyTorch公式が警告している既知の問題)。
@@ -355,29 +359,37 @@ def _run_selfplay_round(
         initializer=_init_selfplay_worker,
         initargs=(network.state_dict(), deck, opponent_deck_pool, search_count),
     ) as pool:
-        for game_index, (samples, winner) in enumerate(
-            pool.imap_unordered(_play_one_selfplay_game, range(num_games))
-        ):
-            all_samples.extend(samples)
-            results[winner] += 1
-            if (game_index + 1) % 20 == 0 or game_index + 1 == num_games:
-                print(f"  game {game_index + 1}/{num_games}  results_so_far={results}")
+        # imap_unorderedだと1局でもフリーズすると全体が永久に止まるため、試合ごとに
+        # タイムアウトを設け、詰まった試合は諦めて先に進む。
+        async_results = [pool.apply_async(_play_one_selfplay_game, (i,)) for i in range(num_games)]
+        for i, async_result in enumerate(async_results):
+            try:
+                samples, winner = async_result.get(timeout=SELFPLAY_GAME_TIMEOUT_SECONDS)
+                all_samples.extend(samples)
+                results[winner] += 1
+            except multiprocessing.TimeoutError:
+                timed_out += 1
+                print(
+                    f"  game {i + 1}/{num_games} timed out after "
+                    f"{SELFPLAY_GAME_TIMEOUT_SECONDS}s, skipping"
+                )
+            done = i + 1
+            if done % 20 == 0 or done == num_games:
+                print(f"  game {done}/{num_games}  results_so_far={results}  timed_out={timed_out}")
     return all_samples, results
 
 
 def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None) -> PolicyValueNet:
     """自己対戦→学習→アリーナ評価を`N_ROUNDS`回繰り返すメインループ。
 
-    各ラウンド、`best_network`で自己対戦したデータで候補ネットワークを学習し、
-    `best_network`本人と過去に採用された`checkpoint_pool`からランダムに選んだ
-    `GATING_POOL_SAMPLE`体、それら全員との対戦を合算した勝率が`GATING_WIN_RATE`を
-    超えた場合のみ`best_network`を候補で置き換える(AlphaZeroのアリーナ/ゲーティング)。
-    直近のbest_networkにだけ勝てばよい基準だと、非推移的な関係(候補がAに勝ち、Aが
-    以前のBに勝っていたが、候補はBには勝てない、等)に弱いため、過去の複数バージョンも
-    検証する。対戦相手ごとに個別の勝ち越しを要求すると相手が増えるほど合格率が乗算的に
-    下がってしまうため、合算勝率で判定する。
-    ランダム相手との勝率も、汎化の絶対的な下限の目安として毎ラウンド測る。
-    対戦相手には`determinize.load_opponent_deck_pool`で集めた実在デッキをランダムに使う。
+    各ラウンド、直近`REPLAY_BUFFER_ROUNDS`ラウンド分の自己対戦データ(リプレイバッファ)で
+    候補ネットワークを学習する。`best_network`と過去チェックポイントの一部(`checkpoint_pool`)
+    との対戦を合算した勝率が`GATING_WIN_RATE`を超えた場合のみ採用する
+    (AlphaZeroのアリーナ/ゲーティング。個別の勝ち越しではなく合算勝率で判定するのは、
+    相手が増えるほど合格率が乗算的に下がるのを避けるため)。
+    ゲーティングは公平な比較のため両者とも`deck`を使うミラー戦だが、それだけだと
+    自己対戦で学んだはずの多様な相手への対応力を検証できないため、ランダム相手の
+    デッキは毎ラウンド`opponent_deck_pool`からランダムに選び、汎化の下限の目安とする。
 
     Args:
         deck: 本番でも使う、こちらの60枚のデッキリスト。
@@ -402,7 +414,8 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
 
     checkpoint_pool: list[
         PolicyValueNet
-    ] = []  # 過去に採用されたネットワーク(直近優先、最大CHECKPOINT_POOL_SIZE件)
+    ] = []  # 採用済みの過去ネットワーク(最大CHECKPOINT_POOL_SIZE件)
+    replay_buffer: deque[list[Sample]] = deque(maxlen=REPLAY_BUFFER_ROUNDS)  # 直近ラウンドのSample
 
     for round_index in range(N_ROUNDS):
         print(
@@ -413,9 +426,13 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         )
         print(f"  round results: {results}  total_samples={len(all_samples)}")
 
+        replay_buffer.append(all_samples)
+        train_samples = [sample for round_samples in replay_buffer for sample in round_samples]
+
         print(f"=== round {round_index + 1}/{N_ROUNDS}: training ===")
+        print(f"  training on {len(train_samples)} samples from last {len(replay_buffer)} round(s)")
         candidate_network = copy.deepcopy(best_network)
-        train_one_round(candidate_network, all_samples, EPOCHS_PER_ROUND)
+        train_one_round(candidate_network, train_samples, EPOCHS_PER_ROUND)
 
         print(
             f"=== round {round_index + 1}/{N_ROUNDS}: arena vs best_network + checkpoint pool ==="
@@ -447,12 +464,13 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
                 checkpoint_pool.pop(0)
             best_network = candidate_network
 
-        print(f"=== round {round_index + 1}/{N_ROUNDS}: eval vs random ===")
+        print(f"=== round {round_index + 1}/{N_ROUNDS}: eval vs random (diverse deck) ===")
         eval_agent = make_mcts_eval_agent(best_network, deck)
+        random_opponent_deck = random.choice(opponent_deck_pool)
         vs_random = match_evaluate(
-            eval_agent, _random_agent_factory(deck), n_episodes=EVAL_GAMES_PER_ROUND
+            eval_agent, _random_agent_factory(random_opponent_deck), n_episodes=EVAL_GAMES_PER_ROUND
         )
-        print(f"  vs random: {vs_random}")
+        print(f"  vs random (opponent deck size {len(set(random_opponent_deck))}): {vs_random}")
 
         checkpoint_path = CHECKPOINT_DIR / f"round{round_index + 1}.pt"
         torch.save(best_network.state_dict(), checkpoint_path)
