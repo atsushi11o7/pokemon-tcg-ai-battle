@@ -12,6 +12,34 @@ from sparse_features import SparseVector, decoder_size, encoder_size
 
 NUM_WORDS_ENCODER = 24  # get_encoder_inputが作るトークン数(ベンチ8x2+アクティブ2+盤面2+手札1+デッキ1+スタジアム1+ターン情報1)
 
+# 所有者(誰の情報か)とゾーン(何の種類の情報か)。ベンチ8枠はゲームルール上並び順に
+# 意味が無いため、スロットごとに別の埋め込みを持たせず、所有者ごとに1つを共有する。
+_OWNER_SHARED, _OWNER_OWN, _OWNER_OPP = 0, 1, 2
+_NUM_OWNERS = 3
+(
+    _ZONE_CLS,
+    _ZONE_ACTIVE,
+    _ZONE_BENCH,
+    _ZONE_PLAYER_INFO,
+    _ZONE_HAND,
+    _ZONE_DECK,
+    _ZONE_STADIUM,
+    _ZONE_TURN,
+) = range(8)
+_NUM_ZONES = 8
+
+# get_encoder_inputの出力順(CLSを先頭に追加した後)に対応する(owner, zone)の並び
+_TOKEN_OWNER_ZONE = (
+    [(_OWNER_SHARED, _ZONE_CLS)]
+    + [(_OWNER_OWN, _ZONE_BENCH)] * 8
+    + [(_OWNER_OPP, _ZONE_BENCH)] * 8
+    + [(_OWNER_OWN, _ZONE_ACTIVE), (_OWNER_OPP, _ZONE_ACTIVE)]
+    + [(_OWNER_OWN, _ZONE_PLAYER_INFO), (_OWNER_OPP, _ZONE_PLAYER_INFO)]
+    + [(_OWNER_OWN, _ZONE_HAND), (_OWNER_OWN, _ZONE_DECK)]
+    + [(_OWNER_SHARED, _ZONE_STADIUM), (_OWNER_SHARED, _ZONE_TURN)]
+)
+assert len(_TOKEN_OWNER_ZONE) == NUM_WORDS_ENCODER + 1
+
 
 class DecoderLayer(nn.Module):
     """エンコーダの出力に対して交差注意を行う、デコーダの1層分。"""
@@ -76,20 +104,30 @@ class PolicyValueNet(nn.Module):
         self.d_model = d_model
 
         self.encoder_bag = nn.EmbeddingBag(encoder_size(), d_model, mode="sum")
-        # 位置0はCLSトークン、位置1〜24が盤面の24スロット(get_encoder_inputの固定順序)に対応
-        self.pos_embedding = nn.Embedding(NUM_WORDS_ENCODER + 1, d_model)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # ベンチはゲームルール上スロット番号に意味が無いため、個別の位置埋め込みではなく
+        # 所有者(自分/相手/共通)とゾーン(ベンチ/アクティブ/手札等)の埋め込みの和で表す
+        # (自分のベンチ8枠は全て同じ埋め込みを共有する)
+        owner_ids, zone_ids = zip(*_TOKEN_OWNER_ZONE, strict=True)
+        self.register_buffer("_owner_ids", torch.tensor(owner_ids, dtype=torch.long))
+        self.register_buffer("_zone_ids", torch.tensor(zone_ids, dtype=torch.long))
+        self.owner_embedding = nn.Embedding(_NUM_OWNERS, d_model)
+        self.zone_embedding = nn.Embedding(_NUM_ZONES, d_model)
         encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, d_feedforward, 0)
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers_encoder, enable_nested_tensor=False
         )
-        self.encoder_fc = nn.Linear(d_model, 1)
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1)
+        )
 
         self.decoder_bag = nn.EmbeddingBag(decoder_size(), d_model, mode="sum")
         self.decoder = nn.ModuleList(
             [DecoderLayer(d_model, num_heads, d_feedforward) for _ in range(num_layers_decoder)]
         )
-        self.decoder_fc = nn.Linear(d_model, 1)
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1)
+        )
 
     def forward(
         self,
@@ -122,7 +160,8 @@ class PolicyValueNet(nn.Module):
 
         cls = self.cls_token.expand(1, batch_size, -1)
         v = torch.cat([cls, v], dim=0)  # (NUM_WORDS_ENCODER + 1, batch, d_model)
-        v = v + self.pos_embedding.weight.unsqueeze(1)
+        v = v + self.owner_embedding(self._owner_ids).unsqueeze(1)
+        v = v + self.zone_embedding(self._zone_ids).unsqueeze(1)
 
         encoder_out = self.encoder(v)
         value = torch.tanh(self.encoder_fc(encoder_out[0]))  # CLSトークンの出力だけを価値に使う
@@ -131,8 +170,8 @@ class PolicyValueNet(nn.Module):
         p = p.reshape(batch_size, -1, self.d_model).transpose(0, 1)
         for layer in self.decoder:
             p = layer(p, encoder_out)
-        p = self.decoder_fc(p)
-        policy_scores = p.transpose(0, 1).view(batch_size, -1)
+        p = self.decoder_fc(p)  # (n_actions, batch, 1)
+        policy_scores = p.transpose(0, 1).squeeze(-1)  # (batch, n_actions)
         return value, policy_scores
 
 
