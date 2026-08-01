@@ -8,6 +8,8 @@ Usage:
 """
 
 import copy
+import multiprocessing
+import os
 import random
 import sys
 from pathlib import Path
@@ -38,9 +40,10 @@ from match_runner import evaluate as match_evaluate  # noqa: E402
 DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 
-GAMES_PER_ROUND = 200  # 全選択を探索するようになった分、1試合あたり約3.5秒(以前は2.2秒)
+GAMES_PER_ROUND = 200  # 1試合あたり約3.5秒(逐次実行時)。並列自己対戦だと実測で1ラウンド約110秒
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
 SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数
+NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # 自己対戦を並列実行するプロセス数
 EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
@@ -253,6 +256,92 @@ def make_mcts_eval_agent(network: PolicyValueNet, our_deck: list[int]):
     return agent
 
 
+_worker_network: PolicyValueNet | None = None
+_worker_deck: list[int] | None = None
+_worker_opponent_pool: list[list[int]] | None = None
+_worker_search_count: int | None = None
+
+
+def _init_selfplay_worker(
+    state_dict: dict, deck: list[int], opponent_deck_pool: list[list[int]], search_count: int
+) -> None:
+    """自己対戦ワーカープロセスの初期化(プロセスごとに1回だけ呼ばれる)。
+
+    `cg`エンジンはプロセスグローバルな状態を持つため、対局はプロセスをまたいで並列化する
+    必要がある(1プロセス内では同時に複数対局を進められない)。forkで複製された`random`の
+    状態がワーカー間で重複しないよう、PIDでの再シードも行う。トーチのスレッド内並列は
+    プロセス間並列と競合するため無効化する。
+
+    Args:
+        state_dict: この自己対戦ラウンドで使う`PolicyValueNet`の`state_dict()`。
+        deck: こちらの60枚のデッキリスト。
+        opponent_deck_pool: 対戦相手として選ぶ実在デッキのリスト。
+        search_count: 1手あたりのMCTSシミュレーション回数。
+    """
+    global _worker_network, _worker_deck, _worker_opponent_pool, _worker_search_count
+    torch.set_num_threads(1)
+    random.seed(os.getpid())
+    network = PolicyValueNet(
+        D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
+    )
+    network.load_state_dict(state_dict)
+    network.eval()
+    _worker_network = network
+    _worker_deck = deck
+    _worker_opponent_pool = opponent_deck_pool
+    _worker_search_count = search_count
+
+
+def _play_one_selfplay_game(_game_index: int) -> tuple[list[Sample], int]:
+    """ワーカープロセス内で1試合分の自己対戦を行う(`_init_selfplay_worker`の初期化後に呼ばれる)。
+
+    Args:
+        _game_index: `pool.imap_unordered`が渡すインデックス(使わないが引数として必要)。
+
+    Returns:
+        tuple[list[Sample], int]: `selfplay.play_selfplay_game`の戻り値そのまま。
+    """
+    return play_selfplay_game(
+        _worker_network, _worker_deck, _worker_opponent_pool, _worker_search_count
+    )
+
+
+def _run_selfplay_round(
+    network: PolicyValueNet,
+    deck: list[int],
+    opponent_deck_pool: list[list[int]],
+    search_count: int,
+    num_games: int,
+) -> tuple[list[Sample], dict[int, int]]:
+    """1ラウンド分の自己対戦を、`NUM_SELFPLAY_WORKERS`個のプロセスで並列実行する。
+
+    Args:
+        network: 自己対戦に使う`PolicyValueNet`(eval modeにしておくこと)。
+        deck: こちらの60枚のデッキリスト。
+        opponent_deck_pool: 対戦相手として選ぶ実在デッキのリスト。
+        search_count: 1手あたりのMCTSシミュレーション回数。
+        num_games: このラウンドで行う試合数。
+
+    Returns:
+        tuple[list[Sample], dict[int, int]]: (全試合分のSample, 勝敗内訳{0: , 1: , 2(引分): })。
+    """
+    all_samples: list[Sample] = []
+    results = {0: 0, 1: 0, 2: 0}
+    with multiprocessing.Pool(
+        processes=NUM_SELFPLAY_WORKERS,
+        initializer=_init_selfplay_worker,
+        initargs=(network.state_dict(), deck, opponent_deck_pool, search_count),
+    ) as pool:
+        for game_index, (samples, winner) in enumerate(
+            pool.imap_unordered(_play_one_selfplay_game, range(num_games))
+        ):
+            all_samples.extend(samples)
+            results[winner] += 1
+            if (game_index + 1) % 20 == 0 or game_index + 1 == num_games:
+                print(f"  game {game_index + 1}/{num_games}  results_so_far={results}")
+    return all_samples, results
+
+
 def run_training_loop(deck: list[int]) -> PolicyValueNet:
     """自己対戦→学習→アリーナ評価を`N_ROUNDS`回繰り返すメインループ。
 
@@ -279,17 +368,12 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
     print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
 
     for round_index in range(N_ROUNDS):
-        print(f"=== round {round_index + 1}/{N_ROUNDS}: self-play ===")
-        all_samples: list[Sample] = []
-        results = {0: 0, 1: 0, 2: 0}
-        for game_index in range(GAMES_PER_ROUND):
-            samples, winner = play_selfplay_game(
-                best_network, deck, opponent_deck_pool, SEARCH_COUNT
-            )
-            all_samples.extend(samples)
-            results[winner] += 1
-            if (game_index + 1) % 20 == 0 or game_index + 1 == GAMES_PER_ROUND:
-                print(f"  game {game_index + 1}/{GAMES_PER_ROUND}  results_so_far={results}")
+        print(
+            f"=== round {round_index + 1}/{N_ROUNDS}: self-play ({NUM_SELFPLAY_WORKERS} workers) ==="
+        )
+        all_samples, results = _run_selfplay_round(
+            best_network, deck, opponent_deck_pool, SEARCH_COUNT, GAMES_PER_ROUND
+        )
         print(f"  round results: {results}  total_samples={len(all_samples)}")
 
         print(f"=== round {round_index + 1}/{N_ROUNDS}: training ===")
