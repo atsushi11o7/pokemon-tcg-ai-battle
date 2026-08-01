@@ -35,7 +35,7 @@ from cg.api import (  # noqa: E402
 sys.path.insert(0, str(ROOT / "src" / "evaluation"))
 from match_runner import evaluate as match_evaluate  # noqa: E402
 
-DECK_PATH = ROOT / "submission" / "01_rule_based" / "deck.csv"
+DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 
 GAMES_PER_ROUND = 200  # 全選択を探索するようになった分、1試合あたり約3.5秒(以前は2.2秒)
@@ -57,7 +57,7 @@ NUM_LAYERS_DECODER = 1
 
 
 def read_deck() -> list[int]:
-    """自己対戦に使う、01_rule_based/BCと共通のdeck.csv(60行のカードID)を読み込む。
+    """自己対戦に使う、decks/配下の共通deck.csv(60行のカードID)を読み込む。
 
     Returns:
         list[int]: 60枚分のカードID。

@@ -34,7 +34,7 @@ from cg.api import (  # noqa: E402
     to_observation_class,
 )
 
-DECK_PATH = ROOT / "submission" / "01_rule_based" / "deck.csv"
+DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数(GPU無し・2vCPU実行のため小さめ)
 
@@ -72,7 +72,7 @@ _own_deck_cache: list[int] | None = None
 
 
 def read_deck() -> list[int]:
-    """デッキ提出用に、01_rule_basedと共通のdeck.csv(60行のカードID)を読み込む。
+    """デッキ提出用に、decks/配下の共通deck.csv(60行のカードID)を読み込む。
 
     Returns:
         list[int]: 60枚分のカードID。

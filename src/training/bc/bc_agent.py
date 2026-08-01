@@ -21,8 +21,8 @@ from train_bc import HIDDEN_DIM, MODEL_PATH, PolicyNet  # noqa: E402
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import Observation, SelectData, SelectType, to_observation_class  # noqa: E402
 
-# ルールベースエージェント(01_rule_based)と同じデッキ(Issue #4で決定したもの)を使う
-DECK_PATH = ROOT / "submission" / "01_rule_based" / "deck.csv"
+# 現在採用中のデッキ(Issue #4で決定したもの、decks/配下で管理)を使う
+DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 
 _model = PolicyNet(STATE_DIM, OPTION_DIM, HIDDEN_DIM)
 _model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
@@ -30,7 +30,7 @@ _model.eval()
 
 
 def read_deck() -> list[int]:
-    """デッキ提出用に、01_rule_basedと共通のdeck.csv（60行のカードID）を読み込む。
+    """デッキ提出用に、decks/配下の共通deck.csv（60行のカードID）を読み込む。
 
     Returns:
         list[int]: 60枚分のカードID。
