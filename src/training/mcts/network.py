@@ -75,6 +75,9 @@ class PolicyValueNet(nn.Module):
         self.d_model = d_model
 
         self.encoder_bag = nn.EmbeddingBag(encoder_size(), d_model, mode="sum")
+        # 位置0はCLSトークン、位置1〜24が盤面の24スロット(get_encoder_inputの固定順序)に対応
+        self.pos_embedding = nn.Embedding(NUM_WORDS_ENCODER + 1, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, d_feedforward, 0)
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers_encoder, enable_nested_tensor=False
@@ -114,9 +117,13 @@ class PolicyValueNet(nn.Module):
         v = self.encoder_bag(index_encoder, offset_encoder, value_encoder)
         v = v.reshape(-1, NUM_WORDS_ENCODER, self.d_model).transpose(0, 1)
         batch_size = v.size(1)
+
+        cls = self.cls_token.expand(1, batch_size, -1)
+        v = torch.cat([cls, v], dim=0)  # (NUM_WORDS_ENCODER + 1, batch, d_model)
+        v = v + self.pos_embedding.weight.unsqueeze(1)
+
         encoder_out = self.encoder(v)
-        v = self.encoder_fc(encoder_out)
-        value = torch.tanh(v.mean(0))
+        value = torch.tanh(self.encoder_fc(encoder_out[0]))  # CLSトークンの出力だけを価値に使う
 
         p = self.decoder_bag(index_decoder, offset_decoder, value_decoder)
         p = p.reshape(batch_size, -1, self.d_model).transpose(0, 1)
