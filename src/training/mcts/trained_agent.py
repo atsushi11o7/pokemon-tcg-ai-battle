@@ -5,7 +5,6 @@
 最小構成(`src/evaluation/match_runner.py`での評価用)。
 """
 
-import random
 import re
 import sys
 from pathlib import Path
@@ -15,11 +14,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from determinize import (  # noqa: E402
-    sample_opponent_active_guess,
-    sample_opponent_hidden,
-    sample_own_hidden,
-)
+from determinize import search_begin_kwargs  # noqa: E402
 from network import PolicyValueNet  # noqa: E402
 from search import run_mcts  # noqa: E402
 from selfplay import make_eval_fn  # noqa: E402
@@ -34,8 +29,6 @@ from train_mcts import (  # noqa: E402
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import (  # noqa: E402
     Observation,
-    SelectData,
-    SelectType,
     search_begin,
     search_end,
     to_observation_class,
@@ -117,53 +110,16 @@ def _get_eval_fn():
     return _eval_fn
 
 
-def _search_begin_kwargs(obs: Observation) -> dict:
-    """`search_begin`に渡す、隠れ情報の仮定一式を組み立てる。
-
-    自分側は既知のデッキリストから、相手側は過去リプレイのカード出現頻度から
-    それぞれサンプリングする(`determinize.py`)。相手のアクティブポケモンが伏せられている
-    場合のみ、その正体の仮定も追加する。
-
-    Args:
-        obs: 探索を開始したい局面のObservation。
-
-    Returns:
-        dict: `search_begin`にそのまま`**kwargs`で渡せる引数一式。
-    """
-    state = obs.current
-    your_index = state.yourIndex
-    me = state.players[your_index]
-    opp = state.players[1 - your_index]
-
-    your_deck, your_prize = sample_own_hidden(_own_deck(), me.deckCount, len(me.prize))
-    opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
-        opp.deckCount, opp.handCount, len(opp.prize)
-    )
-    opponent_active: list[int] = []
-    if opp.active and opp.active[0] is None:
-        opponent_active = [sample_opponent_active_guess()]
-
-    return {
-        "your_deck": your_deck,
-        "your_prize": your_prize,
-        "opponent_deck": opponent_deck,
-        "opponent_prize": opponent_prize,
-        "opponent_hand": opponent_hand,
-        "opponent_active": opponent_active,
-    }
-
-
 def choose_with_mcts(obs: Observation) -> list[int]:
     """隠れ情報を1つ仮定した上でDeterminized MCTSを実行し、最善と判断した選択を返す。
 
     Args:
-        obs: `select.type`がMAIN/EVOLVEで、`minCount==maxCount==1`であることを
-            呼び出し側で保証しておくこと。
+        obs: `select`がNoneでない局面のObservation。
 
     Returns:
-        list[int]: 選んだ選択肢のindexを1つだけ含むリスト。
+        list[int]: 選んだ選択肢のindexのリスト。
     """
-    root_state = search_begin(obs, **_search_begin_kwargs(obs))
+    root_state = search_begin(obs, **search_begin_kwargs(obs, _own_deck()))
     try:
         select, _policy_target, _root_value, _actions = run_mcts(
             root_state, obs.current.yourIndex, _get_eval_fn(), SEARCH_COUNT
@@ -173,21 +129,8 @@ def choose_with_mcts(obs: Observation) -> list[int]:
     return select
 
 
-def fallback_random(sel: SelectData) -> list[int]:
-    """探索の対象外の選択(セットアップ・サーチ等)に対して、ランダムに選ぶ。
-
-    Args:
-        sel: 今回の選択肢一式。
-
-    Returns:
-        list[int]: `minCount`以上`maxCount`以下の個数だけランダムに選んだindexのリスト。
-    """
-    count = random.randint(sel.minCount, sel.maxCount)
-    return random.sample(range(len(sel.option)), count)
-
-
 def agent(obs_dict: dict) -> list[int]:
-    """MAIN/EVOLVEの単一選択はDeterminized MCTS(学習済みネットワーク)で、それ以外はランダムで応答する。
+    """デッキ提出以外は、あらゆる選択をDeterminized MCTSで決める。
 
     Args:
         obs_dict: kaggle_environmentsから渡される観測(生dict)。
@@ -198,11 +141,4 @@ def agent(obs_dict: dict) -> list[int]:
     obs: Observation = to_observation_class(obs_dict)
     if obs.select is None:
         return read_deck()
-    sel = obs.select
-    if (
-        sel.type in (SelectType.MAIN, SelectType.EVOLVE)
-        and sel.minCount == sel.maxCount == 1
-        and (len(sel.option) >= 2)
-    ):
-        return choose_with_mcts(obs)
-    return fallback_random(sel)
+    return choose_with_mcts(obs)

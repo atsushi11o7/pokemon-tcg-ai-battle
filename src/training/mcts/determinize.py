@@ -100,6 +100,39 @@ def sample_own_hidden(
     return sampled[:deck_count], sampled[deck_count:]
 
 
+def search_begin_kwargs(obs, our_deck: list[int]) -> dict:
+    """`search_begin`に渡す、隠れ情報の仮定一式を組み立てる(自分のデッキは既知、相手は不明)。
+
+    Args:
+        obs: 探索を開始したい局面のObservation。
+        our_deck: 自分の60枚のデッキリスト(既知)。
+
+    Returns:
+        dict: `search_begin`にそのまま`**kwargs`で渡せる引数一式。
+    """
+    state = obs.current
+    your_index = state.yourIndex
+    me = state.players[your_index]
+    opp = state.players[1 - your_index]
+
+    your_deck, your_prize = sample_own_hidden(our_deck, me.deckCount, len(me.prize))
+    opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
+        opp.deckCount, opp.handCount, len(opp.prize)
+    )
+    opponent_active: list[int] = []
+    if opp.active and opp.active[0] is None:
+        opponent_active = [sample_opponent_active_guess()]
+
+    return {
+        "your_deck": your_deck,
+        "your_prize": your_prize,
+        "opponent_deck": opponent_deck,
+        "opponent_prize": opponent_prize,
+        "opponent_hand": opponent_hand,
+        "opponent_active": opponent_active,
+    }
+
+
 def _pokemon_ids() -> set[int]:
     """全カードマスタから、ポケモンカードのIDだけを遅延ロードしてキャッシュする。
 
