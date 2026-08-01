@@ -43,9 +43,9 @@ DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )  # 学習(train_one_round)のみで使う
 
-GAMES_PER_ROUND = 200  # 1試合あたり約3.5秒(逐次実行時)。並列自己対戦だと実測で1ラウンド約110秒
+GAMES_PER_ROUND = 200  # 並列自己対戦(SEARCH_COUNT=50)で実測1ラウンド約690秒(200試合)
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
-SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数
+SEARCH_COUNT = 50  # 1手あたりのMCTSシミュレーション回数(並列化・GPU化で得た余裕分を投入)
 NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # 自己対戦を並列実行するプロセス数
 EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
