@@ -35,7 +35,8 @@ class DecoderLayer(nn.Module):
 
         Args:
             x: 形状`(n_actions, batch, d_model)`のデコーダ側の入力(行動ごとの埋め込み)。
-            encoder_out: 形状`(24, batch, d_model)`のエンコーダの出力。
+            encoder_out: 形状`(NUM_WORDS_ENCODER + 1, batch, d_model)`のエンコーダの出力。
+                先頭がCLSトークン、残り`NUM_WORDS_ENCODER`個が盤面スロット。
 
         Returns:
             torch.Tensor: 形状`(n_actions, batch, d_model)`の更新後のデコーダ側の系列。
