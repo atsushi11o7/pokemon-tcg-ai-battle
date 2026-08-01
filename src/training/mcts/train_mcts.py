@@ -43,16 +43,18 @@ DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )  # 学習(train_one_round)のみで使う
 
-GAMES_PER_ROUND = 200  # 1試合あたり約3.5秒(逐次実行時)。並列自己対戦だと実測で1ラウンド約110秒
+GAMES_PER_ROUND = 200  # 並列自己対戦(SEARCH_COUNT=50)で実測1ラウンド約690秒(200試合)
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
-SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数
+SEARCH_COUNT = 50  # 1手あたりのMCTSシミュレーション回数(並列化・GPU化で得た余裕分を投入)
 NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # 自己対戦を並列実行するプロセス数
 EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 SEED = 0
 EVAL_GAMES_PER_ROUND = 10  # ラウンドごとのアリーナ戦・ランダム相手戦の試合数
-GATING_WIN_RATE = 0.5  # 候補ネットワークをbest_networkとして採用する最低勝率
+GATING_WIN_RATE = 0.5  # 候補ネットワークを採用する最低勝率(対戦相手ごとに判定)
+CHECKPOINT_POOL_SIZE = 3  # ゲーティングで保持する過去に採用されたネットワークの数
+GATING_POOL_SAMPLE = 2  # 1ラウンドで追加サンプリングする過去ネットワーク数
 
 # ネットワーク構成(公式サンプルコードの`MyModel(128, 2, 256, 1, 1)`と同じ規模)
 D_MODEL = 128
@@ -204,6 +206,7 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
             optimizer.step()
 
             batch_size = value_labels.shape[0]
@@ -362,8 +365,13 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
     """自己対戦→学習→アリーナ評価を`N_ROUNDS`回繰り返すメインループ。
 
     各ラウンド、`best_network`で自己対戦したデータで候補ネットワークを学習し、
-    `best_network`とのミラー戦(両者とも`deck`を使用)に勝ち越した場合のみ
-    `best_network`を候補で置き換える(AlphaZeroのアリーナ/ゲーティング)。
+    `best_network`本人と過去に採用された`checkpoint_pool`からランダムに選んだ
+    `GATING_POOL_SAMPLE`体、それら全員との対戦を合算した勝率が`GATING_WIN_RATE`を
+    超えた場合のみ`best_network`を候補で置き換える(AlphaZeroのアリーナ/ゲーティング)。
+    直近のbest_networkにだけ勝てばよい基準だと、非推移的な関係(候補がAに勝ち、Aが
+    以前のBに勝っていたが、候補はBには勝てない、等)に弱いため、過去の複数バージョンも
+    検証する。対戦相手ごとに個別の勝ち越しを要求すると相手が増えるほど合格率が乗算的に
+    下がってしまうため、合算勝率で判定する。
     ランダム相手との勝率も、汎化の絶対的な下限の目安として毎ラウンド測る。
     対戦相手には`determinize.load_opponent_deck_pool`で集めた実在デッキをランダムに使う。
 
@@ -383,6 +391,10 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
     opponent_deck_pool = load_opponent_deck_pool()
     print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
 
+    checkpoint_pool: list[
+        PolicyValueNet
+    ] = []  # 過去に採用されたネットワーク(直近優先、最大CHECKPOINT_POOL_SIZE件)
+
     for round_index in range(N_ROUNDS):
         print(
             f"=== round {round_index + 1}/{N_ROUNDS}: self-play ({NUM_SELFPLAY_WORKERS} workers) ==="
@@ -396,14 +408,34 @@ def run_training_loop(deck: list[int]) -> PolicyValueNet:
         candidate_network = copy.deepcopy(best_network)
         train_one_round(candidate_network, all_samples, EPOCHS_PER_ROUND)
 
-        print(f"=== round {round_index + 1}/{N_ROUNDS}: arena vs best_network ===")
+        print(
+            f"=== round {round_index + 1}/{N_ROUNDS}: arena vs best_network + checkpoint pool ==="
+        )
         candidate_agent = make_mcts_eval_agent(candidate_network, deck)
-        best_agent = make_mcts_eval_agent(best_network, deck)
-        arena_result = match_evaluate(candidate_agent, best_agent, n_episodes=EVAL_GAMES_PER_ROUND)
-        accepted = arena_result["win_rate"] > GATING_WIN_RATE
-        print(f"  candidate vs best: {arena_result}  accepted={accepted}")
+        gating_opponents = [("current_best", best_network)]
+        sampled_past = random.sample(checkpoint_pool, min(len(checkpoint_pool), GATING_POOL_SAMPLE))
+        gating_opponents += [(f"past_{i}", net) for i, net in enumerate(sampled_past)]
+
+        total_wins = 0
+        total_games = 0
+        for name, opponent_network in gating_opponents:
+            opponent_agent = make_mcts_eval_agent(opponent_network, deck)
+            result = match_evaluate(
+                candidate_agent, opponent_agent, n_episodes=EVAL_GAMES_PER_ROUND
+            )
+            print(f"  candidate vs {name}: {result}")
+            total_wins += result["wins"]
+            total_games += EVAL_GAMES_PER_ROUND
+        pooled_win_rate = total_wins / total_games
+        accepted = pooled_win_rate > GATING_WIN_RATE
+        print(
+            f"  pooled_win_rate={pooled_win_rate:.3f} ({total_wins}/{total_games})  accepted={accepted}"
+        )
 
         if accepted:
+            checkpoint_pool.append(copy.deepcopy(best_network))
+            if len(checkpoint_pool) > CHECKPOINT_POOL_SIZE:
+                checkpoint_pool.pop(0)
             best_network = candidate_network
 
         print(f"=== round {round_index + 1}/{N_ROUNDS}: eval vs random ===")
