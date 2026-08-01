@@ -78,7 +78,7 @@ def make_eval_fn(network, decks: list[list[int]]):
         decoder_sv = get_decoder_input(obs, actions)
         index_enc, value_enc, offset_enc = encoder_sv.to_tensors()
         index_dec, value_dec, offset_dec = decoder_sv.to_tensors()
-        with torch.no_grad():
+        with torch.inference_mode():
             value, scores = network(
                 index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec
             )
