@@ -39,6 +39,9 @@ from match_runner import evaluate as match_evaluate  # noqa: E402
 
 DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)  # 学習(train_one_round)のみで使う
 
 GAMES_PER_ROUND = 200  # 1試合あたり約3.5秒(逐次実行時)。並列自己対戦だと実測で1ラウンド約110秒
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
@@ -163,6 +166,8 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
     """
     dataset = SelfplayDataset(samples)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=_collate)
+
+    network.to(DEVICE)
     optimizer = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE)
 
     network.train()
@@ -180,6 +185,16 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
             policy_targets,
             value_labels,
         ) in loader:
+            index_enc = index_enc.to(DEVICE)
+            value_enc = value_enc.to(DEVICE)
+            offset_enc = offset_enc.to(DEVICE)
+            index_dec = index_dec.to(DEVICE)
+            value_dec = value_dec.to(DEVICE)
+            offset_dec = offset_dec.to(DEVICE)
+            mask = mask.to(DEVICE)
+            policy_targets = policy_targets.to(DEVICE)
+            value_labels = value_labels.to(DEVICE)
+
             values, scores = network(
                 index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec
             )
@@ -200,6 +215,7 @@ def train_one_round(network: PolicyValueNet, samples: list[Sample], epochs: int)
             f"  epoch {epoch + 1}/{epochs}  policy_loss={total_policy_loss / n:.4f}  "
             f"value_loss={total_value_loss / n:.4f}"
         )
+    network.to("cpu")
     network.eval()
 
 
