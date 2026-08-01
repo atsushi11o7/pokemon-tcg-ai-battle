@@ -112,7 +112,8 @@ class PolicyValueNet(nn.Module):
         Returns:
             tuple[torch.Tensor, torch.Tensor]: (value, policy_scores)。
                 value: 形状`(batch, 1)`の価値([-1, 1]、tanh済み)。
-                policy_scores: 形状`(batch, max_actions)`の方策スコア([-1, 1]、tanh済み)。
+                policy_scores: 形状`(batch, max_actions)`の方策の生ロジット(tanhなし、
+                    呼び出し側でsoftmax/log_softmaxする前提)。
         """
         v = self.encoder_bag(index_encoder, offset_encoder, value_encoder)
         v = v.reshape(-1, NUM_WORDS_ENCODER, self.d_model).transpose(0, 1)
@@ -130,8 +131,7 @@ class PolicyValueNet(nn.Module):
         for layer in self.decoder:
             p = layer(p, encoder_out)
         p = self.decoder_fc(p)
-        p = p.transpose(0, 1).view(batch_size, -1)
-        policy_scores = torch.tanh(p)
+        policy_scores = p.transpose(0, 1).view(batch_size, -1)
         return value, policy_scores
 
 
