@@ -56,7 +56,7 @@ BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 SEED = 0
 EVAL_GAMES_PER_ROUND = 10  # ラウンドごとのアリーナ戦・ランダム相手戦の試合数
-GATING_WIN_RATE = 0.5  # 候補ネットワークを採用する最低勝率(対戦相手ごとに判定)
+GATING_WIN_RATE = 0.5  # 候補ネットワークを採用する最低勝率(全ゲーティング対戦の合算で判定)
 CHECKPOINT_POOL_SIZE = 3  # ゲーティングで保持する過去に採用されたネットワークの数
 GATING_POOL_SAMPLE = 2  # 1ラウンドで追加サンプリングする過去ネットワーク数
 REPLAY_BUFFER_ROUNDS = 5  # 学習に使う直近ラウンド数(公式サンプルは常に1ラウンド分のみ)
@@ -292,12 +292,9 @@ def _init_selfplay_worker(
     """自己対戦ワーカープロセスの初期化(プロセスごとに1回だけ呼ばれる)。
 
     `cg`エンジンはプロセスグローバルな状態を持つため、対局はプロセスをまたいで並列化する
-    必要がある(1プロセス内では同時に複数対局を進められない)。さらに、並列度診断の結果、
-    複数プロセスが同時にエンジンへネイティブ呼び出しを行うとまれにクラッシュすることが
-    判明した(level=2でも発生、level=18で最大78%。プロセス間ロックでの直列化も試したが
-    解消せず)。そのため`_run_selfplay_round`ではワーカー数を1に固定し、常に1プロセスのみが
-    エンジンに触れるようにしている。forkで複製された`random`の状態がワーカー間で重複しない
-    よう、PIDでの再シードも行う。トーチのスレッド内並列はプロセス間並列と競合するため無効化する。
+    必要がある(1プロセス内では同時に複数対局を進められない)。forkで複製された`random`の
+    状態がワーカー間で重複しないよう、PIDでの再シードも行う。トーチのスレッド内並列は
+    プロセス間並列と競合するため無効化する。
 
     Args:
         state_dict: この自己対戦ラウンドで使う`PolicyValueNet`の`state_dict()`。
@@ -405,10 +402,8 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         PolicyValueNet: 最終ラウンド終了時点の`best_network`。
     """
     torch.manual_seed(SEED)
-    # load_opponent_deck_pool()(大量のJSONを読む)をPolicyValueNet構築より先に行う。
-    # 逆順だと、AllCard/AllAttack呼び出し(PolicyValueNet構築がencoder_size/decoder_size
-    # 経由で行う)の直後に大量のファイルI/Oを行った際にネイティブ側でクラッシュする
-    # ことを確認済み(順序依存で100%再現・回避できた。原因はソース上では特定できず)。
+    # PolicyValueNet構築(encoder_size/decoder_size経由でAllCard/AllAttackを呼ぶ)の直後に
+    # 大量のファイルI/Oを行うとネイティブ側でクラッシュするため、load_opponent_deck_pool()を先に呼ぶ。
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     opponent_deck_pool = load_opponent_deck_pool()
     print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
