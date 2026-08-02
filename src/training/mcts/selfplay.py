@@ -176,30 +176,31 @@ def play_selfplay_game(
 
     eval_fn = make_eval_fn(network, decks)
     obs_dict, start_data = battle_start(decks[0], decks[1])
-    if start_data.errorPlayer >= 0:
-        raise ValueError(f"deck error: errorType={start_data.errorType}")
+    try:
+        if start_data.errorPlayer >= 0:
+            raise ValueError(f"deck error: errorType={start_data.errorType}")
 
-    samples: list[Sample] = []
-    obs = to_observation_class(obs_dict)
+        samples: list[Sample] = []
+        obs = to_observation_class(obs_dict)
 
-    while obs.current.result < 0:
-        your_index = obs.current.yourIndex
-        root_state = search_begin(obs, **_search_begin_kwargs(obs, decks[your_index]))
-        try:
-            select, policy_target, root_value, actions = run_mcts(
-                root_state, your_index, eval_fn, search_count
-            )
-        finally:
-            search_end()
-        if your_index == our_seat:
-            encoder_sv = get_encoder_input(obs, our_deck)
-            decoder_sv = get_decoder_input(obs, actions)
-            samples.append(Sample(encoder_sv, decoder_sv, policy_target, root_value))
-        obs = to_observation_class(battle_select(select))
+        while obs.current.result < 0:
+            your_index = obs.current.yourIndex
+            root_state = search_begin(obs, **_search_begin_kwargs(obs, decks[your_index]))
+            try:
+                select, policy_target, root_value, actions = run_mcts(
+                    root_state, your_index, eval_fn, search_count
+                )
+            finally:
+                search_end()
+            if your_index == our_seat:
+                encoder_sv = get_encoder_input(obs, our_deck)
+                decoder_sv = get_decoder_input(obs, actions)
+                samples.append(Sample(encoder_sv, decoder_sv, policy_target, root_value))
+            obs = to_observation_class(battle_select(select))
 
-    battle_finish()
+        winner = obs.current.result
+        _assign_labels(samples, winner, our_seat)
 
-    winner = obs.current.result
-    _assign_labels(samples, winner, our_seat)
-
-    return samples, winner
+        return samples, winner
+    finally:
+        battle_finish()
