@@ -405,6 +405,14 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         PolicyValueNet: 最終ラウンド終了時点の`best_network`。
     """
     torch.manual_seed(SEED)
+    # load_opponent_deck_pool()(大量のJSONを読む)をPolicyValueNet構築より先に行う。
+    # 逆順だと、AllCard/AllAttack呼び出し(PolicyValueNet構築がencoder_size/decoder_size
+    # 経由で行う)の直後に大量のファイルI/Oを行った際にネイティブ側でクラッシュする
+    # ことを確認済み(順序依存で100%再現・回避できた。原因はソース上では特定できず)。
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    opponent_deck_pool = load_opponent_deck_pool()
+    print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
+
     best_network = PolicyValueNet(
         D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
     )
@@ -412,10 +420,6 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         best_network.load_state_dict(torch.load(warmstart_checkpoint, weights_only=True))
         print(f"warm-started best_network from {warmstart_checkpoint}")
     best_network.eval()
-
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    opponent_deck_pool = load_opponent_deck_pool()
-    print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
 
     checkpoint_pool: list[
         PolicyValueNet
