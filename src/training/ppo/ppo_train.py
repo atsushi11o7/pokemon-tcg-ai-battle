@@ -172,10 +172,11 @@ def _ppo_loss(
     probs_safe = log_probs_safe.exp()
     entropy = -(probs_safe * log_probs_safe).sum(dim=-1).mean()
 
-    normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # advantageはtrain_one_round側でラウンド全体を通して一度だけ正規化済み
+    # (ミニバッチごとに正規化すると、同じサンプルの値がシャッフルのたびに変わってしまう)。
     ratio = torch.exp(new_log_probs - old_log_probs)
-    surr1 = ratio * normalized_advantages
-    surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * normalized_advantages
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
 
     value_loss = functional.mse_loss(values.squeeze(-1), returns)
@@ -184,21 +185,38 @@ def _ppo_loss(
     return loss, policy_loss, value_loss, entropy
 
 
-def train_one_round(network: PolicyValueNet, samples: list[PPOSample], epochs: int) -> None:
+def train_one_round(
+    network: PolicyValueNet,
+    optimizer: torch.optim.Optimizer,
+    samples: list[PPOSample],
+    epochs: int,
+) -> None:
     """1ラウンド分のロールアウトで、`network`をPPOで数エポック学習する。
 
     ロールアウト収集時の方策(behavior policy)に対するクリップ付き目的関数のため、
     同じデータを複数エポック(`epochs`)再利用できる(AlphaZero式のTD学習と異なり、
-    PPOはオンポリシー更新をこの範囲内で複数回行うのが特徴)。
+    PPOはオンポリシー更新をこの範囲内で複数回行うのが特徴)。advantageはミニバッチ分割前に
+    ラウンド全体で一度だけ正規化する(ミニバッチごとの正規化だと、シャッフルのたびに
+    同じサンプルの正規化後advantageが変わってしまうため)。
 
     Args:
         network: 更新対象のネットワーク(このラウンドの自己対戦にも使われたもの)。
+        optimizer: ラウンドをまたいで保持する`Adam`(モーメント推定をリセットしないため)。
         samples: このラウンドの自己対戦で集めた`PPOSample`のリスト(GAE計算済み)。
         epochs: 学習エポック数。
     """
+    if not samples:
+        print("  no rollout samples collected; skipping PPO update")
+        return
+
+    advantage_tensor = torch.tensor([s.advantage for s in samples], dtype=torch.float32)
+    advantage_mean = advantage_tensor.mean()
+    advantage_std = advantage_tensor.std(unbiased=False)
+    for sample in samples:
+        sample.advantage = float((sample.advantage - advantage_mean) / (advantage_std + 1e-8))
+
     dataset = PPODataset(samples)
     network.to(DEVICE)
-    optimizer = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE)
 
     network.train()
     for epoch in range(epochs):
@@ -374,6 +392,9 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         network.load_state_dict(torch.load(warmstart_checkpoint, weights_only=True))
         print(f"warm-started network from {warmstart_checkpoint}")
     network.eval()
+    # ラウンドをまたいで同じoptimizerを使う(毎ラウンド作り直すとAdamのモーメント推定が
+    # リセットされてしまうため)。
+    optimizer = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE)
 
     for round_index in range(N_ROUNDS):
         print(
@@ -385,7 +406,7 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
         print(f"  round results: {results}  total_samples={len(all_samples)}")
 
         print(f"=== round {round_index + 1}/{N_ROUNDS}: PPO update ===")
-        train_one_round(network, all_samples, EPOCHS_PER_ROUND)
+        train_one_round(network, optimizer, all_samples, EPOCHS_PER_ROUND)
 
         print(f"=== round {round_index + 1}/{N_ROUNDS}: eval vs random (diverse deck) ===")
         eval_agent = make_ppo_eval_agent(network, deck)

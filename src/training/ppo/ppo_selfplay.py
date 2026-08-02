@@ -64,8 +64,9 @@ def evaluate_policy(network, obs, deck: list[int]):
         deck: 今まさに手番を選んでいる側の60枚のデッキリスト。
 
     Returns:
-        tuple[list[list[int]], torch.Tensor, float]:
-            (列挙済みの行動一覧, 方策の生ロジット(形状`(n_actions,)`), 価値推定`V(s)`)。
+        tuple[list[list[int]], torch.Tensor, float, SparseVector, SparseVector]:
+            (列挙済みの行動一覧, 方策の生ロジット(形状`(n_actions,)`), 価値推定`V(s)`,
+            盤面の疎ベクトル, 行動群の疎ベクトル)。
     """
     actions = _enumerate_actions(obs.select)
     encoder_sv = get_encoder_input(obs, deck)
@@ -77,7 +78,9 @@ def evaluate_policy(network, obs, deck: list[int]):
     return actions, scores[0], float(value.item()), encoder_sv, decoder_sv
 
 
-def _act(network, obs, your_deck: list[int]) -> tuple[int, float, float, list[list[int]], object]:
+def _act(
+    network, obs, your_deck: list[int]
+) -> tuple[int, float, float, list[list[int]], object, object]:
     """現在の方策からカテゴリカルサンプリングで1つ行動を選ぶ。
 
     Args:
