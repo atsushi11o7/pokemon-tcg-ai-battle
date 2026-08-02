@@ -198,12 +198,9 @@ def run_mcts(
     """
     root = create_node(None, root_state, your_index, eval_fn)
     actions = [child.select for child in root.children]
-    # search_stepで新しく作られたSearchState(searchId)は、エンジン側にネイティブメモリを
-    # 割り当てたままになる。search_release()で明示的に解放しないとリークし続け、
-    # 自己対戦のように同一プロセスで大量に呼び続けるとネイティブ側のメモリが壊れる
-    # 原因になりうる(公式APIの`search_release`のdocstring: "make the memory available
-    # for reuse")。根ノード(root_state)は呼び出し元がsearch_beginで作った、
-    # search_endが解放する対象なのでここでは解放しない。
+    # search_stepは呼ぶたびに新しいSearchStateをエンジン側に確保するので、使い終わったら
+    # search_releaseで明示的に解放する(放置するとネイティブメモリがリークする)。
+    # 根ノード(root_state)はsearch_begin/search_endが管理するのでここでは対象外。
     created_search_ids: list[int] = []
 
     try:
