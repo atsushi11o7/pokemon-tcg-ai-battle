@@ -52,6 +52,31 @@ class PPOSample:
         self.return_: float | None = None  # GAEで後から埋める(advantage + value)
 
 
+def evaluate_policy(network, obs, deck: list[int]):
+    """現局面を`PolicyValueNet`に通し、列挙済みの行動・方策ロジット・価値推定を得る。
+
+    自己対戦(サンプリング)・本番推論(貪欲方策)の両方から共通で使う、特徴量エンコード
+    〜forward計算までの処理。
+
+    Args:
+        network: 評価に使う`PolicyValueNet`(eval modeで呼び出し側が管理すること)。
+        obs: 現在の`Observation`。
+        deck: 今まさに手番を選んでいる側の60枚のデッキリスト。
+
+    Returns:
+        tuple[list[list[int]], torch.Tensor, float]:
+            (列挙済みの行動一覧, 方策の生ロジット(形状`(n_actions,)`), 価値推定`V(s)`)。
+    """
+    actions = _enumerate_actions(obs.select)
+    encoder_sv = get_encoder_input(obs, deck)
+    decoder_sv = get_decoder_input(obs, actions)
+    index_enc, value_enc, offset_enc = encoder_sv.to_tensors()
+    index_dec, value_dec, offset_dec = decoder_sv.to_tensors()
+    with torch.inference_mode():
+        value, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
+    return actions, scores[0], float(value.item()), encoder_sv, decoder_sv
+
+
 def _act(network, obs, your_deck: list[int]) -> tuple[int, float, float, list[list[int]], object]:
     """現在の方策からカテゴリカルサンプリングで1つ行動を選ぶ。
 
@@ -65,17 +90,11 @@ def _act(network, obs, your_deck: list[int]) -> tuple[int, float, float, list[li
             (選んだ行動のindex, その行動のlog確率, 価値推定`V(s)`, 列挙済みの行動一覧,
             盤面の疎ベクトル, 行動群の疎ベクトル)。
     """
-    actions = _enumerate_actions(obs.select)
-    encoder_sv = get_encoder_input(obs, your_deck)
-    decoder_sv = get_decoder_input(obs, actions)
-    index_enc, value_enc, offset_enc = encoder_sv.to_tensors()
-    index_dec, value_dec, offset_dec = decoder_sv.to_tensors()
-    with torch.inference_mode():
-        value, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
-    dist = torch.distributions.Categorical(logits=scores[0])
+    actions, scores, value, encoder_sv, decoder_sv = evaluate_policy(network, obs, your_deck)
+    dist = torch.distributions.Categorical(logits=scores)
     action_index = int(dist.sample().item())
     log_prob = float(dist.log_prob(torch.tensor(action_index)).item())
-    return action_index, log_prob, float(value.item()), actions, encoder_sv, decoder_sv
+    return action_index, log_prob, value, actions, encoder_sv, decoder_sv
 
 
 def play_ppo_game(
@@ -118,13 +137,8 @@ def play_ppo_game(
             obs = to_observation_class(battle_select(actions[action_index]))
 
         winner = obs.current.result
-        if samples:
-            if winner == 2:
-                samples[-1].reward = 0.0
-            elif winner == our_seat:
-                samples[-1].reward = 1.0
-            else:
-                samples[-1].reward = -1.0
+        if samples and winner != 2:  # 引き分けはreward=0のまま(初期値)でよい
+            samples[-1].reward = 1.0 if winner == our_seat else -1.0
 
         return samples, winner
     finally:

@@ -31,9 +31,7 @@ sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 sys.path.insert(0, str(ROOT / "src" / "training" / "mcts"))
 from network import PolicyValueNet, SparseBatch  # noqa: E402
 from opponent_pool import load_opponent_deck_pool  # noqa: E402
-from ppo_selfplay import PPOSample, compute_gae, play_ppo_game  # noqa: E402
-from search import _enumerate_actions  # noqa: E402
-from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
+from ppo_selfplay import PPOSample, compute_gae, evaluate_policy, play_ppo_game  # noqa: E402
 from train_mcts import (  # noqa: E402
     D_FEEDFORWARD,
     D_MODEL,
@@ -343,14 +341,8 @@ def make_ppo_eval_agent(network: PolicyValueNet, our_deck: list[int]):
         if obs.select is None:
             return our_deck
 
-        actions = _enumerate_actions(obs.select)
-        encoder_sv = get_encoder_input(obs, our_deck)
-        decoder_sv = get_decoder_input(obs, actions)
-        index_enc, value_enc, offset_enc = encoder_sv.to_tensors()
-        index_dec, value_dec, offset_dec = decoder_sv.to_tensors()
-        with torch.inference_mode():
-            _, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
-        best_index = int(torch.argmax(scores[0]).item())
+        actions, scores, _value, _encoder_sv, _decoder_sv = evaluate_policy(network, obs, our_deck)
+        best_index = int(torch.argmax(scores).item())
         return actions[best_index]
 
     return agent
