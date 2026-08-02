@@ -44,10 +44,13 @@ DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )  # 学習(train_one_round)のみで使う
 
-GAMES_PER_ROUND = 200  # 並列自己対戦(SEARCH_COUNT=50)で実測1ラウンド約690秒(200試合)
+GAMES_PER_ROUND = 200  # 1試合平均約50秒(逐次実行時)
 N_ROUNDS = 30  # ランダム初期化から自己対戦のみで学習
-SEARCH_COUNT = 50  # 1手あたりのMCTSシミュレーション回数(並列化・GPU化で得た余裕分を投入)
-NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # 自己対戦を並列実行するプロセス数
+SEARCH_COUNT = 50  # 1手あたりのMCTSシミュレーション回数
+# cgエンジンは複数プロセスから同時に触るとまれにネイティブクラッシュする(並列度診断で
+# level=2でも発生、level=18で最大78%を確認、プロセス間ロックでの直列化も解消せず)。
+# そのため常に1プロセスのみで自己対戦を行う(`_run_selfplay_round`参照)。
+NUM_SELFPLAY_WORKERS = 1
 SELFPLAY_GAME_TIMEOUT_SECONDS = 300  # 1試合がこれを超えて終わらなければフリーズとみなして諦める
 EPOCHS_PER_ROUND = 3
 BATCH_SIZE = 32
@@ -290,9 +293,12 @@ def _init_selfplay_worker(
     """自己対戦ワーカープロセスの初期化(プロセスごとに1回だけ呼ばれる)。
 
     `cg`エンジンはプロセスグローバルな状態を持つため、対局はプロセスをまたいで並列化する
-    必要がある(1プロセス内では同時に複数対局を進められない)。forkで複製された`random`の
-    状態がワーカー間で重複しないよう、PIDでの再シードも行う。トーチのスレッド内並列は
-    プロセス間並列と競合するため無効化する。
+    必要がある(1プロセス内では同時に複数対局を進められない)。さらに、並列度診断の結果、
+    複数プロセスが同時にエンジンへネイティブ呼び出しを行うとまれにクラッシュすることが
+    判明した(level=2でも発生、level=18で最大78%。プロセス間ロックでの直列化も試したが
+    解消せず)。そのため`_run_selfplay_round`ではワーカー数を1に固定し、常に1プロセスのみが
+    エンジンに触れるようにしている。forkで複製された`random`の状態がワーカー間で重複しない
+    よう、PIDでの再シードも行う。トーチのスレッド内並列はプロセス間並列と競合するため無効化する。
 
     Args:
         state_dict: この自己対戦ラウンドで使う`PolicyValueNet`の`state_dict()`。
@@ -335,7 +341,11 @@ def _run_selfplay_round(
     search_count: int,
     num_games: int,
 ) -> tuple[list[Sample], dict[int, int]]:
-    """1ラウンド分の自己対戦を、`NUM_SELFPLAY_WORKERS`個のプロセスで並列実行する。
+    """1ラウンド分の自己対戦を、単一のワーカープロセスで逐次実行する。
+
+    `NUM_SELFPLAY_WORKERS=1`。ワーカープロセス自体は使う(`cg`はプロセスグローバルな
+    状態を持つため、メインプロセスと対局用プロセスを分けておくと、対局用プロセスが
+    クラッシュしてもメインプロセスやチェックポイントには影響しない)が、並列実行はしない。
 
     Args:
         network: 自己対戦に使う`PolicyValueNet`(eval modeにしておくこと)。
