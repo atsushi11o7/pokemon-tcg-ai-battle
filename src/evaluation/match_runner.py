@@ -1,21 +1,59 @@
-"""Evaluate two agents against each other over N episodes via kaggle_environments.
+"""Evaluate two agents against each other over N episodes, using `cg.game`直接。
 
-kaggle_environmentsの"cabt"環境は本番と同じハーネスなので、ここで使う`agent(obs_dict) -> list[int]`は
-本番のmain.pyに書くものと全く同じ形でよい（cg.gameのように自分で対戦を進行させるコードは不要）。
+以前は`kaggle_environments`の"cabt"環境経由だったが、`kaggle_environments`が独自に
+バンドルした別バージョンの`libcg.so`が、自己対戦側の`cg.api`と同一プロセスに
+同居することでまれにネイティブクラッシュしていた。自己対戦は元々`cg.game`を直接
+使っているので、評価側もこちらに揃えて二重ロードを無くす。
+
+`agent(obs_dict) -> list[int]`のインターフェースは本番の`main.py`と同じ
+(デッキ提出時は`obs_dict["select"] is None`を見て自分のデッキを返す)。
 
 Usage:
     uv run python src/evaluation/match_runner.py
 """
 
-from kaggle_environments import make
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
+from cg.api import to_observation_class  # noqa: E402
+from cg.game import battle_finish, battle_select, battle_start  # noqa: E402
+
+# デッキ提出フェーズのobservation(kaggle_environments側の実装と同じ形式)。
+_DECK_REQUEST_OBS = {"select": None, "logs": [], "current": None, "search_begin_input": None}
 
 
 def play_one_match(agent1, agent2) -> tuple[float, float]:
     """1試合実行し、(agent1の報酬, agent2の報酬)を返す。"""
-    env = make("cabt", debug=True)
-    env.run([agent1, agent2])
-    final_state = env.steps[-1]
-    return final_state[0].reward, final_state[1].reward
+    deck1 = agent1(_DECK_REQUEST_OBS)
+    deck2 = agent2(_DECK_REQUEST_OBS)
+    if len(deck1) != 60:
+        return -1.0, 1.0
+    if len(deck2) != 60:
+        return 1.0, -1.0
+
+    obs_dict, start_data = battle_start(deck1, deck2)
+    try:
+        if start_data.errorPlayer == 0:
+            return -1.0, 1.0
+        if start_data.errorPlayer == 1:
+            return 1.0, -1.0
+
+        agents = [agent1, agent2]
+        while True:
+            obs = to_observation_class(obs_dict)
+            result = obs.current.result
+            if result == 0:
+                return 1.0, -1.0
+            if result == 1:
+                return -1.0, 1.0
+            if result == 2:
+                return 0.0, 0.0
+            select = agents[obs.current.yourIndex](obs_dict)
+            obs_dict = battle_select(select)
+    finally:
+        battle_finish()
 
 
 def evaluate(agent1, agent2, n_episodes: int, swap_positions: bool = True) -> dict:
@@ -47,8 +85,22 @@ def evaluate(agent1, agent2, n_episodes: int, swap_positions: bool = True) -> di
 
 
 if __name__ == "__main__":
-    # 動作確認用: kaggle_environments に組み込まれているランダムAI同士で対戦させる
-    from kaggle_environments.envs.cabt.cabt import agents
+    import random
 
-    result = evaluate(agents["random"], agents["first"], n_episodes=30)
+    # 動作確認用: ランダムAI同士で対戦させる
+    deck = [
+        int(x)
+        for x in (ROOT / "decks" / "cynthias_garchomp_ex.csv").read_text().split("\n")
+        if x.strip()
+    ]
+
+    def random_agent(obs_dict: dict) -> list[int]:
+        obs = to_observation_class(obs_dict)
+        if obs.select is None:
+            return deck
+        sel = obs.select
+        count = random.randint(sel.minCount, sel.maxCount)
+        return random.sample(range(len(sel.option)), count)
+
+    result = evaluate(random_agent, random_agent, n_episodes=30)
     print(result)
