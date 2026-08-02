@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SAMPLE_SUBMISSION_DIR = ROOT / "data" / "sample_submission" / "sample_submission"
 sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 
-from cg.api import search_step  # noqa: E402
+from cg.api import search_release, search_step  # noqa: E402
 
 MAX_ACTIONS_PER_NODE = 64  # 多重選択(maxCount>1)での組み合わせ爆発を抑えるための上限
 PUCT_C = 0.4  # 公式サンプルコードと同じ探索係数
@@ -198,29 +198,41 @@ def run_mcts(
     """
     root = create_node(None, root_state, your_index, eval_fn)
     actions = [child.select for child in root.children]
+    # search_stepで新しく作られたSearchState(searchId)は、エンジン側にネイティブメモリを
+    # 割り当てたままになる。search_release()で明示的に解放しないとリークし続け、
+    # 自己対戦のように同一プロセスで大量に呼び続けるとネイティブ側のメモリが壊れる
+    # 原因になりうる(公式APIの`search_release`のdocstring: "make the memory available
+    # for reuse")。根ノード(root_state)は呼び出し元がsearch_beginで作った、
+    # search_endが解放する対象なのでここでは解放しない。
+    created_search_ids: list[int] = []
 
-    for _ in range(search_count):
-        current = root
-        while True:
-            child = _select_child(current, your_index)
-            if child.node is None:
-                next_state = search_step(current.state.searchId, child.select)
-                child.node = create_node(current, next_state, your_index, eval_fn)
-                break
-            current = child.node
-            if current.state.observation.current.result >= 0:
-                # 既に終局しているノードを再訪問した場合、その結果を再度加算する
-                current.backprop(current.total / current.visit)
-                break
+    try:
+        for _ in range(search_count):
+            current = root
+            while True:
+                child = _select_child(current, your_index)
+                if child.node is None:
+                    next_state = search_step(current.state.searchId, child.select)
+                    created_search_ids.append(next_state.searchId)
+                    child.node = create_node(current, next_state, your_index, eval_fn)
+                    break
+                current = child.node
+                if current.state.observation.current.result >= 0:
+                    # 既に終局しているノードを再訪問した場合、その結果を再度加算する
+                    current.backprop(current.total / current.visit)
+                    break
 
-    root_value = root.total / root.visit
-    visits = [child.node.visit if child.node is not None else 0 for child in root.children]
-    total_visits = sum(visits)
-    if total_visits == 0:
-        # 1回もシミュレーションが展開されなかった場合(search_count=0等)のフォールバック
-        policy_target = [1.0 / len(root.children)] * len(root.children)
-        return root.children[0].select, policy_target, root_value, actions
+        root_value = root.total / root.visit
+        visits = [child.node.visit if child.node is not None else 0 for child in root.children]
+        total_visits = sum(visits)
+        if total_visits == 0:
+            # 1回もシミュレーションが展開されなかった場合(search_count=0等)のフォールバック
+            policy_target = [1.0 / len(root.children)] * len(root.children)
+            return root.children[0].select, policy_target, root_value, actions
 
-    policy_target = [v / total_visits for v in visits]
-    best_index = max(range(len(root.children)), key=lambda i: visits[i])
-    return root.children[best_index].select, policy_target, root_value, actions
+        policy_target = [v / total_visits for v in visits]
+        best_index = max(range(len(root.children)), key=lambda i: visits[i])
+        return root.children[best_index].select, policy_target, root_value, actions
+    finally:
+        for search_id in created_search_ids:
+            search_release(search_id)
