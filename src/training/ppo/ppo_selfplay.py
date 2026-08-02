@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 sys.path.insert(0, str(ROOT / "src" / "training" / "mcts"))
 from search import _enumerate_actions  # noqa: E402
-from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
+from sparse_features import SparseVector, get_decoder_input, get_encoder_input  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import to_observation_class  # noqa: E402
@@ -80,7 +80,7 @@ def evaluate_policy(network, obs, deck: list[int]):
 
 def _act(
     network, obs, your_deck: list[int]
-) -> tuple[int, float, float, list[list[int]], object, object]:
+) -> tuple[int, float, float, list[list[int]], SparseVector, SparseVector]:
     """現在の方策からカテゴリカルサンプリングで1つ行動を選ぶ。
 
     Args:

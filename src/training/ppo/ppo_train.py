@@ -52,7 +52,7 @@ CHECKPOINT_DIR = ROOT / "outputs" / "ppo_checkpoints"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 GAMES_PER_ROUND = 200
-N_ROUNDS = 100  # MCTSと違い1局が軽い(探索無し)ため、ラウンド数を多めに取れる
+N_ROUNDS = 250  # 実測26.7秒/ラウンド(200試合・18並列)なので、250ラウンドで約2時間
 NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)
 SELFPLAY_GAME_TIMEOUT_SECONDS = 300  # 1試合がこれを超えて終わらなければフリーズとみなして諦める
 EPOCHS_PER_ROUND = 4  # 収集したロールアウトを複数エポック再利用する(PPOの特徴)
@@ -136,7 +136,7 @@ def _collate(batch: list[PPOSample]):
 
 def _ppo_loss(
     network: PolicyValueNet, batch, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """クリップ付きサロゲート目的関数+価値損失+エントロピー項を計算する。
 
     Args:
@@ -145,8 +145,11 @@ def _ppo_loss(
         device: 計算に使うデバイス。
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            (合計損失, 方策損失, 価値損失, エントロピー)。いずれもスカラー。
+        tuple[torch.Tensor, ...]: (合計損失, 方策損失, 価値損失, エントロピー,
+            approx_kl, clip_fraction)。いずれもスカラー。
+            approx_kl: 更新前後の方策のずれの目安(大きすぎる場合は学習率/エポック数が
+                強すぎる兆候)。
+            clip_fraction: クリップが実際に効いたサンプルの割合。
     """
     (
         index_enc,
@@ -182,7 +185,13 @@ def _ppo_loss(
     value_loss = functional.mse_loss(values.squeeze(-1), returns)
 
     loss = policy_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy
-    return loss, policy_loss, value_loss, entropy
+
+    with torch.no_grad():
+        log_ratio = new_log_probs - old_log_probs
+        approx_kl = ((ratio - 1) - log_ratio).mean()
+        clip_fraction = ((ratio - 1.0).abs() > CLIP_EPS).float().mean()
+
+    return loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction
 
 
 def train_one_round(
@@ -224,9 +233,13 @@ def train_one_round(
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
+        total_approx_kl = 0.0
+        total_clip_fraction = 0.0
         n = 0
         for batch in loader:
-            loss, policy_loss, value_loss, entropy = _ppo_loss(network, batch, DEVICE)
+            loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction = _ppo_loss(
+                network, batch, DEVICE
+            )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(network.parameters(), MAX_GRAD_NORM)
@@ -236,10 +249,13 @@ def train_one_round(
             total_policy_loss += policy_loss.item() * batch_size
             total_value_loss += value_loss.item() * batch_size
             total_entropy += entropy.item() * batch_size
+            total_approx_kl += approx_kl.item() * batch_size
+            total_clip_fraction += clip_fraction.item() * batch_size
             n += batch_size
 
         print(
             f"  epoch {epoch + 1}/{epochs}  policy_loss={total_policy_loss / n:.4f}  "
+            f"approx_kl={total_approx_kl / n:.4f}  clip_fraction={total_clip_fraction / n:.4f}  "
             f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}"
         )
     network.to("cpu")
@@ -258,8 +274,9 @@ def _init_selfplay_worker(
 
     `cg`エンジンはプロセスグローバルな状態を持つため、対局はプロセスをまたいで並列化する
     必要がある(1プロセス内では同時に複数対局を進められない)。forkで複製された`random`の
-    状態がワーカー間で重複しないよう、PIDでの再シードも行う。トーチのスレッド内並列は
-    プロセス間並列と競合するため無効化する。
+    状態がワーカー間で重複しないよう、PIDでの再シードも行う(行動サンプリングは
+    `torch.distributions.Categorical`経由でtorchの乱数を使うため、`torch.manual_seed`も
+    合わせて行う)。トーチのスレッド内並列はプロセス間並列と競合するため無効化する。
 
     Args:
         state_dict: この自己対戦ラウンドで使う`PolicyValueNet`の`state_dict()`。
@@ -269,6 +286,7 @@ def _init_selfplay_worker(
     global _worker_network, _worker_deck, _worker_opponent_pool
     torch.set_num_threads(1)
     random.seed(os.getpid())
+    torch.manual_seed(os.getpid())
     network = PolicyValueNet(
         D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
     )
@@ -418,6 +436,10 @@ def run_training_loop(deck: list[int], warmstart_checkpoint: Path | None = None)
 
         checkpoint_path = CHECKPOINT_DIR / f"round{round_index + 1}.pt"
         torch.save(network.state_dict(), checkpoint_path)
+        # optimizer(Adamのモーメント推定)は別ファイルに保存する。warm-start読み込み
+        # (`network.load_state_dict(torch.load(path))`)との互換性を保つため、
+        # 本体のcheckpointにはネットワークのstate_dictだけを入れる。
+        torch.save(optimizer.state_dict(), CHECKPOINT_DIR / f"round{round_index + 1}_optimizer.pt")
         print(f"  saved checkpoint to {checkpoint_path}")
 
     return network
