@@ -9,7 +9,6 @@ Usage:
     uv run python src/training/mcts/bc_pretrain.py
 """
 
-import json
 import random
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 from network import PolicyValueNet  # noqa: E402
+from opponent_pool import _read_episode_json  # noqa: E402
 from search import _enumerate_actions  # noqa: E402
 from selfplay import Sample  # noqa: E402
 from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
@@ -129,8 +129,7 @@ def build_dataset(our_deck: list[int]) -> list[Sample]:
     all_samples: list[Sample] = []
     n_episodes = 0
     for path in sorted(EPISODES_DIR.glob("*.json")):
-        with path.open() as f:
-            episode = json.load(f)
+        episode = _read_episode_json(path)
         samples = extract_samples_from_episode(episode, our_deck)
         if samples:
             n_episodes += 1

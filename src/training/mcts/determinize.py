@@ -4,7 +4,6 @@
 過去リプレイの実在デッキから作ったカード出現頻度プールから確率的に推測する。
 """
 
-import json
 import random
 import sys
 from collections import Counter
@@ -15,7 +14,9 @@ EPISODES_DIR = ROOT / "data" / "episodes"
 SAMPLE_SUBMISSION_DIR = ROOT / "data" / "sample_submission" / "sample_submission"
 sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 
+sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 from cg.api import CardType, all_card_data  # noqa: E402
+from opponent_pool import _read_episode_json  # noqa: E402
 
 _opponent_pool: list[int] | None = None
 _pokemon_card_ids: set[int] | None = None
@@ -29,8 +30,7 @@ def _load_opponent_pool() -> list[int]:
     """
     counter: Counter[int] = Counter()
     for path in EPISODES_DIR.glob("*.json"):
-        with path.open() as f:
-            episode = json.load(f)
+        episode = _read_episode_json(path)
         for viz in episode["steps"][0][0].get("visualize") or []:
             action = viz.get("action")
             if (
