@@ -19,6 +19,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 from network import PolicyValueNet  # noqa: E402
 from search import _enumerate_actions  # noqa: E402
 from selfplay import Sample  # noqa: E402

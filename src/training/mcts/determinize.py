@@ -19,7 +19,6 @@ from cg.api import CardType, all_card_data  # noqa: E402
 
 _opponent_pool: list[int] | None = None
 _pokemon_card_ids: set[int] | None = None
-_opponent_deck_pool: list[list[int]] | None = None
 
 
 def _load_opponent_pool() -> list[int]:
@@ -183,39 +182,3 @@ def sample_full_hidden(
         sampled[deck_count : deck_count + hand_count],
         sampled[deck_count + hand_count :],
     )
-
-
-def load_opponent_deck_pool() -> list[list[int]]:
-    """リプレイ中の実在デッキから、重複を除いた60枚デッキの一覧を集める。
-
-    `_load_opponent_pool`がカード単位の出現頻度を集計するのに対し、こちらはデッキ単位で
-    重複を除いて集める。自己対戦の対戦相手を実在デッキからランダムに選ぶために使う。
-
-    Returns:
-        list[list[int]]: 重複を除いた60枚デッキのリスト。
-    """
-    global _opponent_deck_pool
-    if _opponent_deck_pool is not None:
-        return _opponent_deck_pool
-
-    seen: set[tuple[int, ...]] = set()
-    decks: list[list[int]] = []
-    for path in EPISODES_DIR.glob("*.json"):
-        with path.open() as f:
-            episode = json.load(f)
-        for viz in episode["steps"][0][0].get("visualize") or []:
-            action = viz.get("action")
-            if (
-                isinstance(action, list)
-                and len(action) == 2
-                and all(isinstance(deck, list) and len(deck) == 60 for deck in action)
-            ):
-                for deck in action:
-                    key = tuple(sorted(deck))
-                    if key not in seen:
-                        seen.add(key)
-                        decks.append(deck)
-    if not decks:
-        raise RuntimeError(f"No deck data found under {EPISODES_DIR}")
-    _opponent_deck_pool = decks
-    return _opponent_deck_pool

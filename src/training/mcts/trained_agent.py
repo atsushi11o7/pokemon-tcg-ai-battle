@@ -14,6 +14,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 from determinize import search_begin_kwargs  # noqa: E402
 from network import PolicyValueNet  # noqa: E402
 from search import run_mcts  # noqa: E402

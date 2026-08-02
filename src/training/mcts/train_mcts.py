@@ -22,8 +22,10 @@ from torch.utils.data import DataLoader, Dataset
 ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from determinize import load_opponent_deck_pool, search_begin_kwargs  # noqa: E402
+sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
+from determinize import search_begin_kwargs  # noqa: E402
 from network import PolicyValueNet, SparseBatch  # noqa: E402
+from opponent_pool import load_opponent_deck_pool  # noqa: E402
 from search import run_mcts  # noqa: E402
 from selfplay import Sample, make_eval_fn, play_selfplay_game  # noqa: E402
 
