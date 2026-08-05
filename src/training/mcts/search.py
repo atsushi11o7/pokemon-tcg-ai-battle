@@ -155,6 +155,17 @@ def _select_child(node: "Node", your_index: int) -> "Child":
     Returns:
         Child: 選ばれた子。
     """
+    if not node.children:
+        # `_enumerate_actions`が空を返した(例: minCount/maxCountに対して選択肢数が
+        # 足りない、といった不整合なSelectData)場合にここへ来る。Noneを黙って返すと
+        # 呼び出し側が`child.node`で意味不明なAttributeErrorになるため、ここで
+        # 原因が分かる形の例外にしておく(呼び出し側の1試合単位の例外キャッチで
+        # 引き続き吸収される)。
+        raise RuntimeError(
+            "_select_child called on a node with no enumerated actions "
+            f"(degenerate SelectData?); state={node.state.observation.current!r}"
+        )
+
     c = PUCT_C * math.sqrt(node.visit)
     best_child = None
     best_score = -math.inf
