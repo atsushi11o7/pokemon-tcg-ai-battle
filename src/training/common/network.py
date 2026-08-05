@@ -6,6 +6,8 @@
 局面全体の価値を計算する。
 """
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from sparse_features import SparseVector, decoder_size, encoder_size
@@ -210,3 +212,47 @@ class SparseBatch:
             torch.tensor(self.value, dtype=torch.float32),
             torch.tensor(self.offset, dtype=torch.int64),
         )
+
+
+def collate_encoder_decoder[T](
+    batch: list[T],
+    get_encoder_sv: Callable[[T], SparseVector],
+    get_decoder_sv: Callable[[T], SparseVector],
+    get_n_actions: Callable[[T], int],
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """可変長の行動群を、バッチ内の最大行動数までパディングし、疎ベクトルを連結する。
+
+    エンコーダ側は全サンプル共通のトークン数なのでパディング不要だが、デコーダ側
+    (行動の数)は局面ごとに異なるため、`SparseBatch.add_empty_word`で埋める
+    (公式サンプルコードの`LearnInput`と同じ扱い)。MCTS(`Sample`)・PPO(`PPOSample`)の
+    どちらの学習サンプルからも、疎ベクトル/行動数の取り出し方だけ渡せば使える。
+
+    Args:
+        batch: 学習サンプルのリスト。
+        get_encoder_sv: サンプルから盤面の疎ベクトルを取り出す関数。
+        get_decoder_sv: サンプルから行動群の疎ベクトルを取り出す関数。
+        get_n_actions: サンプルの局面で列挙されていた行動数を取り出す関数。
+
+    Returns:
+        tuple: (index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask)。
+            mask: 形状`(batch, max_actions)`のbool。パディングした行動位置はFalse。
+    """
+    max_actions = max(get_n_actions(sample) for sample in batch)
+
+    encoder_batch = SparseBatch()
+    decoder_batch = SparseBatch()
+    mask = torch.zeros(len(batch), max_actions, dtype=torch.bool)
+
+    for i, sample in enumerate(batch):
+        encoder_batch.add(get_encoder_sv(sample))
+        decoder_batch.add(get_decoder_sv(sample))
+        n = get_n_actions(sample)
+        mask[i, :n] = True
+        for _ in range(max_actions - n):
+            decoder_batch.add_empty_word()
+
+    index_enc, value_enc, offset_enc = encoder_batch.to_tensors()
+    index_dec, value_dec, offset_dec = decoder_batch.to_tensors()
+    return index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask
