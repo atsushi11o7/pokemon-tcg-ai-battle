@@ -5,13 +5,12 @@
 木として自然に処理される)。探索結果(訪問回数分布)を方策の教師信号、ゲーム終了後に
 補正した価値推定を価値の教師信号として、1試合分の学習サンプルを作る。
 
-対戦相手には実在デッキ(`determinize.load_opponent_deck_pool`)からランダムに選んだ
-ものを使い、こちらの固定デッキ(`our_deck`)側の意思決定のみを学習サンプルとして集める。
-探索側は自分の本当のデッキだけを知り、相手の隠れ情報は本番と同じくカード出現頻度からの
-推測(`determinize.sample_opponent_hidden`)を使う(相手の本当のデッキはカンニングしない)。
+3つの自己対戦モードを切り替えられる(`mode`引数、詳細は`play_selfplay_game`のdocstring参照)。
+"asymmetric"(相手デッキランダム・自分側のみ学習)、"mirror"(両者同デッキ・両サイド学習)、
+"generalist"(両者独立ランダム・両サイド学習)。いずれも探索側は自分の本当のデッキだけを知り、
+相手の隠れ情報は本番と同じくカード出現頻度からの推測(`determinize.sample_opponent_hidden`)を使う。
 """
 
-import random
 import sys
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from determinize import (  # noqa: E402
     sample_opponent_hidden,
 )
 from search import run_mcts  # noqa: E402
+from selfplay_modes import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
 from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
@@ -152,36 +152,46 @@ def _assign_labels(samples: list[Sample], winner: int, player_index: int) -> Non
 
 
 def play_selfplay_game(
-    network, our_deck: list[int], opponent_deck_pool: list[list[int]], search_count: int
+    network,
+    our_deck: list[int],
+    opponent_deck_pool: list[list[int]] | None,
+    search_count: int,
+    mode: SelfplayMode = "asymmetric",
 ) -> tuple[list[Sample], int]:
     """1試合分の自己対戦を行い、方策・価値の学習サンプルを集める。
 
-    対戦相手には`opponent_deck_pool`(過去リプレイの実在デッキ)からランダムに選んだ
-    ものを使う。どちらの座席が`our_deck`を使うかも毎回ランダムに決め、先手/後手の
-    偏りが学習データに乗らないようにする。学習サンプルは`our_deck`を使っている側の
-    意思決定のみを集める(対戦相手側のデッキを学習対象にする必要は無いため)。
+    `mode="asymmetric"`(既定)では対戦相手に`opponent_deck_pool`からランダムに選んだ実在デッキを
+    使い、どちらの座席が`our_deck`を使うかも毎回ランダムに決めた上で、`our_deck`側の
+    意思決定のみを学習サンプルとして集める。`mode="mirror"`では両者とも`our_deck`を使い、
+    `mode="generalist"`では両者とも`opponent_deck_pool`から独立にランダムに選んだ実在デッキ
+    (両者同じ組み合わせになることもある)を使う。"mirror"/"generalist"はいずれも
+    (`opponent_deck_pool`は"mirror"では不要)、両サイドの意思決定を両方とも学習サンプルとして
+    集める("generalist"は`our_deck`を使わないので、あらゆる実在デッキを乗りこなす汎用方策を
+    狙う構成。学習後にどのデッキで提出するかは別途決める)。
 
     Args:
         network: 探索の事前分布・評価値に使う`PolicyValueNet`(eval modeにしておくこと)。
-        our_deck: 本番でも使う、こちらの60枚のデッキリスト。
+        our_deck: 本番でも使う、こちらの60枚のデッキリスト。`mode="generalist"`のときは
+            自己対戦のデッキ選択には使われない。
         opponent_deck_pool: 対戦相手として選ぶ、実在デッキ(60枚)のリスト。
+            `mode="mirror"`のときは使われないので`None`でよい。
         search_count: 1手あたりのMCTSシミュレーション回数。
+        mode: "asymmetric"(相手デッキランダム・自分側のみ学習)、
+            "mirror"(両者同デッキ・両サイド学習、公式サンプルコードと同じ構成)、
+            "generalist"(両者とも実在デッキプールから独立ランダム・両サイド学習)。
 
     Returns:
-        tuple[list[Sample], int]: (`our_deck`側の、labelまで埋めたSampleのリスト,
-            `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
+        tuple[list[Sample], int]: (labelまで埋めたSampleのリスト("asymmetric"は`our_deck`側のみ、
+            それ以外は両サイド分), `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
     """
-    our_seat = random.randint(0, 1)
-    decks: list[list[int]] = [our_deck, our_deck]
-    decks[1 - our_seat] = random.choice(opponent_deck_pool)
-
+    decks, collect_seats = pick_decks_and_collect_seats(mode, our_deck, opponent_deck_pool)
     eval_fn = make_eval_fn(network, decks)
     obs_dict, start_data = battle_start(decks[0], decks[1])
     try:
         if start_data.errorPlayer >= 0:
             raise ValueError(f"deck error: errorType={start_data.errorType}")
 
-        samples: list[Sample] = []
+        samples_by_seat: list[list[Sample]] = [[], []]
         obs = to_observation_class(obs_dict)
 
         while obs.current.result < 0:
@@ -193,15 +203,18 @@ def play_selfplay_game(
                 )
             finally:
                 search_end()
-            if your_index == our_seat:
-                encoder_sv = get_encoder_input(obs, our_deck)
+            if your_index in collect_seats:
+                encoder_sv = get_encoder_input(obs, decks[your_index])
                 decoder_sv = get_decoder_input(obs, actions)
-                samples.append(Sample(encoder_sv, decoder_sv, policy_target, root_value))
+                samples_by_seat[your_index].append(
+                    Sample(encoder_sv, decoder_sv, policy_target, root_value)
+                )
             obs = to_observation_class(battle_select(select))
 
         winner = obs.current.result
-        _assign_labels(samples, winner, our_seat)
+        for seat in collect_seats:
+            _assign_labels(samples_by_seat[seat], winner, seat)
 
-        return samples, winner
+        return samples_by_seat[0] + samples_by_seat[1], winner
     finally:
         battle_finish()

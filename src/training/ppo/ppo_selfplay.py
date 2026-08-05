@@ -5,12 +5,10 @@ MCTS(`mcts/selfplay.py`)と違い、探索を行わずネットワークの方�
 より大幅に軽い。探索を行わないので、隠れ情報を仮定する`determinize.py`も不要で、
 実際の`Observation`をそのまま使う。
 
-対戦相手には実在デッキ(`opponent_pool.load_opponent_deck_pool`)からランダムに選んだ
-ものを使い、両者の意思決定を同じ方策で行う(`mcts/selfplay.py`と同じself-play構成)が、
-学習サンプルは`our_deck`側の意思決定のみ集める。
+`mcts/selfplay.py`と同じ"asymmetric"/"mirror"/"generalist"の3モードを切り替えられる
+(詳細は同ファイルのモジュールdocstringを参照)。
 """
 
-import random
 import sys
 from pathlib import Path
 
@@ -21,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 sys.path.insert(0, str(ROOT / "src" / "training" / "mcts"))
 from search import _enumerate_actions  # noqa: E402
+from selfplay_modes import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
 from sparse_features import SparseVector, get_decoder_input, get_encoder_input  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
@@ -101,33 +100,43 @@ def _act(
 
 
 def play_ppo_game(
-    network, our_deck: list[int], opponent_deck_pool: list[list[int]]
-) -> tuple[list[PPOSample], int]:
+    network,
+    our_deck: list[int],
+    opponent_deck_pool: list[list[int]] | None,
+    mode: SelfplayMode = "asymmetric",
+) -> tuple[list[list[PPOSample]], int]:
     """1試合分の自己対戦を行い、PPO学習用のサンプルを集める。
 
-    `mcts/selfplay.py`の`play_selfplay_game`と同じself-play構成(対戦相手デッキは
-    `opponent_deck_pool`からランダム選択、座席もランダム、`our_deck`側のみ収集)だが、
-    探索を行わず方策から直接サンプリングする点が異なる。
+    `mcts/selfplay.py`の`play_selfplay_game`と同じ"asymmetric"/"mirror"/"generalist"モード
+    構成だが、探索を行わず方策から直接サンプリングする点が異なる。GAE計算はサンプルの
+    時系列的な隣接関係(1つのMDP軌跡)に依存するため、座席ごとに分けたまま返す
+    (呼び出し側が`compute_gae`を座席ごとに適用してから結合すること。特に"mirror"/
+    "generalist"では両座席分の軌跡を1つの試合から得るので、ここで結合してしまうと
+    片方の軌跡の終端がもう片方の軌跡の先頭に繋がってしまいGAEが壊れる)。
 
     Args:
         network: 方策・価値に使う`PolicyValueNet`(eval modeにしておくこと)。
-        our_deck: 本番でも使う、こちらの60枚のデッキリスト。
+        our_deck: 本番でも使う、こちらの60枚のデッキリスト。`mode="generalist"`のときは
+            自己対戦のデッキ選択には使われない。
         opponent_deck_pool: 対戦相手として選ぶ、実在デッキ(60枚)のリスト。
+            `mode="mirror"`のときは使われないので`None`でよい。
+        mode: "asymmetric"(相手デッキランダム・自分側のみ学習)、
+            "mirror"(両者同デッキ・両サイド学習)、
+            "generalist"(両者とも実在デッキプールから独立ランダム・両サイド学習)。
 
     Returns:
-        tuple[list[PPOSample], int]: (`our_deck`側の、rewardまで埋めたPPOSampleのリスト,
-            `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
+        tuple[list[list[PPOSample]], int]: (`[player0のPPOSampleのリスト,
+            player1のPPOSampleのリスト]`。学習サンプルを集めなかった側は空リスト。
+            rewardまで埋め済み, `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
     """
-    our_seat = random.randint(0, 1)
-    decks: list[list[int]] = [our_deck, our_deck]
-    decks[1 - our_seat] = random.choice(opponent_deck_pool)
+    decks, collect_seats = pick_decks_and_collect_seats(mode, our_deck, opponent_deck_pool)
 
     obs_dict, start_data = battle_start(decks[0], decks[1])
     try:
         if start_data.errorPlayer >= 0:
             raise ValueError(f"deck error: errorType={start_data.errorType}")
 
-        samples: list[PPOSample] = []
+        samples_by_seat: list[list[PPOSample]] = [[], []]
         obs = to_observation_class(obs_dict)
 
         while obs.current.result < 0:
@@ -135,29 +144,33 @@ def play_ppo_game(
             action_index, log_prob, value, actions, encoder_sv, decoder_sv = _act(
                 network, obs, decks[your_index]
             )
-            if your_index == our_seat:
-                samples.append(PPOSample(encoder_sv, decoder_sv, action_index, log_prob, value))
+            if your_index in collect_seats:
+                samples_by_seat[your_index].append(
+                    PPOSample(encoder_sv, decoder_sv, action_index, log_prob, value)
+                )
             obs = to_observation_class(battle_select(actions[action_index]))
 
         winner = obs.current.result
-        if samples and winner != 2:  # 引き分けはreward=0のまま(初期値)でよい
-            samples[-1].reward = 1.0 if winner == our_seat else -1.0
+        if winner != 2:  # 引き分けはreward=0のまま(初期値)でよい
+            for seat in collect_seats:
+                if samples_by_seat[seat]:
+                    samples_by_seat[seat][-1].reward = 1.0 if winner == seat else -1.0
 
-        return samples, winner
+        return samples_by_seat, winner
     finally:
         battle_finish()
 
 
 def compute_gae(samples: list[PPOSample], gamma: float, lam: float) -> None:
-    """1試合分の`PPOSample`列に、GAE(Generalized Advantage Estimation)で
+    """1試合・1座席分の`PPOSample`列に、GAE(Generalized Advantage Estimation)で
     advantage/returnを付ける。
 
     このゲームは対局終了時にしか報酬が無い(`samples`の最後だけ`reward`が非0)。
-    `samples`は`our_deck`側の意思決定だけを時系列順に並べたものなので、これを1つの
+    `samples`は同一試合・同一座席の意思決定だけを時系列順に並べたものなので、これを1つの
     MDP軌跡とみなし、最後のサンプルは終端(それ以降のブートストラップ値は0)として扱う。
 
     Args:
-        samples: `play_ppo_game`が返す、時系列順のPPOSampleのリスト(1試合分)。
+        samples: `play_ppo_game`が返す`samples_by_seat`の1座席分(時系列順、1試合分)。
         gamma: 割引率。
         lam: GAEのλ(バイアスと分散のトレードオフ)。
     """
