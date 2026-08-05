@@ -1,60 +1,22 @@
 """Determinized MCTSの探索用に、隠れ情報(相手の手札・山札・サイド)をサンプリングする。
 
 自分の情報は既知のデッキリストからサンプリングする。相手の情報は不明なため、
-過去リプレイの実在デッキから作ったカード出現頻度プールから確率的に推測する。
+`opponent_pool.load_opponent_card_pool`が作るカード出現頻度プールから確率的に推測する。
 """
 
 import random
 import sys
-from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-EPISODES_DIR = ROOT / "data" / "episodes"
 SAMPLE_SUBMISSION_DIR = ROOT / "data" / "sample_submission" / "sample_submission"
 sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 
 sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
 from cg.api import CardType, all_card_data  # noqa: E402
-from opponent_pool import _read_episode_json  # noqa: E402
+from opponent_pool import load_opponent_card_pool as _opponent_card_pool  # noqa: E402
 
-_opponent_pool: list[int] | None = None
 _pokemon_card_ids: set[int] | None = None
-
-
-def _load_opponent_pool() -> list[int]:
-    """リプレイ中の実在デッキ(`steps[0][0]["visualize"]`)からカード出現頻度プールを作る。
-
-    Returns:
-        list[int]: 出現頻度に応じて重複を含むカードIDのリスト(`random.choices`の母集団)。
-    """
-    counter: Counter[int] = Counter()
-    for path in EPISODES_DIR.glob("*.json"):
-        episode = _read_episode_json(path)
-        for viz in episode["steps"][0][0].get("visualize") or []:
-            action = viz.get("action")
-            if (
-                isinstance(action, list)
-                and len(action) == 2
-                and all(isinstance(deck, list) and len(deck) == 60 for deck in action)
-            ):
-                counter.update(action[0])
-                counter.update(action[1])
-    if not counter:
-        raise RuntimeError(f"No deck data found under {EPISODES_DIR}")
-    return list(counter.elements())
-
-
-def _opponent_card_pool() -> list[int]:
-    """出現頻度プールを遅延ロードしてキャッシュする。
-
-    Returns:
-        list[int]: `_load_opponent_pool`が返すプール。
-    """
-    global _opponent_pool
-    if _opponent_pool is None:
-        _opponent_pool = _load_opponent_pool()
-    return _opponent_pool
 
 
 def sample_opponent_hidden(
