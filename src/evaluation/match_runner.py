@@ -12,6 +12,7 @@ Usage:
     uv run python src/evaluation/match_runner.py
 """
 
+import random
 import sys
 from pathlib import Path
 
@@ -84,17 +85,17 @@ def evaluate(agent1, agent2, n_episodes: int, swap_positions: bool = True) -> di
     }
 
 
-if __name__ == "__main__":
-    import random
+def random_agent_factory(deck: list[int]):
+    """完全ランダムに選ぶ`agent()`を作る(「vs random」評価の対戦相手・floor-check用)。
 
-    # 動作確認用: ランダムAI同士で対戦させる
-    deck = [
-        int(x)
-        for x in (ROOT / "decks" / "cynthias_garchomp_ex.csv").read_text().split("\n")
-        if x.strip()
-    ]
+    Args:
+        deck: デッキ提出時に返す60枚のデッキリスト。
 
-    def random_agent(obs_dict: dict) -> list[int]:
+    Returns:
+        Callable[[dict], list[int]]: `evaluate`に渡せるagent関数。
+    """
+
+    def agent(obs_dict: dict) -> list[int]:
         obs = to_observation_class(obs_dict)
         if obs.select is None:
             return deck
@@ -102,5 +103,16 @@ if __name__ == "__main__":
         count = random.randint(sel.minCount, sel.maxCount)
         return random.sample(range(len(sel.option)), count)
 
+    return agent
+
+
+if __name__ == "__main__":
+    # 動作確認用: ランダムAI同士で対戦させる
+    deck = [
+        int(x)
+        for x in (ROOT / "decks" / "cynthias_garchomp_ex.csv").read_text().split("\n")
+        if x.strip()
+    ]
+    random_agent = random_agent_factory(deck)
     result = evaluate(random_agent, random_agent, n_episodes=30)
     print(result)

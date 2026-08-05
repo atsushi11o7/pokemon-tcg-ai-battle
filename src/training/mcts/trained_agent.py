@@ -15,17 +15,18 @@ ROOT = Path(__file__).resolve().parents[3]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
+from deck import read_deck  # noqa: E402
 from determinize import search_begin_kwargs  # noqa: E402
-from network import PolicyValueNet  # noqa: E402
-from search import run_mcts  # noqa: E402
-from selfplay import make_eval_fn  # noqa: E402
-from train_mcts import (  # noqa: E402
+from model_config import (  # noqa: E402
     D_FEEDFORWARD,
     D_MODEL,
     NUM_HEADS,
     NUM_LAYERS_DECODER,
     NUM_LAYERS_ENCODER,
 )
+from network import PolicyValueNet  # noqa: E402
+from search import run_mcts  # noqa: E402
+from selfplay import make_eval_fn  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import (  # noqa: E402
@@ -35,7 +36,6 @@ from cg.api import (  # noqa: E402
     to_observation_class,
 )
 
-DECK_PATH = ROOT / "decks" / "cynthias_garchomp_ex.csv"
 CHECKPOINT_DIR = ROOT / "outputs" / "mcts_checkpoints"
 SEARCH_COUNT = 10  # 1手あたりのMCTSシミュレーション回数(GPU無し・2vCPU実行のため小さめ)
 
@@ -47,18 +47,20 @@ def _latest_checkpoint_path() -> Path:
     """`CHECKPOINT_DIR`の中から、ラウンド番号が最も大きいチェックポイントを探す。
 
     サイズが`MIN_CHECKPOINT_BYTES`未満のファイルは、別アーキテクチャの古い
-    チェックポイントとして無視する。
+    チェックポイントとして無視する。ファイル名は`train_mcts.py`が保存する
+    `{SELFPLAY_MODE}_round{N}.pt`形式(例: `generalist_round12.pt`)を想定する。
 
     Returns:
-        Path: 最新の`round{N}.pt`のパス。
+        Path: 最新の`{mode}_round{N}.pt`のパス。
 
     Raises:
         FileNotFoundError: チェックポイントが1つも見つからない場合。
     """
     checkpoints = [
         (int(m.group(1)), p)
-        for p in CHECKPOINT_DIR.glob("round*.pt")
-        if p.stat().st_size >= MIN_CHECKPOINT_BYTES and (m := re.match(r"round(\d+)\.pt", p.name))
+        for p in CHECKPOINT_DIR.glob("*_round*.pt")
+        if p.stat().st_size >= MIN_CHECKPOINT_BYTES
+        and (m := re.match(r".*_round(\d+)\.pt", p.name))
     ]
     if not checkpoints:
         raise FileNotFoundError(f"No checkpoints found in {CHECKPOINT_DIR}")
@@ -70,15 +72,6 @@ _network.load_state_dict(torch.load(_latest_checkpoint_path(), weights_only=True
 _network.eval()
 
 _own_deck_cache: list[int] | None = None
-
-
-def read_deck() -> list[int]:
-    """デッキ提出用に、decks/配下の共通deck.csv(60行のカードID)を読み込む。
-
-    Returns:
-        list[int]: 60枚分のカードID。
-    """
-    return [int(x) for x in DECK_PATH.read_text().split("\n") if x.strip()]
 
 
 def _own_deck() -> list[int]:
