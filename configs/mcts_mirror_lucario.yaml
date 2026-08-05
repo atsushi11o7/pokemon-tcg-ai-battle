@@ -1,0 +1,7 @@
+algorithm: mcts
+deck_path: decks/mega_lucario_ex_pixiux_v62.csv
+selfplay_mode: mirror
+initial_warmstart_checkpoint: outputs/saved_checkpoints/generalist_round250.pt
+games_per_round: 200
+n_rounds: 40
+checkpoint_dir: outputs/mcts_checkpoints/mirror_lucario

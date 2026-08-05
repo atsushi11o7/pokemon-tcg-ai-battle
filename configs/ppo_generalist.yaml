@@ -1,0 +1,7 @@
+algorithm: ppo
+deck_path: decks/mega_lucario_ex_pixiux_v62.csv
+selfplay_mode: generalist
+initial_warmstart_checkpoint: outputs/mcts_checkpoints/bc_pretrained.pt
+games_per_round: 500
+n_rounds: 250
+checkpoint_dir: outputs/ppo_checkpoints/generalist
