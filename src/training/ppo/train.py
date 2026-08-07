@@ -1,9 +1,9 @@
 """PPOによる自己対戦で、価値・方策ネットワークを学習する(MCTSを使わない軽量な代替経路)。
 
 自己対戦→GAE計算→PPO更新、を繰り返す。1手あたりのネット評価が1回で済むため、
-MCTS自己対戦(train_mcts.py、1手ごとにSEARCH_COUNT回評価)よりスループットが高い。
-ネットワークはMCTS側と共通の`PolicyValueNet`をそのまま使うので、BC/MCTS自己対戦の
-チェックポイントをwarm-startとして使うこともできる。
+MCTS自己対戦(mcts/train.py、1手ごとにSEARCH_COUNT回評価)よりスループットが高い。
+ネットワークはMCTS側と共通の`PolicyValueNet`をそのまま使うので、既存PPO/MCTSの
+チェックポイントを初期重みとして相互利用できる。
 
 AlphaZero式のゲーティング(勝率が閾値を超えたら採用)は行わず、毎ラウンドそのまま
 方策を更新し続ける(PPOはオンポリシー更新のため、探索で洗練した教師信号を前提とする
@@ -11,21 +11,15 @@ AlphaZero式のゲーティング(勝率が閾値を超えたら採用)は行わ
 モニタリング用に残す。
 
 `_run_selfplay_round`は1試合単位のタイムアウト/例外を捕まえてその試合だけ諦める
-(cgエンジンはまれにネイティブクラッシュすることがあるため)。プロセスごと落ちた場合は
-`scripts/run_ppo_with_retry.sh`で再起動でき、`__main__`が保存済みの最新ラウンドの
+(cgエンジンはまれにネイティブクラッシュすることがあるため)。プロセスごと落ちた場合は統一training CLIが再起動し、保存済みの最新ラウンドの
 チェックポイントから自動で再開する。
 
-Usage:
-    uv run python src/training/ppo/ppo_train.py
-    (クラッシュしても自動で再起動・再開したい場合は scripts/run_ppo_with_retry.sh を使う)
+このmoduleは内部trainer。表向きの実行入口は `python -m training.cli`。
 """
 
-import multiprocessing
 import os
 import random
-import re
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -34,31 +28,37 @@ from torch.utils.data import DataLoader, Dataset
 
 ROOT = Path(__file__).resolve().parents[3]
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
-from model_config import (  # noqa: E402
+from ..common.checkpoints import latest_checkpoint_round, restore_optimizer_state  # noqa: E402
+from ..common.evaluation_plan import build_fixed_matchups  # noqa: E402
+from ..common.model_config import (  # noqa: E402
     D_FEEDFORWARD,
     D_MODEL,
     NUM_HEADS,
     NUM_LAYERS_DECODER,
     NUM_LAYERS_ENCODER,
 )
-from network import PolicyValueNet, collate_encoder_decoder  # noqa: E402
-from opponent_pool import load_opponent_deck_pool  # noqa: E402
-from ppo_selfplay import PPOSample, compute_gae, evaluate_policy, play_ppo_game  # noqa: E402
-from run_config import config_path_from_argv, load_run_config, save_config_snapshot  # noqa: E402
-from selfplay_modes import SelfplayMode  # noqa: E402
+from ..common.network import PolicyValueNet, collate_encoder_decoder  # noqa: E402
+from ..common.opponent_pool import (  # noqa: E402
+    configure_sampling_snapshot,
+    load_opponent_deck_pool,
+)
+from ..common.parallel_games import run_parallel_games  # noqa: E402
+from ..common.run_config import (  # noqa: E402
+    load_run_config,
+    save_config_snapshot,
+    validate_algorithm,
+)
+from ..common.selfplay_modes import SelfplayMode  # noqa: E402
+from .selfplay import PPOSample, compute_gae, evaluate_policy, play_ppo_game  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import to_observation_class  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "src" / "evaluation"))
-from match_runner import evaluate as match_evaluate  # noqa: E402
-from match_runner import random_agent_factory  # noqa: E402
+from match_runner import evaluate_fixed_matchups, random_agent_factory  # noqa: E402
 
-# デッキ・自己対戦モード・ウォームスタート元・回数・出力先は実験のたびに変わるため、
-# `configs/*.yaml`で管理する(`__main__`参照)。ここではアーキテクチャ以外の、
-# 基本的に変えないアルゴリズムのハイパーパラメータだけを定数として持つ。
+# 以下は関数単体利用時の既定値。通常実行ではmainがrun configの値で上書きする。
+# ネットワーク構造だけはcommon/model_config.pyで一元管理する。
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 NUM_SELFPLAY_WORKERS = max(1, (os.cpu_count() or 4) - 2)
@@ -77,7 +77,8 @@ CLIP_EPS = 0.2
 VALUE_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01
 MAX_GRAD_NORM = 1.0
-EVAL_GAMES_PER_ROUND = 10
+TARGET_KL = 0.02
+EVAL_GAMES_PER_ROUND = 12
 SEED = 0
 
 
@@ -266,6 +267,10 @@ def train_one_round(
             f"approx_kl={total_approx_kl / n:.4f}  clip_fraction={total_clip_fraction / n:.4f}  "
             f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}"
         )
+        mean_kl = total_approx_kl / n
+        if mean_kl > TARGET_KL:
+            print(f"  early stopping PPO update: approx_kl={mean_kl:.4f} > {TARGET_KL:.4f}")
+            break
     network.to("cpu")
     network.eval()
 
@@ -274,6 +279,9 @@ _worker_network: PolicyValueNet | None = None
 _worker_deck: list[int] | None = None
 _worker_opponent_pool: list[list[int]] | None = None
 _worker_mode: SelfplayMode | None = None
+_worker_gamma = GAMMA
+_worker_gae_lambda = GAE_LAMBDA
+_worker_seed = SEED
 
 
 def _init_selfplay_worker(
@@ -281,55 +289,65 @@ def _init_selfplay_worker(
     deck: list[int],
     opponent_deck_pool: list[list[int]],
     mode: SelfplayMode,
+    gamma: float,
+    gae_lambda: float,
+    seed: int,
 ) -> None:
     """自己対戦ワーカープロセスの初期化(プロセスごとに1回だけ呼ばれる)。
 
     `cg`エンジンはプロセスグローバルな状態を持つため、対局はプロセスをまたいで並列化する
-    必要がある(1プロセス内では同時に複数対局を進められない)。forkで複製された`random`の
-    状態がワーカー間で重複しないよう、PIDでの再シードも行う(行動サンプリングは
-    `torch.distributions.Categorical`経由でtorchの乱数を使うため、`torch.manual_seed`も
-    合わせて行う)。トーチのスレッド内並列はプロセス間並列と競合するため無効化する。
+    必要がある(1プロセス内では同時に複数対局を進められない)。各試合は
+    `run seed + game index`でPython/torchの乱数を再シードし、worker配置に依存しない。
+    torchのスレッド内並列はプロセス間並列と競合するため無効化する。
 
     Args:
         state_dict: この自己対戦ラウンドで使う`PolicyValueNet`の`state_dict()`。
         deck: こちらの60枚のデッキリスト。
         opponent_deck_pool: 対戦相手として選ぶ実在デッキのリスト。
-        mode: "asymmetric"、"mirror"、"generalist"(`ppo_selfplay.play_ppo_game`に渡す自己対戦モード)。
+        mode: "asymmetric"、"mirror"、"generalist"。
+        gamma: GAEに使う割引率。
+        gae_lambda: GAEのlambda。
+        seed: run全体の乱数seed。
     """
     global _worker_network, _worker_deck, _worker_opponent_pool, _worker_mode
+    global _worker_gamma, _worker_gae_lambda, _worker_seed
     torch.set_num_threads(1)
-    random.seed(os.getpid())
-    torch.manual_seed(os.getpid())
     network = PolicyValueNet(
         D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
     )
-    network.load_state_dict(state_dict)
+    network.load_state_dict(state_dict, assign=True)
     network.eval()
     _worker_network = network
     _worker_deck = deck
     _worker_opponent_pool = opponent_deck_pool
     _worker_mode = mode
+    _worker_gamma = gamma
+    _worker_gae_lambda = gae_lambda
+    _worker_seed = seed
 
 
-def _play_one_ppo_game(_game_index: int) -> tuple[list[PPOSample], int]:
+def _play_one_ppo_game(game_index: int) -> tuple[list[PPOSample], int]:
     """ワーカープロセス内で1試合分の自己対戦を行い、GAEまで計算する。
 
     `play_ppo_game`は座席ごとに分けたサンプル列を返す("mirror"/"generalist"では両座席分)ので、
     GAEはそれぞれの軌跡に対して独立に計算してから結合する。
 
     Args:
-        _game_index: `pool.apply_async`が渡すインデックス(使わないが引数として必要)。
+        game_index: run内で一意な試合番号。乱数seedにも使用する。
 
     Returns:
         tuple[list[PPOSample], int]: (advantage/return計算済みのPPOSampleのリスト
             (座席を結合済み), `state.result`)。
     """
+    game_seed = _worker_seed + game_index
+    random.seed(game_seed)
+    torch.manual_seed(game_seed)
     samples_by_seat, winner = play_ppo_game(
         _worker_network, _worker_deck, _worker_opponent_pool, _worker_mode
     )
     samples: list[PPOSample] = []
     for seat_samples in samples_by_seat:
-        compute_gae(seat_samples, GAMMA, GAE_LAMBDA)
+        compute_gae(seat_samples, _worker_gamma, _worker_gae_lambda)
         samples.extend(seat_samples)
     return samples, winner
 
@@ -340,10 +358,11 @@ def _run_selfplay_round(
     opponent_deck_pool: list[list[int]],
     num_games: int,
     mode: SelfplayMode,
+    round_num: int,
 ) -> tuple[list[PPOSample], dict[int, int]]:
     """1ラウンド分の自己対戦を、`NUM_SELFPLAY_WORKERS`個のプロセスで並列実行する。
 
-    `mcts/train_mcts.py`の`_run_selfplay_round`と同じ構成(spawn・per-game timeout)。
+    `mcts/train.py`の`_run_selfplay_round`と同じ構成(spawn・per-game timeout)。
 
     Args:
         network: 自己対戦に使う`PolicyValueNet`(eval modeにしておくこと)。
@@ -357,47 +376,37 @@ def _run_selfplay_round(
     """
     all_samples: list[PPOSample] = []
     results = {0: 0, 1: 0, 2: 0}
-    skipped = 0
-    # ワーカーが軒並みハングするとPool自体が壊れ、`.get(timeout=...)`が個々の試合の
-    # タイムアウト通りに機能しなくなることがある。それに備え、ラウンド全体にも
-    # 締め切りを設け、超えたらPoolを強制終了して残りを諦める。
-    round_deadline = time.monotonic() + SELFPLAY_ROUND_TIMEOUT_SECONDS
-    mp_ctx = multiprocessing.get_context("spawn")
-    with mp_ctx.Pool(
-        processes=NUM_SELFPLAY_WORKERS,
+    processed = 0
+
+    def on_result(_game_index: int, result) -> None:
+        nonlocal processed
+        samples, winner = result
+        all_samples.extend(samples)
+        results[winner] += 1
+        processed += 1
+        if processed % 20 == 0 or processed == num_games:
+            print(f"  games processed={processed}/{num_games}  results_so_far={results}")
+
+    def on_failure(game_index: int, reason: str) -> None:
+        nonlocal processed
+        processed += 1
+        print(f"  game {game_index + 1}/{num_games} failed: {reason}")
+
+    _completed, skipped = run_parallel_games(
+        num_games=num_games,
+        num_workers=NUM_SELFPLAY_WORKERS,
         initializer=_init_selfplay_worker,
-        initargs=(network.state_dict(), deck, opponent_deck_pool, mode),
-    ) as pool:
-        async_results = [pool.apply_async(_play_one_ppo_game, (i,)) for i in range(num_games)]
-        for i, async_result in enumerate(async_results):
-            remaining = round_deadline - time.monotonic()
-            if remaining <= 0:
-                skipped += num_games - i
-                print(
-                    f"  round exceeded {SELFPLAY_ROUND_TIMEOUT_SECONDS}s deadline, "
-                    f"terminating pool and skipping remaining {num_games - i} games"
-                )
-                pool.terminate()
-                break
-            try:
-                samples, winner = async_result.get(
-                    timeout=min(SELFPLAY_GAME_TIMEOUT_SECONDS, remaining)
-                )
-                all_samples.extend(samples)
-                results[winner] += 1
-            except multiprocessing.TimeoutError:
-                skipped += 1
-                print(
-                    f"  game {i + 1}/{num_games} timed out after "
-                    f"{SELFPLAY_GAME_TIMEOUT_SECONDS}s, skipping"
-                )
-            except Exception as e:
-                # 1試合だけの想定外の異常でラウンド全体を落とさない(タイムアウトと同じ扱い)。
-                skipped += 1
-                print(f"  game {i + 1}/{num_games} raised {e!r}, skipping")
-            done = i + 1
-            if done % 20 == 0 or done == num_games:
-                print(f"  game {done}/{num_games}  results_so_far={results}  skipped={skipped}")
+        initargs=(network.state_dict(), deck, opponent_deck_pool, mode, GAMMA, GAE_LAMBDA, SEED),
+        task=_play_one_ppo_game,
+        game_timeout_seconds=SELFPLAY_GAME_TIMEOUT_SECONDS,
+        round_timeout_seconds=SELFPLAY_ROUND_TIMEOUT_SECONDS,
+        on_result=on_result,
+        on_failure=on_failure,
+        event_log_path=CHECKPOINT_DIR.parent / "worker_events.jsonl",
+        event_context={"algorithm": "ppo", "round": round_num, "mode": mode},
+    )
+    if skipped:
+        print(f"  skipped {skipped}/{num_games} failed or timed-out games")
     return all_samples, results
 
 
@@ -427,40 +436,9 @@ def make_ppo_eval_agent(network: PolicyValueNet, our_deck: list[int]):
     return agent
 
 
-def make_random_deck_ppo_eval_agent(network: PolicyValueNet, opponent_deck_pool: list[list[int]]):
-    """`network`で、対局のたびに実在デッキをランダムに選び直すagent()を作る(generalist評価用)。
-
-    `make_ppo_eval_agent`は1つの`our_deck`に固定するが、generalistは特定のデッキを
-    学習していないため、評価も自己対戦と同じ「毎回ランダムな実在デッキ」の分布で行う
-    (`mcts/train_mcts.py`の`make_random_deck_mcts_eval_agent`と同じ考え方)。
-
-    Args:
-        network: 評価対象の`PolicyValueNet`(eval modeにしておくこと)。
-        opponent_deck_pool: 対局のたびに選ぶ実在デッキのリスト。
-
-    Returns:
-        Callable[[dict], list[int]]: `match_runner.evaluate`に渡せるagent関数。
-    """
-    current_deck: list[int] = []
-
-    def agent(obs_dict: dict) -> list[int]:
-        obs = to_observation_class(obs_dict)
-        if obs.select is None:
-            current_deck[:] = random.choice(opponent_deck_pool)
-            return current_deck
-
-        actions, scores, _value, _encoder_sv, _decoder_sv = evaluate_policy(
-            network, obs, current_deck
-        )
-        best_index = int(torch.argmax(scores).item())
-        return actions[best_index]
-
-    return agent
-
-
 def run_training_loop(
     deck: list[int],
-    warmstart_checkpoint: Path | None = None,
+    initial_checkpoint: Path | None = None,
     optimizer_checkpoint: Path | None = None,
     start_round: int = 1,
 ) -> PolicyValueNet:
@@ -468,8 +446,8 @@ def run_training_loop(
 
     Args:
         deck: 本番でも使う、こちらの60枚のデッキリスト。
-        warmstart_checkpoint: 指定があれば、ランダム初期化の代わりにこのチェックポイントを
-            初期値として使う(`bc_pretrain.py`/`train_mcts.py`が保存したものを想定)。
+        initial_checkpoint: 指定があれば、ランダム初期化の代わりにこのチェックポイントを
+            初期値として使う（共通`PolicyValueNet`のcheckpointを想定）。
         optimizer_checkpoint: 指定があれば、Adamのモーメント推定もこのチェックポイントから
             復元する(クラッシュ後に同じラウンドの続きから再開する用途。新規学習では`None`)。
         start_round: 学習を開始するラウンド番号(1始まり)。クラッシュ後の再開時は
@@ -481,7 +459,7 @@ def run_training_loop(
     torch.manual_seed(SEED)
     # PolicyValueNet構築(AllCard/AllAttackを呼ぶ)の直後に大量のファイルI/Oを行うと
     # ネイティブ側でクラッシュするため、load_opponent_deck_pool()を先に呼ぶ
-    # (train_mcts.pyのrun_training_loopと同じ理由)。
+    # (mcts/train.pyのrun_training_loopと同じ理由)。
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     opponent_deck_pool = load_opponent_deck_pool()
     print(f"loaded {len(opponent_deck_pool)} distinct opponent decks for self-play")
@@ -490,44 +468,55 @@ def run_training_loop(
     network = PolicyValueNet(
         D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
     )
-    if warmstart_checkpoint is not None:
-        network.load_state_dict(torch.load(warmstart_checkpoint, weights_only=True))
-        print(f"warm-started network from {warmstart_checkpoint}")
+    if initial_checkpoint is not None:
+        network.load_state_dict(torch.load(initial_checkpoint, weights_only=True))
+        print(f"loaded initial network weights from {initial_checkpoint}")
     network.eval()
     # ラウンドをまたいで同じoptimizerを使う(毎ラウンド作り直すとAdamのモーメント推定が
     # リセットされてしまうため)。
     optimizer = torch.optim.Adam(network.parameters(), lr=LEARNING_RATE)
     if optimizer_checkpoint is not None:
-        optimizer.load_state_dict(torch.load(optimizer_checkpoint, weights_only=True))
-        print(f"restored optimizer state from {optimizer_checkpoint}")
+        restore_optimizer_state(
+            optimizer,
+            optimizer_checkpoint,
+            learning_rate=LEARNING_RATE,
+        )
+        print(
+            f"restored optimizer state from {optimizer_checkpoint} "
+            f"with configured learning_rate={LEARNING_RATE}"
+        )
 
     for round_num in range(start_round, N_ROUNDS + 1):
         print(f"=== round {round_num}/{N_ROUNDS}: self-play ({NUM_SELFPLAY_WORKERS} workers) ===")
         all_samples, results = _run_selfplay_round(
-            network, deck, opponent_deck_pool, GAMES_PER_ROUND, SELFPLAY_MODE
+            network, deck, opponent_deck_pool, GAMES_PER_ROUND, SELFPLAY_MODE, round_num
         )
         print(f"  round results: {results}  total_samples={len(all_samples)}")
 
         print(f"=== round {round_num}/{N_ROUNDS}: PPO update ===")
         train_one_round(network, optimizer, all_samples, EPOCHS_PER_ROUND)
 
-        print(f"=== round {round_num}/{N_ROUNDS}: eval vs random (diverse deck) ===")
-        # generalistは特定のデッキを学習していないため、自己対戦と同じ分布
-        # (実在デッキから毎回ランダム)で評価する(mcts/train_mcts.pyのmake_eval_agentと同じ考え方)。
-        eval_agent = (
-            make_random_deck_ppo_eval_agent(network, opponent_deck_pool)
-            if SELFPLAY_MODE == "generalist"
-            else make_ppo_eval_agent(network, deck)
+        # round間のモデル差だけを比較できるよう、matchupとPython seedを固定する。
+        evaluation_seed = SEED + 100_000
+        matchups = build_fixed_matchups(
+            SELFPLAY_MODE,
+            deck,
+            opponent_deck_pool,
+            EVAL_GAMES_PER_ROUND,
+            evaluation_seed,
         )
-        random_opponent_deck = random.choice(opponent_deck_pool)
-        vs_random = match_evaluate(
-            eval_agent, random_agent_factory(random_opponent_deck), n_episodes=EVAL_GAMES_PER_ROUND
+        print(f"=== round {round_num}/{N_ROUNDS}: fixed-matchup eval vs random ===")
+        vs_random = evaluate_fixed_matchups(
+            lambda selected_deck: make_ppo_eval_agent(network, selected_deck),
+            random_agent_factory,
+            matchups,
+            seed=evaluation_seed,
         )
-        print(f"  vs random (opponent deck size {len(set(random_opponent_deck))}): {vs_random}")
+        print(f"  vs random: {vs_random}")
 
         checkpoint_path = CHECKPOINT_DIR / f"{SELFPLAY_MODE}_round{round_num}.pt"
         torch.save(network.state_dict(), checkpoint_path)
-        # optimizer(Adamのモーメント推定)は別ファイルに保存する。warm-start読み込み
+        # optimizer(Adamのモーメント推定)は別ファイルに保存する。初期重み読み込み
         # (`network.load_state_dict(torch.load(path))`)との互換性を保つため、
         # 本体のcheckpointにはネットワークのstate_dictだけを入れる。
         torch.save(
@@ -539,61 +528,70 @@ def run_training_loop(
     return network
 
 
-def _latest_checkpoint_round() -> int | None:
-    """`CHECKPOINT_DIR`から、`{SELFPLAY_MODE}_round{N}.pt`の最大ラウンド番号を探す。
+def main(config_path: Path) -> int:
+    """PPO trainerを1つのrun configで実行する。再起動時は最新roundから再開する。"""
+    global CHECKPOINT_DIR, SELFPLAY_MODE, GAMES_PER_ROUND, N_ROUNDS
+    global NUM_SELFPLAY_WORKERS, SELFPLAY_GAME_TIMEOUT_SECONDS
+    global SELFPLAY_ROUND_TIMEOUT_SECONDS, EPOCHS_PER_ROUND, MINIBATCH_SIZE
+    global LEARNING_RATE, TARGET_KL, GAMMA, GAE_LAMBDA, CLIP_EPS
+    global VALUE_LOSS_COEF, ENTROPY_COEF, MAX_GRAD_NORM
+    global EVAL_GAMES_PER_ROUND, SEED
 
-    `_optimizer.pt`側は末尾が`.pt`で終わらない(`_round{N}_optimizer.pt`)ため、
-    このパターンには一致しない。
-
-    Returns:
-        int | None: 見つかった最大のラウンド番号。1つも無ければNone。
-    """
-    pattern = re.compile(rf"{re.escape(SELFPLAY_MODE)}_round(\d+)\.pt$")
-    rounds = [
-        int(m.group(1))
-        for p in CHECKPOINT_DIR.glob(f"{SELFPLAY_MODE}_round*.pt")
-        if (m := pattern.match(p.name))
-    ]
-    return max(rounds) if rounds else None
-
-
-if __name__ == "__main__":
-    # デッキ・モード・ウォームスタート元・回数・出力先はconfigから読む
-    # (`uv run python src/training/ppo/ppo_train.py [configのパス]`、省略時は既定のconfig)。
-    config_path = config_path_from_argv(ROOT / "configs" / "ppo_generalist.yaml")
     config = load_run_config(config_path)
+    validate_algorithm(config, "ppo")
+    settings = config.training
     CHECKPOINT_DIR = config.checkpoint_dir
     SELFPLAY_MODE = config.selfplay_mode
     GAMES_PER_ROUND = config.games_per_round
     N_ROUNDS = config.n_rounds
-    INITIAL_WARMSTART_CHECKPOINT = config.initial_warmstart_checkpoint
+    NUM_SELFPLAY_WORKERS = config.runtime.workers
+    SELFPLAY_GAME_TIMEOUT_SECONDS = config.runtime.game_timeout_seconds
+    SELFPLAY_ROUND_TIMEOUT_SECONDS = config.runtime.round_timeout_seconds
+    EPOCHS_PER_ROUND = int(settings["epochs_per_round"])
+    MINIBATCH_SIZE = int(settings["minibatch_size"])
+    LEARNING_RATE = float(settings["learning_rate"])
+    TARGET_KL = float(settings["target_kl"])
+    GAMMA = float(settings["gamma"])
+    GAE_LAMBDA = float(settings["gae_lambda"])
+    CLIP_EPS = float(settings["clip_epsilon"])
+    VALUE_LOSS_COEF = float(settings["value_loss_coef"])
+    ENTROPY_COEF = float(settings["entropy_coef"])
+    MAX_GRAD_NORM = float(settings["max_grad_norm"])
+    EVAL_GAMES_PER_ROUND = int(settings["eval_games_per_round"])
+    SEED = config.runtime.seed
 
-    # どのconfigで作ったチェックポイント群かを後から追えるよう、使ったconfigを
-    # checkpoint_dir直下にコピーしておく。
+    configure_sampling_snapshot(config.sampling_snapshot)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    save_config_snapshot(config_path, CHECKPOINT_DIR)
+    save_config_snapshot(config_path, config.output_dir)
 
-    # 実行するたびに、保存済みの最新ラウンドから自動で再開する(クラッシュ後の
-    # 再実行でも同じコマンドをそのまま使える)。何も無ければconfigの
-    # `initial_warmstart_checkpoint`から新規に開始する。
-    latest_round = _latest_checkpoint_round()
+    latest_round = latest_checkpoint_round(CHECKPOINT_DIR, SELFPLAY_MODE)
     if latest_round is not None:
-        warmstart = CHECKPOINT_DIR / f"{SELFPLAY_MODE}_round{latest_round}.pt"
-        optimizer_ckpt = CHECKPOINT_DIR / f"{SELFPLAY_MODE}_round{latest_round}_optimizer.pt"
+        initial_checkpoint = CHECKPOINT_DIR / f"{SELFPLAY_MODE}_round{latest_round}.pt"
+        optimizer_candidate = CHECKPOINT_DIR / f"{SELFPLAY_MODE}_round{latest_round}_optimizer.pt"
+        optimizer_ckpt = optimizer_candidate if optimizer_candidate.exists() else None
         start_round = latest_round + 1
-        print(f"resuming from round {latest_round} (start_round={start_round})")
+        print(f"resuming {config.name} from round {latest_round} (start_round={start_round})")
     else:
-        warmstart = (
-            INITIAL_WARMSTART_CHECKPOINT
-            if INITIAL_WARMSTART_CHECKPOINT and INITIAL_WARMSTART_CHECKPOINT.exists()
-            else None
-        )
+        initial_checkpoint = config.model.initial_checkpoint
+        if initial_checkpoint is not None and not initial_checkpoint.exists():
+            raise FileNotFoundError(f"initial checkpoint does not exist: {initial_checkpoint}")
         optimizer_ckpt = None
         start_round = 1
-        print(f"no existing round checkpoint found; starting fresh from {warmstart}")
-    run_training_loop(
+        print(f"starting {config.name} from initial checkpoint {initial_checkpoint}")
+
+    network = run_training_loop(
         config.deck,
-        warmstart_checkpoint=warmstart,
+        initial_checkpoint=initial_checkpoint,
         optimizer_checkpoint=optimizer_ckpt,
         start_round=start_round,
     )
+    final_path = CHECKPOINT_DIR / "final.pt"
+    torch.save(network.state_dict(), final_path)
+    print(f"saved final checkpoint to {final_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("Usage: python ppo/train.py CONFIG_PATH")
+    raise SystemExit(main(Path(sys.argv[1])))
