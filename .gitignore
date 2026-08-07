@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .venv/
+*.egg-info/
 
 .env
 
@@ -13,3 +14,4 @@ logs/
 
 *.tar.gz
 submission/
+nohup.out

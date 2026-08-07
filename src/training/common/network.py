@@ -10,7 +10,8 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-from sparse_features import SparseVector, decoder_size, encoder_size
+
+from .sparse_features import SparseVector, decoder_size, encoder_size
 
 NUM_WORDS_ENCODER = 24  # get_encoder_inputが作るトークン数(ベンチ8x2+アクティブ2+盤面2+手札1+デッキ1+スタジアム1+ターン情報1)
 
