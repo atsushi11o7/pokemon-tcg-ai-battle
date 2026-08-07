@@ -1,0 +1,33 @@
+run:
+  name: mcts_generalist
+  output_dir: outputs/runs/mcts_generalist
+
+algorithm: mcts
+
+model:
+  initial_checkpoint: outputs/runs/ppo_generalist/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 4
+  game_timeout_seconds: 300
+  round_timeout_seconds: 1800
+  max_restarts: 50
+  retry_delay_seconds: 5
+
+training:
+  selfplay_mode: generalist
+  games_per_round: 200
+  rounds: 40
+  search_count: 50
+  learning_rate: 0.001
+  batch_size: 32
+  epochs_per_round: 3
+  eval_games_per_round: 32
+  gating_win_rate: 0.5
+  checkpoint_pool_size: 3
+  gating_pool_sample: 2
+  replay_buffer_rounds: 5

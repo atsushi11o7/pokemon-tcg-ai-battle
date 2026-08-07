@@ -1,221 +1,158 @@
-"""Determinized MCTSの探索用に、隠れ情報(相手の手札・山札・サイド)をサンプリングする。
+"""MCTS探索用の隠れ情報を、実在デッキと公開情報に整合する形でサンプリングする。"""
 
-自分の情報は既知のデッキリストからサンプリングする。相手の情報は不明なため、
-過去リプレイの実在デッキから作ったカード出現頻度プールから確率的に推測する。
-"""
-
-import json
 import random
 import sys
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-EPISODES_DIR = ROOT / "data" / "episodes"
 SAMPLE_SUBMISSION_DIR = ROOT / "data" / "sample_submission" / "sample_submission"
 sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 
 from cg.api import CardType, all_card_data  # noqa: E402
 
-_opponent_pool: list[int] | None = None
+from ..common.opponent_pool import load_opponent_deck_pool  # noqa: E402
+
 _pokemon_card_ids: set[int] | None = None
-_opponent_deck_pool: list[list[int]] | None = None
-
-
-def _load_opponent_pool() -> list[int]:
-    """リプレイ中の実在デッキ(`steps[0][0]["visualize"]`)からカード出現頻度プールを作る。
-
-    Returns:
-        list[int]: 出現頻度に応じて重複を含むカードIDのリスト(`random.choices`の母集団)。
-    """
-    counter: Counter[int] = Counter()
-    for path in EPISODES_DIR.glob("*.json"):
-        with path.open() as f:
-            episode = json.load(f)
-        for viz in episode["steps"][0][0].get("visualize") or []:
-            action = viz.get("action")
-            if (
-                isinstance(action, list)
-                and len(action) == 2
-                and all(isinstance(deck, list) and len(deck) == 60 for deck in action)
-            ):
-                counter.update(action[0])
-                counter.update(action[1])
-    if not counter:
-        raise RuntimeError(f"No deck data found under {EPISODES_DIR}")
-    return list(counter.elements())
-
-
-def _opponent_card_pool() -> list[int]:
-    """出現頻度プールを遅延ロードしてキャッシュする。
-
-    Returns:
-        list[int]: `_load_opponent_pool`が返すプール。
-    """
-    global _opponent_pool
-    if _opponent_pool is None:
-        _opponent_pool = _load_opponent_pool()
-    return _opponent_pool
-
-
-def sample_opponent_hidden(
-    deck_count: int, hand_count: int, prize_count: int
-) -> tuple[list[int], list[int], list[int]]:
-    """相手の山札・手札・サイドを、カード出現頻度プールからサンプリングする。
-
-    Args:
-        deck_count: 相手の残り山札枚数(`PlayerState.deckCount`)。
-        hand_count: 相手の手札枚数(`PlayerState.handCount`)。
-        prize_count: 相手の残りサイド枚数(`len(PlayerState.prize)`)。
-
-    Returns:
-        tuple[list[int], list[int], list[int]]: (opponent_deck, opponent_hand, opponent_prize)。
-            `search_begin`にそのまま渡せる形式。
-    """
-    pool = _opponent_card_pool()
-    total = deck_count + hand_count + prize_count
-    sampled = random.choices(pool, k=total)
-    random.shuffle(sampled)
-    return (
-        sampled[:deck_count],
-        sampled[deck_count : deck_count + hand_count],
-        sampled[deck_count + hand_count :],
-    )
-
-
-def sample_own_hidden(
-    own_deck: list[int], deck_count: int, prize_count: int
-) -> tuple[list[int], list[int]]:
-    """自分の山札・サイドを、既知のデッキリストからランダムに割り当てる。
-
-    Args:
-        own_deck: 自分の60枚のデッキリスト(カードID)。
-        deck_count: 自分の残り山札枚数。
-        prize_count: 自分の残りサイド枚数。
-
-    Returns:
-        tuple[list[int], list[int]]: (your_deck, your_prize)。`search_begin`にそのまま渡せる形式。
-    """
-    sampled = random.sample(own_deck, deck_count + prize_count)
-    return sampled[:deck_count], sampled[deck_count:]
-
-
-def search_begin_kwargs(obs, our_deck: list[int]) -> dict:
-    """`search_begin`に渡す、隠れ情報の仮定一式を組み立てる(自分のデッキは既知、相手は不明)。
-
-    Args:
-        obs: 探索を開始したい局面のObservation。
-        our_deck: 自分の60枚のデッキリスト(既知)。
-
-    Returns:
-        dict: `search_begin`にそのまま`**kwargs`で渡せる引数一式。
-    """
-    state = obs.current
-    your_index = state.yourIndex
-    me = state.players[your_index]
-    opp = state.players[1 - your_index]
-
-    your_deck, your_prize = sample_own_hidden(our_deck, me.deckCount, len(me.prize))
-    opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
-        opp.deckCount, opp.handCount, len(opp.prize)
-    )
-    opponent_active: list[int] = []
-    if opp.active and opp.active[0] is None:
-        opponent_active = [sample_opponent_active_guess()]
-
-    return {
-        "your_deck": your_deck,
-        "your_prize": your_prize,
-        "opponent_deck": opponent_deck,
-        "opponent_prize": opponent_prize,
-        "opponent_hand": opponent_hand,
-        "opponent_active": opponent_active,
-    }
 
 
 def _pokemon_ids() -> set[int]:
-    """全カードマスタから、ポケモンカードのIDだけを遅延ロードしてキャッシュする。
-
-    Returns:
-        set[int]: `CardType.POKEMON`であるカードIDの集合。
-    """
     global _pokemon_card_ids
     if _pokemon_card_ids is None:
         _pokemon_card_ids = {c.cardId for c in all_card_data() if c.cardType == CardType.POKEMON}
     return _pokemon_card_ids
 
 
-def sample_opponent_active_guess() -> int:
-    """相手のアクティブポケモンが伏せられている場合に、その正体として仮定するカードIDを選ぶ。
+def _pokemon_cards(pokemon) -> list[int]:
+    """場のポケモン1体を構成する全カードIDを返す。"""
+    if pokemon is None:
+        return []
+    return [
+        pokemon.id,
+        *(card.id for card in pokemon.preEvolution),
+        *(card.id for card in pokemon.energyCards),
+        *(card.id for card in pokemon.tools),
+    ]
 
-    `search_begin`はポケモンカード以外のIDを渡すとエラーになるため、出現頻度プールを
-    ポケモンカードのみに絞ってサンプリングする。
+
+def visible_cards(state, player_index: int) -> list[int]:
+    """山札・非公開サイドを除き、現在公開されているカードを多重集合で返す。"""
+    player = state.players[player_index]
+    cards: list[int] = []
+    for pokemon in player.active:
+        cards.extend(_pokemon_cards(pokemon))
+    for pokemon in player.bench:
+        cards.extend(_pokemon_cards(pokemon))
+    cards.extend(card.id for card in player.discard)
+    cards.extend(card.id for card in player.prize if card is not None)
+    if player.hand is not None:
+        cards.extend(card.id for card in player.hand)
+    cards.extend(card.id for card in state.stadium if card.playerIndex == player_index)
+    return cards
+
+
+def _remaining_deck(full_deck: list[int], known_cards: list[int]) -> list[int] | None:
+    """full_deckから既知カードを枚数込みで差し引く。不整合ならNone。"""
+    remaining = Counter(full_deck)
+    remaining.subtract(Counter(known_cards))
+    if any(count < 0 for count in remaining.values()):
+        return None
+    return list(remaining.elements())
+
+
+def _choose_compatible_deck(
+    candidates: list[list[int]], known_cards: list[int], required_hidden: int
+) -> tuple[list[int], list[int]]:
+    """公開カードを含み、必要な隠れ枚数を確保できる実在デッキを選ぶ。"""
+    compatible: list[tuple[list[int], list[int]]] = []
+    for deck in candidates:
+        remaining = _remaining_deck(deck, known_cards)
+        if remaining is not None and len(remaining) >= required_hidden:
+            compatible.append((deck, remaining))
+    if not compatible:
+        raise ValueError(
+            "no opponent deck candidate is compatible with the observed public cards "
+            f"(known={Counter(known_cards)}, required_hidden={required_hidden})"
+        )
+    return random.choice(compatible)
+
+
+def determinize_for_search(
+    obs,
+    own_deck: list[int],
+    opponent_deck_pool: list[list[int]] | None = None,
+) -> tuple[dict, list[list[int]]]:
+    """探索側から見える情報だけで隠れ状態を作る。
 
     Returns:
-        int: 仮定するポケモンカードのID。
+        (search_beginへ渡すkwargs, playerIndex順の仮定フルデッキ)。
     """
-    pool = _opponent_card_pool()
-    pokemon_ids = _pokemon_ids()
-    candidates = [card_id for card_id in pool if card_id in pokemon_ids]
-    if not candidates:
-        candidates = list(pokemon_ids)
-    return random.choice(candidates)
+    state = obs.current
+    your_index = state.yourIndex
+    opponent_index = 1 - your_index
+    me = state.players[your_index]
+    opponent = state.players[opponent_index]
 
+    own_remaining = _remaining_deck(own_deck, visible_cards(state, your_index))
+    own_unknown_prizes = sum(card is None for card in me.prize)
+    own_hidden_count = me.deckCount + own_unknown_prizes
+    if own_remaining is None or len(own_remaining) < own_hidden_count:
+        raise ValueError(
+            "own deck is inconsistent with observed cards "
+            f"(remaining={None if own_remaining is None else len(own_remaining)}, "
+            f"required={own_hidden_count})"
+        )
+    random.shuffle(own_remaining)
+    your_hidden_deck = own_remaining[: me.deckCount]
+    hidden_own_prizes = iter(own_remaining[me.deckCount : own_hidden_count])
+    your_prize = [card.id if card is not None else next(hidden_own_prizes) for card in me.prize]
 
-def sample_full_hidden(
-    known_deck: list[int], deck_count: int, hand_count: int, prize_count: int
-) -> tuple[list[int], list[int], list[int]]:
-    """デッキ構成が既知の相手(自己対戦)向けに、山札・手札・サイドをまとめて割り当てる。
-
-    Args:
-        known_deck: 既知の60枚のデッキリスト(カードID)。
-        deck_count: 残り山札枚数。
-        hand_count: 手札枚数。
-        prize_count: 残りサイド枚数。
-
-    Returns:
-        tuple[list[int], list[int], list[int]]: (deck, hand, prize)。
-            `search_begin`にそのまま渡せる形式。
-    """
-    sampled = random.sample(known_deck, deck_count + hand_count + prize_count)
-    return (
-        sampled[:deck_count],
-        sampled[deck_count : deck_count + hand_count],
-        sampled[deck_count + hand_count :],
+    candidates = opponent_deck_pool or load_opponent_deck_pool()
+    opponent_known = visible_cards(state, opponent_index)
+    face_down_active = bool(opponent.active and opponent.active[0] is None)
+    opponent_unknown_prizes = sum(card is None for card in opponent.prize)
+    opponent_hidden_count = opponent.deckCount + opponent.handCount + opponent_unknown_prizes
+    assumed_opponent_deck, opponent_remaining = _choose_compatible_deck(
+        candidates, opponent_known, opponent_hidden_count + int(face_down_active)
     )
 
+    opponent_active: list[int] = []
+    if face_down_active:
+        pokemon_positions = [
+            index for index, card_id in enumerate(opponent_remaining) if card_id in _pokemon_ids()
+        ]
+        if not pokemon_positions:
+            raise ValueError("compatible opponent deck has no Pokémon for the face-down Active")
+        active_position = random.choice(pokemon_positions)
+        opponent_active.append(opponent_remaining.pop(active_position))
 
-def load_opponent_deck_pool() -> list[list[int]]:
-    """リプレイ中の実在デッキから、重複を除いた60枚デッキの一覧を集める。
+    random.shuffle(opponent_remaining)
+    opponent_deck = opponent_remaining[: opponent.deckCount]
+    hand_start = opponent.deckCount
+    prize_start = hand_start + opponent.handCount
+    opponent_hand = opponent_remaining[hand_start:prize_start]
+    hidden_opponent_prizes = iter(
+        opponent_remaining[prize_start : prize_start + opponent_unknown_prizes]
+    )
+    opponent_prize = [
+        card.id if card is not None else next(hidden_opponent_prizes) for card in opponent.prize
+    ]
 
-    `_load_opponent_pool`がカード単位の出現頻度を集計するのに対し、こちらはデッキ単位で
-    重複を除いて集める。自己対戦の対戦相手を実在デッキからランダムに選ぶために使う。
+    assumed_decks = [own_deck, own_deck]
+    assumed_decks[your_index] = own_deck
+    assumed_decks[opponent_index] = assumed_opponent_deck
+    kwargs = {
+        "your_deck": your_hidden_deck,
+        "your_prize": your_prize,
+        "opponent_deck": opponent_deck,
+        "opponent_prize": opponent_prize,
+        "opponent_hand": opponent_hand,
+        "opponent_active": opponent_active,
+    }
+    return kwargs, assumed_decks
 
-    Returns:
-        list[list[int]]: 重複を除いた60枚デッキのリスト。
-    """
-    global _opponent_deck_pool
-    if _opponent_deck_pool is not None:
-        return _opponent_deck_pool
 
-    seen: set[tuple[int, ...]] = set()
-    decks: list[list[int]] = []
-    for path in EPISODES_DIR.glob("*.json"):
-        with path.open() as f:
-            episode = json.load(f)
-        for viz in episode["steps"][0][0].get("visualize") or []:
-            action = viz.get("action")
-            if (
-                isinstance(action, list)
-                and len(action) == 2
-                and all(isinstance(deck, list) and len(deck) == 60 for deck in action)
-            ):
-                for deck in action:
-                    key = tuple(sorted(deck))
-                    if key not in seen:
-                        seen.add(key)
-                        decks.append(deck)
-    if not decks:
-        raise RuntimeError(f"No deck data found under {EPISODES_DIR}")
-    _opponent_deck_pool = decks
-    return _opponent_deck_pool
+def search_begin_kwargs(obs, our_deck: list[int]) -> dict:
+    """後方互換用。本番探索向けの隠れ情報kwargsだけを返す。"""
+    kwargs, _assumed_decks = determinize_for_search(obs, our_deck)
+    return kwargs
