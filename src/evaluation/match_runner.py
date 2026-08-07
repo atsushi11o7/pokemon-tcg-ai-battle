@@ -14,6 +14,7 @@ Usage:
 
 import random
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +83,69 @@ def evaluate(agent1, agent2, n_episodes: int, swap_positions: bool = True) -> di
         "losses": losses,
         "draws": draws,
         "win_rate": wins / n_episodes,
+    }
+
+
+def evaluate_fixed_matchups(
+    agent1_factory: Callable[[list[int]], Callable[[dict], list[int]]],
+    agent2_factory: Callable[[list[int]], Callable[[dict], list[int]]],
+    matchups: list[tuple[list[int], list[int]]],
+    *,
+    seed: int,
+    swap_decks: bool = True,
+) -> dict:
+    """固定したデッキ組合せを、同一Python seed・席交換で評価する。
+
+    1つのmatchup ``(A, B)`` につき、まずagent1=A/agent2=Bで両方の席を
+    1回ずつ対戦する。``swap_decks=True``ならagent1=B/agent2=Aでも同じ2戦を行う。
+    したがって通常は1 matchupあたり4試合になる。
+
+    各席交換ペアは同じPython乱数seedから開始する。これはPython側のデッキ推定、
+    MCTS determinization、random agentを揃えるためのもので、seed APIを公開していない
+    native CG engine内部のshuffleまで同一化する保証はない。
+    """
+    wins = losses = draws = 0
+    random_state = random.getstate()
+    try:
+        for matchup_index, (deck_a, deck_b) in enumerate(matchups):
+            assignments = [(deck_a, deck_b)]
+            if swap_decks:
+                assignments.append((deck_b, deck_a))
+
+            for assignment_index, (agent1_deck, agent2_deck) in enumerate(assignments):
+                pair_seed = seed + matchup_index * 2 + assignment_index
+
+                random.seed(pair_seed)
+                agent1 = agent1_factory(agent1_deck)
+                agent2 = agent2_factory(agent2_deck)
+                r1, r2 = play_one_match(agent1, agent2)
+                if r1 == 1:
+                    wins += 1
+                elif r2 == 1:
+                    losses += 1
+                else:
+                    draws += 1
+
+                random.seed(pair_seed)
+                agent1 = agent1_factory(agent1_deck)
+                agent2 = agent2_factory(agent2_deck)
+                r2, r1 = play_one_match(agent2, agent1)
+                if r1 == 1:
+                    wins += 1
+                elif r2 == 1:
+                    losses += 1
+                else:
+                    draws += 1
+    finally:
+        random.setstate(random_state)
+
+    n_games = wins + losses + draws
+    return {
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "games": n_games,
+        "win_rate": wins / n_games if n_games else 0.0,
     }
 
 
