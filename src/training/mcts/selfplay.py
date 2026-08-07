@@ -8,9 +8,10 @@
 3つの自己対戦モードを切り替えられる(`mode`引数、詳細は`play_selfplay_game`のdocstring参照)。
 "asymmetric"(相手デッキランダム・自分側のみ学習)、"mirror"(両者同デッキ・両サイド学習)、
 "generalist"(両者独立ランダム・両サイド学習)。いずれも探索側は自分の本当のデッキだけを知り、
-相手の隠れ情報は本番と同じくカード出現頻度からの推測(`determinize.sample_opponent_hidden`)を使う。
+相手の隠れ情報は本番と同じく、公開カードと整合する実在デッキ候補から推測する。
 """
 
+import random
 import sys
 from pathlib import Path
 
@@ -18,24 +19,20 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(ROOT / "src" / "training" / "common"))
-from determinize import (  # noqa: E402
-    sample_full_hidden,
-    sample_opponent_active_guess,
-    sample_opponent_hidden,
-)
-from search import run_mcts  # noqa: E402
-from selfplay_modes import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
-from sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
+from ..common.selfplay_modes import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
+from ..common.sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
+from .determinize import determinize_for_search  # noqa: E402
+from .search import run_mcts  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import search_begin, search_end, to_observation_class  # noqa: E402
 from cg.game import battle_finish, battle_select, battle_start  # noqa: E402
 
-LAMBDA = (
-    0.9  # 価値ラベルを作るときの、実際の結果と探索時のvalue推定とのブレンド率(公式サンプルと同じ)
-)
+LAMBDA = 0.9
+NUM_DETERMINIZATIONS = 5
+ROOT_DIRICHLET_ALPHA = 0.3
+ROOT_NOISE_FRACTION = 0.25
+SELFPLAY_TEMPERATURE_TURNS = 20
 
 
 class Sample:
@@ -60,7 +57,7 @@ def make_eval_fn(network, decks: list[list[int]]):
     """`PolicyValueNet`をラップして、`search.create_node`が要求する`eval_fn`にする。
 
     探索木は複数ターンにまたがりうるため、ノードごとに「今まさに手番を選んでいる側
-    (`obs.current.yourIndex`)の本当のデッキ」を`decks`から引いて`get_encoder_input`に渡す
+    (`obs.current.yourIndex`)の仮定デッキ」を`decks`から引いて`get_encoder_input`に渡す
     (`decks[0]`/`decks[1]`のどちらがその局面で手番を持っているかは局面ごとに変わりうる)。
 
     Args:
@@ -89,43 +86,62 @@ def make_eval_fn(network, decks: list[list[int]]):
     return eval_fn
 
 
-def _search_begin_kwargs(obs, my_true_deck: list[int]) -> dict:
-    """今まさに手番を選んでいる側の視点で、隠れ情報の仮定一式を組み立てる。
+def run_determinized_mcts(
+    network,
+    obs,
+    own_deck: list[int],
+    opponent_deck_pool: list[list[int]] | None,
+    search_count: int,
+    *,
+    num_determinizations: int = NUM_DETERMINIZATIONS,
+    add_root_noise: bool = False,
+    temperature: float | None = None,
+) -> tuple[list[int], list[float], float, list[list[int]]]:
+    """複数の隠れ情報仮説へ探索予算を分配し、根の方策と価値を集約する。"""
+    hypothesis_count = min(max(1, num_determinizations), max(1, search_count))
+    base_budget, remainder = divmod(search_count, hypothesis_count)
+    aggregate_policy: list[float] | None = None
+    aggregate_value = 0.0
+    total_weight = 0
+    common_actions: list[list[int]] | None = None
 
-    自分の本当のデッキ(`my_true_deck`)は探索側にとって既知だが、相手の本当のデッキ
-    (自己対戦なので実際には`play_selfplay_game`が知っている)はカンニングさせず、
-    本番の対戦相手と同じくカード出現頻度からの推測(`determinize.sample_opponent_hidden`)
-    を使う。これにより、学習時の探索と本番推論時の探索が同じ前提で動く。
+    for hypothesis_index in range(hypothesis_count):
+        budget = base_budget + int(hypothesis_index < remainder)
+        kwargs, assumed_decks = determinize_for_search(obs, own_deck, opponent_deck_pool)
+        eval_fn = make_eval_fn(network, assumed_decks)
+        root_state = search_begin(obs, **kwargs)
+        try:
+            _select, policy, value, actions = run_mcts(
+                root_state,
+                obs.current.yourIndex,
+                eval_fn,
+                budget,
+                root_dirichlet_alpha=ROOT_DIRICHLET_ALPHA if add_root_noise else None,
+                root_noise_fraction=ROOT_NOISE_FRACTION if add_root_noise else 0.0,
+            )
+        finally:
+            search_end()
 
-    Args:
-        obs: 探索を開始したい局面のObservation。
-        my_true_deck: 今探索している側が実際に使っている60枚のデッキリスト。
+        if common_actions is None:
+            common_actions = actions
+            aggregate_policy = [0.0] * len(policy)
+        elif actions != common_actions:
+            raise RuntimeError("root legal actions changed across determinizations")
+        weight = max(1, budget)
+        for index, probability in enumerate(policy):
+            aggregate_policy[index] += probability * weight
+        aggregate_value += value * weight
+        total_weight += weight
 
-    Returns:
-        dict: `search_begin`にそのまま`**kwargs`で渡せる引数一式。
-    """
-    state = obs.current
-    your_index = state.yourIndex
-    me = state.players[your_index]
-    opp = state.players[1 - your_index]
-
-    # 自分の手札はObservationで既知なので、hand_count=0にしてdeck/prizeだけ受け取る
-    your_deck, _, your_prize = sample_full_hidden(my_true_deck, me.deckCount, 0, len(me.prize))
-    opponent_deck, opponent_hand, opponent_prize = sample_opponent_hidden(
-        opp.deckCount, opp.handCount, len(opp.prize)
-    )
-    opponent_active: list[int] = []
-    if opp.active and opp.active[0] is None:
-        opponent_active = [sample_opponent_active_guess()]
-
-    return {
-        "your_deck": your_deck,
-        "your_prize": your_prize,
-        "opponent_deck": opponent_deck,
-        "opponent_prize": opponent_prize,
-        "opponent_hand": opponent_hand,
-        "opponent_active": opponent_active,
-    }
+    assert common_actions is not None and aggregate_policy is not None
+    policy_target = [value / total_weight for value in aggregate_policy]
+    root_value = aggregate_value / total_weight
+    if temperature is None or temperature <= 0:
+        selected_index = max(range(len(policy_target)), key=policy_target.__getitem__)
+    else:
+        weights = [probability ** (1.0 / temperature) for probability in policy_target]
+        selected_index = random.choices(range(len(weights)), weights=weights, k=1)[0]
+    return common_actions[selected_index], policy_target, root_value, common_actions
 
 
 def _assign_labels(samples: list[Sample], winner: int, player_index: int) -> None:
@@ -185,7 +201,6 @@ def play_selfplay_game(
             それ以外は両サイド分), `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
     """
     decks, collect_seats = pick_decks_and_collect_seats(mode, our_deck, opponent_deck_pool)
-    eval_fn = make_eval_fn(network, decks)
     obs_dict, start_data = battle_start(decks[0], decks[1])
     try:
         if start_data.errorPlayer >= 0:
@@ -196,13 +211,15 @@ def play_selfplay_game(
 
         while obs.current.result < 0:
             your_index = obs.current.yourIndex
-            root_state = search_begin(obs, **_search_begin_kwargs(obs, decks[your_index]))
-            try:
-                select, policy_target, root_value, actions = run_mcts(
-                    root_state, your_index, eval_fn, search_count
-                )
-            finally:
-                search_end()
+            select, policy_target, root_value, actions = run_determinized_mcts(
+                network,
+                obs,
+                decks[your_index],
+                opponent_deck_pool,
+                search_count,
+                add_root_noise=True,
+                temperature=1.0 if obs.current.turn <= SELFPLAY_TEMPERATURE_TURNS else None,
+            )
             if your_index in collect_seats:
                 encoder_sv = get_encoder_input(obs, decks[your_index])
                 decoder_sv = get_decoder_input(obs, actions)

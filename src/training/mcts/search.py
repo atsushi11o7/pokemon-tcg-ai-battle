@@ -7,6 +7,7 @@
 
 import itertools
 import math
+import random
 import sys
 from pathlib import Path
 
@@ -61,34 +62,44 @@ class Node:
             self.parent.backprop(value)
 
 
+def _unrank_combination(n: int, count: int, rank: int) -> list[int]:
+    """辞書順の組み合わせを全列挙せず、rank番目だけを取り出す。"""
+    result: list[int] = []
+    start = 0
+    for position in range(count):
+        remaining = count - position - 1
+        for candidate in range(start, n):
+            suffixes = math.comb(n - candidate - 1, remaining)
+            if rank < suffixes:
+                result.append(candidate)
+                start = candidate + 1
+                break
+            rank -= suffixes
+    return result
+
+
 def _enumerate_actions(select) -> list[list[int]]:
-    """選択肢の中から、`minCount`以上`maxCount`以下の個数を選ぶ組み合わせを列挙する。
-
-    ほとんどの選択は`minCount == maxCount == 1`の単一選択で、この場合は
-    「各選択肢を1つずつ選ぶ」という単純な列挙になり、選択肢数nに対して線形(高々n件)
-    にしかならないため打ち切らない(MAIN選択はATTACHのエネルギー×対象ポケモンの
-    組み合わせなどで数十件になることがあるが、組み合わせ爆発ではないので問題無い)。
-    2個以上を選ぶ複数選択は組み合わせ数が膨大になりうるため、`MAX_ACTIONS_PER_NODE`件で
-    打ち切る(公式サンプルコードも同様に列挙件数の上限を設けている)。
-
-    Args:
-        select: 列挙対象の`SelectData`。
-
-    Returns:
-        list[list[int]]: 各要素が選択するindexのリスト(`search_step`にそのまま渡せる形式)。
-    """
+    """合法な複数選択を列挙し、多すぎる場合はrank空間から均等に採る。"""
     n = len(select.option)
+    counts = list(range(select.minCount, select.maxCount + 1))
+    sizes = [math.comb(n, count) for count in counts]
+    total = sum(sizes)
+    if total <= MAX_ACTIONS_PER_NODE:
+        return [
+            list(combo) for count in counts for combo in itertools.combinations(range(n), count)
+        ]
+
+    # 先頭だけを採ると後方indexを含む合法手が消えるため、全rankから等間隔に選ぶ。
+    ranks = sorted(
+        {round(i * (total - 1) / (MAX_ACTIONS_PER_NODE - 1)) for i in range(MAX_ACTIONS_PER_NODE)}
+    )
     actions: list[list[int]] = []
-    for count in range(select.minCount, select.maxCount + 1):
-        if count == 0:
-            actions.append([])
-        elif count == 1:
-            actions.extend([i] for i in range(n))
-        else:
-            for combo in itertools.combinations(range(n), count):
-                actions.append(list(combo))
-                if len(actions) >= MAX_ACTIONS_PER_NODE:
-                    return actions
+    for rank in ranks:
+        for count, size in zip(counts, sizes, strict=True):
+            if rank < size:
+                actions.append(_unrank_combination(n, count, rank))
+                break
+            rank -= size
     return actions
 
 
@@ -171,7 +182,9 @@ def _select_child(node: "Node", your_index: int) -> "Child":
     best_score = -math.inf
     for child in node.children:
         if child.node is None:
-            avg_value = node.total / node.visit
+            # 未展開の辺には価値観測がない。親のQをコピーすると、親が高評価なだけで
+            # 未知の全行動まで高評価になり、priorによる探索が歪む。
+            avg_value = 0.0
             visit = 0
         else:
             avg_value = child.node.total / child.node.visit
@@ -186,7 +199,12 @@ def _select_child(node: "Node", your_index: int) -> "Child":
 
 
 def run_mcts(
-    root_state, your_index: int, eval_fn, search_count: int
+    root_state,
+    your_index: int,
+    eval_fn,
+    search_count: int,
+    root_dirichlet_alpha: float | None = None,
+    root_noise_fraction: float = 0.0,
 ) -> tuple[list[int], list[float], float, list[list[int]]]:
     """根の`SearchState`からPUCTで`search_count`回のシミュレーションを行う。
 
@@ -209,6 +227,13 @@ def run_mcts(
     """
     root = create_node(None, root_state, your_index, eval_fn)
     actions = [child.select for child in root.children]
+    if root_dirichlet_alpha is not None and root_noise_fraction > 0 and len(root.children) > 1:
+        noise = [random.gammavariate(root_dirichlet_alpha, 1.0) for _ in root.children]
+        noise_total = sum(noise)
+        for child, sample in zip(root.children, noise, strict=True):
+            child.prob = (
+                1.0 - root_noise_fraction
+            ) * child.prob + root_noise_fraction * sample / noise_total
     # search_stepは呼ぶたびに新しいSearchStateをエンジン側に確保するので、使い終わったら
     # search_releaseで明示的に解放する(放置するとネイティブメモリがリークする)。
     # 根ノード(root_state)はsearch_begin/search_endが管理するのでここでは対象外。
