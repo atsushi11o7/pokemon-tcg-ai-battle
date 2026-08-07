@@ -1,82 +1,275 @@
-"""実験のたびに変わる設定(デッキ・自己対戦モード・ウォームスタート元・回数・出力先)をyamlから読む。
+"""単一の学習run(PPOまたはMCTS)を表す厳密なYAML設定。"""
 
-アーキテクチャ定数(`model_config.py`)や、学習率のようにほぼ変えないアルゴリズムの
-ハイパーパラメータは対象外(各学習スクリプトにPythonの定数として残す)。`configs/`配下の
-yamlを追加・複製するだけで、コードを編集せずに実験(デッキ・モード・ウォームスタート元の
-組み合わせ)を切り替えられるようにするのが狙い。
-"""
+from __future__ import annotations
 
+import os
 import shutil
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from deck import parse_deck_csv
-from selfplay_modes import SelfplayMode
+
+from .deck import parse_deck_csv
+from .selfplay_modes import SelfplayMode
 
 ROOT = Path(__file__).resolve().parents[3]
+Algorithm = Literal["ppo", "mcts"]
 
 
-@dataclass
+@dataclass(frozen=True)
+class ModelConfig:
+    initial_checkpoint: Path
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    seed: int
+    workers: int
+    game_timeout_seconds: float
+    round_timeout_seconds: float
+    max_restarts: int
+    retry_delay_seconds: float
+
+
+@dataclass(frozen=True)
 class RunConfig:
-    algorithm: Literal["mcts", "ppo"]
-    deck_path: Path
+    name: str
+    algorithm: Algorithm
+    output_dir: Path
+    model: ModelConfig
+    sampling_snapshot: Path
+    runtime: RuntimeConfig
     selfplay_mode: SelfplayMode
-    initial_warmstart_checkpoint: Path | None
-    games_per_round: int
-    n_rounds: int
-    checkpoint_dir: Path
+    deck_path: Path | None
+    training: dict[str, Any]
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        return self.output_dir / "checkpoints"
 
     @property
     def deck(self) -> list[int]:
-        return parse_deck_csv(self.deck_path)
+        # generalistは両席ともsnapshotから抽選するため、固定デッキを使用しない。
+        return parse_deck_csv(self.deck_path) if self.deck_path is not None else []
+
+    @property
+    def games_per_round(self) -> int:
+        return int(self.training["games_per_round"])
+
+    @property
+    def n_rounds(self) -> int:
+        return int(self.training["rounds"])
+
+
+def _mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping")
+    return value
+
+
+def _reject_unknown(raw: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"unknown {label} field(s): {', '.join(sorted(unknown))}")
+
+
+def _positive(value: Any, label: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise ValueError(f"{label} must be positive")
+    return number
+
+
+def _non_negative(value: Any, label: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise ValueError(f"{label} must be non-negative")
+    return number
+
+
+def _positive_int(value: Any, label: str) -> int:
+    number = int(value)
+    if number <= 0 or number != float(value):
+        raise ValueError(f"{label} must be a positive integer")
+    return number
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    number = int(value)
+    if number < 0 or number != float(value):
+        raise ValueError(f"{label} must be a non-negative integer")
+    return number
+
+
+def _probability(value: Any, label: str) -> float:
+    number = float(value)
+    if not 0 <= number <= 1:
+        raise ValueError(f"{label} must be between 0 and 1")
+    return number
+
+
+def _required_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _resolve(path: str | None) -> Path | None:
+    return ROOT / path if path else None
+
+
+def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> SelfplayMode:
+    common_fields = {"selfplay_mode", "deck_path", "games_per_round", "rounds"}
+    algorithm_fields = {
+        "ppo": {
+            "learning_rate",
+            "minibatch_size",
+            "epochs_per_round",
+            "target_kl",
+            "gamma",
+            "gae_lambda",
+            "clip_epsilon",
+            "value_loss_coef",
+            "entropy_coef",
+            "max_grad_norm",
+            "eval_games_per_round",
+        },
+        "mcts": {
+            "search_count",
+            "learning_rate",
+            "batch_size",
+            "epochs_per_round",
+            "eval_games_per_round",
+            "gating_win_rate",
+            "checkpoint_pool_size",
+            "gating_pool_sample",
+            "replay_buffer_rounds",
+        },
+    }[algorithm]
+    _reject_unknown(training, common_fields | algorithm_fields, "training")
+    required = (common_fields - {"deck_path"}) | algorithm_fields
+    missing = required - set(training)
+    if missing:
+        raise ValueError(f"missing training field(s): {', '.join(sorted(missing))}")
+
+    mode = training["selfplay_mode"]
+    if mode not in ("generalist", "asymmetric", "mirror"):
+        raise ValueError(f"invalid selfplay_mode: {mode!r}")
+    if mode != "generalist" and not training.get("deck_path"):
+        raise ValueError(f"training.deck_path is required for selfplay_mode={mode!r}")
+
+    _positive_int(training["games_per_round"], "training.games_per_round")
+    _positive_int(training["rounds"], "training.rounds")
+    _positive(training["learning_rate"], "training.learning_rate")
+    _positive_int(training["epochs_per_round"], "training.epochs_per_round")
+    eval_games = _positive_int(training["eval_games_per_round"], "training.eval_games_per_round")
+    if eval_games % 4 != 0:
+        raise ValueError("training.eval_games_per_round must be a multiple of 4")
+
+    if algorithm == "ppo":
+        _positive_int(training["minibatch_size"], "training.minibatch_size")
+        _positive(training["target_kl"], "training.target_kl")
+        _probability(training["gamma"], "training.gamma")
+        _probability(training["gae_lambda"], "training.gae_lambda")
+        _probability(training["clip_epsilon"], "training.clip_epsilon")
+        _non_negative(training["value_loss_coef"], "training.value_loss_coef")
+        _non_negative(training["entropy_coef"], "training.entropy_coef")
+        _positive(training["max_grad_norm"], "training.max_grad_norm")
+    else:
+        _positive_int(training["search_count"], "training.search_count")
+        _positive_int(training["batch_size"], "training.batch_size")
+        _probability(training["gating_win_rate"], "training.gating_win_rate")
+        pool_size = _non_negative_int(
+            training["checkpoint_pool_size"], "training.checkpoint_pool_size"
+        )
+        pool_sample = _non_negative_int(
+            training["gating_pool_sample"], "training.gating_pool_sample"
+        )
+        if pool_sample > pool_size:
+            raise ValueError("training.gating_pool_sample cannot exceed checkpoint_pool_size")
+        _positive_int(training["replay_buffer_rounds"], "training.replay_buffer_rounds")
+    return mode
 
 
 def load_run_config(path: Path) -> RunConfig:
-    """`path`のyamlを読み、`RunConfig`にする(yaml中のパスは`ROOT`基準の相対パスとして書く)。
+    """1つのalgorithmだけを実行するrun configを読み、未知フィールドも拒否する。"""
+    with path.open(encoding="utf-8") as file:
+        raw = _mapping(yaml.safe_load(file), "config")
+    _reject_unknown(raw, {"run", "algorithm", "model", "data", "runtime", "training"}, "top-level")
 
-    Args:
-        path: 読み込むyamlファイルのパス。
+    run = _mapping(raw.get("run"), "run")
+    model = _mapping(raw.get("model"), "model")
+    data = _mapping(raw.get("data"), "data")
+    runtime = _mapping(raw.get("runtime", {}), "runtime")
+    training = _mapping(raw.get("training"), "training")
+    _reject_unknown(run, {"name", "output_dir"}, "run")
+    _reject_unknown(model, {"initial_checkpoint"}, "model")
+    _reject_unknown(data, {"sampling_snapshot"}, "data")
+    _reject_unknown(
+        runtime,
+        {
+            "seed",
+            "workers",
+            "game_timeout_seconds",
+            "round_timeout_seconds",
+            "max_restarts",
+            "retry_delay_seconds",
+        },
+        "runtime",
+    )
 
-    Returns:
-        RunConfig: 実験設定。
-    """
-    with path.open() as f:
-        raw = yaml.safe_load(f)
-    warmstart = raw.get("initial_warmstart_checkpoint")
+    algorithm = raw.get("algorithm")
+    if algorithm not in ("ppo", "mcts"):
+        raise ValueError("algorithm must be either 'ppo' or 'mcts'")
+    mode = _validate_training(training, algorithm)
+
+    checkpoint_value = _required_text(model.get("initial_checkpoint"), "model.initial_checkpoint")
+    checkpoint = ROOT / checkpoint_value
+
+    workers = _positive_int(
+        runtime.get("workers", max(1, (os.cpu_count() or 4) - 2)), "runtime.workers"
+    )
+    max_restarts = _non_negative_int(runtime.get("max_restarts", 50), "runtime.max_restarts")
+    retry_delay = _non_negative(
+        runtime.get("retry_delay_seconds", 5), "runtime.retry_delay_seconds"
+    )
+    deck_value = training.get("deck_path")
+    if deck_value is not None:
+        deck_value = _required_text(deck_value, "training.deck_path")
+
     return RunConfig(
-        algorithm=raw["algorithm"],
-        deck_path=ROOT / raw["deck_path"],
-        selfplay_mode=raw["selfplay_mode"],
-        initial_warmstart_checkpoint=(ROOT / warmstart) if warmstart else None,
-        games_per_round=raw["games_per_round"],
-        n_rounds=raw["n_rounds"],
-        checkpoint_dir=ROOT / raw["checkpoint_dir"],
+        name=_required_text(run.get("name"), "run.name"),
+        algorithm=algorithm,
+        output_dir=ROOT / _required_text(run.get("output_dir"), "run.output_dir"),
+        model=ModelConfig(checkpoint),
+        sampling_snapshot=ROOT
+        / _required_text(data.get("sampling_snapshot"), "data.sampling_snapshot"),
+        runtime=RuntimeConfig(
+            seed=int(runtime.get("seed", 0)),
+            workers=workers,
+            game_timeout_seconds=_positive(
+                runtime.get("game_timeout_seconds", 300), "runtime.game_timeout_seconds"
+            ),
+            round_timeout_seconds=_positive(
+                runtime.get("round_timeout_seconds", 1800), "runtime.round_timeout_seconds"
+            ),
+            max_restarts=max_restarts,
+            retry_delay_seconds=retry_delay,
+        ),
+        selfplay_mode=mode,
+        deck_path=_resolve(deck_value),
+        training=training,
     )
 
 
-def config_path_from_argv(default: Path) -> Path:
-    """コマンドライン引数でconfigパスが指定されていればそれを、無ければ`default`を使う。
-
-    Args:
-        default: 引数が無いときに使うconfigパス。
-
-    Returns:
-        Path: 使用するconfigファイルのパス。
-    """
-    return Path(sys.argv[1]) if len(sys.argv) > 1 else default
+def validate_algorithm(config: RunConfig, expected: Algorithm) -> None:
+    if config.algorithm != expected:
+        raise ValueError(
+            f"config algorithm is {config.algorithm!r}, but {expected!r} trainer was selected"
+        )
 
 
-def save_config_snapshot(config_path: Path, checkpoint_dir: Path) -> None:
-    """使用したconfigのコピーを`checkpoint_dir`直下に残す。
-
-    どの設定(デッキ・モード・ウォームスタート元)で作ったチェックポイント群かを、
-    後からコードを読まずに`checkpoint_dir`だけ見て分かるようにするための記録用。
-
-    Args:
-        config_path: 実際に使ったconfigファイルのパス。
-        checkpoint_dir: チェックポイントの保存先ディレクトリ(既に存在すること)。
-    """
-    shutil.copy(config_path, checkpoint_dir / "run_config.yaml")
+def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(config_path, output_dir / "run_config.yaml")
