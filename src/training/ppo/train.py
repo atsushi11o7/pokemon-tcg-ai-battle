@@ -48,7 +48,10 @@ from ..common.run_config import (  # noqa: E402
     save_config_snapshot,
     validate_algorithm,
 )
-from ..common.selfplay_modes import SelfplayMode  # noqa: E402
+from ..common.selfplay_modes import (  # noqa: E402
+    SelfplayMode,
+    fixed_deck_seat_for_game,
+)
 from .selfplay import PPOSample, compute_gae, evaluate_policy, play_ppo_game  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
@@ -342,8 +345,9 @@ def _play_one_ppo_game(game_index: int) -> tuple[list[PPOSample], int]:
     game_seed = _worker_seed + game_index
     random.seed(game_seed)
     torch.manual_seed(game_seed)
+    fixed_deck_seat = fixed_deck_seat_for_game(_worker_mode, game_index)
     samples_by_seat, winner = play_ppo_game(
-        _worker_network, _worker_deck, _worker_opponent_pool, _worker_mode
+        _worker_network, _worker_deck, _worker_opponent_pool, _worker_mode, fixed_deck_seat
     )
     samples: list[PPOSample] = []
     for seat_samples in samples_by_seat:
@@ -411,7 +415,7 @@ def _run_selfplay_round(
 
 
 def make_ppo_eval_agent(network: PolicyValueNet, our_deck: list[int]):
-    """`network`で、`match_runner.evaluate`用のagent()関数を作る(貪欲方策)。
+    """`network`で、`match_runner`の固定matchup評価用のagent()関数を作る(貪欲方策)。
 
     探索を行わないPPOでは、評価時は方策のargmaxを取る(学習時のサンプリングと違い、
     最も自信のある行動を決定的に選ぶ)。
@@ -421,7 +425,7 @@ def make_ppo_eval_agent(network: PolicyValueNet, our_deck: list[int]):
         our_deck: こちらの60枚のデッキリスト。
 
     Returns:
-        Callable[[dict], list[int]]: `match_runner.evaluate`に渡せるagent関数。
+        Callable[[dict], list[int]]: `evaluate_fixed_matchups`に渡せるagent関数。
     """
 
     def agent(obs_dict: dict) -> list[int]:

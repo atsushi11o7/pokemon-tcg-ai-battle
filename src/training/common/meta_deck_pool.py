@@ -18,7 +18,6 @@ class WeightedDeckPool(list[list[int]]):
         super().__init__([record["cards"] for record in records])
         if not self:
             raise ValueError("sampling snapshot contains no decks")
-        self.deck_hashes = [record["deckHash"] for record in records]
         self.weights = {
             component: [float(record.get("weights", {}).get(component, 0.0)) for record in records]
             for component in ("meta", "coverage", "exploration", "hard")
@@ -27,7 +26,6 @@ class WeightedDeckPool(list[list[int]]):
             "learner": snapshot.get("learnerMixture") or {"coverage": 1.0},
             "opponent": snapshot.get("opponentMixture") or {"meta": 1.0},
         }
-        self.snapshot_built_at = snapshot.get("builtAt")
 
     def sample(self, role: str) -> list[int]:
         mixture = self.mixtures.get(role)

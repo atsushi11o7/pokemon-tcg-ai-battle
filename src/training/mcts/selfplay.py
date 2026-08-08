@@ -6,8 +6,8 @@
 補正した価値推定を価値の教師信号として、1試合分の学習サンプルを作る。
 
 3つの自己対戦モードを切り替えられる(`mode`引数、詳細は`play_selfplay_game`のdocstring参照)。
-"asymmetric"(相手デッキランダム・自分側のみ学習)、"mirror"(両者同デッキ・両サイド学習)、
-"generalist"(両者独立ランダム・両サイド学習)。いずれも探索側は自分の本当のデッキだけを知り、
+"asymmetric"(固定デッキ対ランダム・両サイド学習)、"mirror"(両者同デッキ・両サイド学習)、
+"generalist"(両者独立ランダム・両サイド学習)。いずれも両サイドを学習し、探索側は自分のデッキだけを知り、
 相手の隠れ情報は本番と同じく、公開カードと整合する実在デッキ候補から推測する。
 """
 
@@ -90,7 +90,7 @@ def run_determinized_mcts(
     network,
     obs,
     own_deck: list[int],
-    opponent_deck_pool: list[list[int]] | None,
+    opponent_deck_pool: list[list[int]],
     search_count: int,
     *,
     num_determinizations: int = NUM_DETERMINIZATIONS,
@@ -170,37 +170,39 @@ def _assign_labels(samples: list[Sample], winner: int, player_index: int) -> Non
 def play_selfplay_game(
     network,
     our_deck: list[int],
-    opponent_deck_pool: list[list[int]] | None,
+    opponent_deck_pool: list[list[int]],
     search_count: int,
     mode: SelfplayMode = "asymmetric",
+    fixed_deck_seat: int | None = None,
 ) -> tuple[list[Sample], int]:
     """1試合分の自己対戦を行い、方策・価値の学習サンプルを集める。
 
     `mode="asymmetric"`(既定)では対戦相手に`opponent_deck_pool`からランダムに選んだ実在デッキを
-    使い、どちらの座席が`our_deck`を使うかも毎回ランダムに決めた上で、`our_deck`側の
-    意思決定のみを学習サンプルとして集める。`mode="mirror"`では両者とも`our_deck`を使い、
+    使い、trainerが試合番号の偶奇により`our_deck`の座席を均等に割り当てる。
+    固定デッキ側とランダムデッキ側の両方を学習する。`mode="mirror"`では両者とも`our_deck`を使い、
     `mode="generalist"`では両者とも`opponent_deck_pool`から独立にランダムに選んだ実在デッキ
-    (両者同じ組み合わせになることもある)を使う。"mirror"/"generalist"はいずれも
-    (`opponent_deck_pool`は"mirror"では不要)、両サイドの意思決定を両方とも学習サンプルとして
-    集める("generalist"は`our_deck`を使わないので、あらゆる実在デッキを乗りこなす汎用方策を
-    狙う構成。学習後にどのデッキで提出するかは別途決める)。
+    (両者同じ組み合わせになることもある)を使い、`our_deck`は使わない(あらゆる実在デッキを
+    乗りこなす汎用方策を狙う)。いずれのモードでも両サイドの意思決定を学習サンプルにする。
 
     Args:
         network: 探索の事前分布・評価値に使う`PolicyValueNet`(eval modeにしておくこと)。
         our_deck: 本番でも使う、こちらの60枚のデッキリスト。`mode="generalist"`のときは
             自己対戦のデッキ選択には使われない。
         opponent_deck_pool: 対戦相手として選ぶ、実在デッキ(60枚)のリスト。
-            `mode="mirror"`のときは使われないので`None`でよい。
+            デッキ選択に使わない"mirror"でも、探索時の相手隠れ情報の推測に必要。
         search_count: 1手あたりのMCTSシミュレーション回数。
-        mode: "asymmetric"(相手デッキランダム・自分側のみ学習)、
+        mode: "asymmetric"(固定デッキ対ランダムデッキ・両サイド学習)、
             "mirror"(両者同デッキ・両サイド学習、公式サンプルコードと同じ構成)、
             "generalist"(両者とも実在デッキプールから独立ランダム・両サイド学習)。
+        fixed_deck_seat: asymmetricで固定デッキを置く座席。trainerから0/1を交互に渡す。
 
     Returns:
-        tuple[list[Sample], int]: (labelまで埋めたSampleのリスト("asymmetric"は`our_deck`側のみ、
-            それ以外は両サイド分), `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
+        tuple[list[Sample], int]: (labelまで埋めた両サイド分のSample、
+            `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
     """
-    decks, collect_seats = pick_decks_and_collect_seats(mode, our_deck, opponent_deck_pool)
+    decks, collect_seats = pick_decks_and_collect_seats(
+        mode, our_deck, opponent_deck_pool, fixed_deck_seat
+    )
     obs_dict, start_data = battle_start(decks[0], decks[1])
     try:
         if start_data.errorPlayer >= 0:
