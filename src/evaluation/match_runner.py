@@ -174,7 +174,7 @@ if __name__ == "__main__":
     # 動作確認用: ランダムAI同士で対戦させる
     deck = [
         int(x)
-        for x in (ROOT / "decks" / "reference" / "cynthias_garchomp_ex.csv").read_text().split("\n")
+        for x in (ROOT / "decks" / "candidates" / "crustle_meta.csv").read_text().split("\n")
         if x.strip()
     ]
     random_agent = random_agent_factory(deck)
