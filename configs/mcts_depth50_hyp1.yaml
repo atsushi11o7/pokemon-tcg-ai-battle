@@ -17,12 +17,13 @@ runtime:
   round_timeout_seconds: 7200
   max_restarts: 50
   retry_delay_seconds: 5
+  keep_last_checkpoints: 5
 
 training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 200
-  rounds: 8
+  rounds: 30
   search_count: 50
   num_determinizations: 1
   learning_rate: 0.0003
