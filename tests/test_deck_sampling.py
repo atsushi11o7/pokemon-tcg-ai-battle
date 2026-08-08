@@ -5,7 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from training.common.meta_deck_pool import WeightedDeckPool, load_weighted_deck_pool
-from training.common.selfplay_modes import pick_decks_and_collect_seats
+from training.common.selfplay_modes import (
+    fixed_deck_seat_for_game,
+    pick_decks_and_collect_seats,
+)
 
 
 def snapshot() -> dict:
@@ -46,6 +49,38 @@ class DeckSamplingTest(unittest.TestCase):
 
         self.assertEqual(decks, [[2] * 60, [1] * 60])
         self.assertEqual(collect_seats, {0, 1})
+
+    def test_asymmetric_places_fixed_deck_in_requested_seat_and_collects_both(self) -> None:
+        fixed_deck = [9] * 60
+        opponent_pool = [[2] * 60]
+
+        first_decks, first_collect_seats = pick_decks_and_collect_seats(
+            "asymmetric", fixed_deck, opponent_pool, fixed_deck_seat=0
+        )
+        second_decks, second_collect_seats = pick_decks_and_collect_seats(
+            "asymmetric", fixed_deck, opponent_pool, fixed_deck_seat=1
+        )
+
+        self.assertEqual(first_decks, [fixed_deck, [2] * 60])
+        self.assertEqual(second_decks, [[2] * 60, fixed_deck])
+        self.assertEqual(first_collect_seats, {0, 1})
+        self.assertEqual(second_collect_seats, {0, 1})
+
+    def test_asymmetric_rejects_invalid_fixed_deck_seat(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fixed_deck_seat"):
+            pick_decks_and_collect_seats(
+                "asymmetric",
+                [9] * 60,
+                [[2] * 60],
+                fixed_deck_seat=2,
+            )
+
+    def test_asymmetric_alternates_fixed_deck_seat_by_game_index(self) -> None:
+        self.assertEqual(
+            [fixed_deck_seat_for_game("asymmetric", index) for index in range(6)],
+            [0, 1, 0, 1, 0, 1],
+        )
+        self.assertIsNone(fixed_deck_seat_for_game("generalist", 1))
 
     def test_loader_returns_deck_pool_directly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
