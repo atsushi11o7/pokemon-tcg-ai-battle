@@ -20,6 +20,7 @@ runtime:
 
 training:
   selfplay_mode: generalist
+  deck_path: null
   games_per_round: 500
   rounds: 200
   learning_rate: 0.0001
