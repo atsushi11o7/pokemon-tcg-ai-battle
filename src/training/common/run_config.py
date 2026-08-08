@@ -142,6 +142,7 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         },
         "mcts": {
             "search_count",
+            "num_determinizations",
             "learning_rate",
             "batch_size",
             "epochs_per_round",
@@ -184,7 +185,13 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         _non_negative(training["entropy_coef"], "training.entropy_coef")
         _positive(training["max_grad_norm"], "training.max_grad_norm")
     else:
-        _positive_int(training["search_count"], "training.search_count")
+        search_count = _positive_int(training["search_count"], "training.search_count")
+        hypotheses = _positive_int(
+            training["num_determinizations"], "training.num_determinizations"
+        )
+        # 予算は仮説へ分割されるので、1仮説あたり1回未満になる組み合わせは弾く。
+        if hypotheses > search_count:
+            raise ValueError("training.num_determinizations cannot exceed search_count")
         _positive_int(training["batch_size"], "training.batch_size")
         _probability(training["gating_win_rate"], "training.gating_win_rate")
         pool_size = _non_negative_int(

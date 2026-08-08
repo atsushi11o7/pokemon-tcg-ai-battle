@@ -64,6 +64,7 @@ class MctsParallelEvaluationTest(unittest.TestCase):
                 [[1] * 60, [2] * 60],
                 [([1] * 60, [2] * 60)],
                 search_count=50,
+                num_determinizations=5,
                 sampling_snapshot=Path("snapshot.json"),
                 seed=123,
                 num_workers=7,

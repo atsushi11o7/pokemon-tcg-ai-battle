@@ -174,6 +174,7 @@ def play_selfplay_game(
     search_count: int,
     mode: SelfplayMode = "asymmetric",
     fixed_deck_seat: int | None = None,
+    num_determinizations: int = NUM_DETERMINIZATIONS,
 ) -> tuple[list[Sample], int]:
     """1試合分の自己対戦を行い、方策・価値の学習サンプルを集める。
 
@@ -195,6 +196,8 @@ def play_selfplay_game(
             "mirror"(両者同デッキ・両サイド学習、公式サンプルコードと同じ構成)、
             "generalist"(両者とも実在デッキプールから独立ランダム・両サイド学習)。
         fixed_deck_seat: asymmetricで固定デッキを置く座席。trainerから0/1を交互に渡す。
+        num_determinizations: 隠れ情報の仮説数。`search_count`はこの数へ分割されるので、
+            1仮説あたりの探索の深さは`search_count // num_determinizations`になる。
 
     Returns:
         tuple[list[Sample], int]: (labelまで埋めた両サイド分のSample、
@@ -219,6 +222,7 @@ def play_selfplay_game(
                 decks[your_index],
                 opponent_deck_pool,
                 search_count,
+                num_determinizations=num_determinizations,
                 add_root_noise=True,
                 temperature=1.0 if obs.current.turn <= SELFPLAY_TEMPERATURE_TURNS else None,
             )

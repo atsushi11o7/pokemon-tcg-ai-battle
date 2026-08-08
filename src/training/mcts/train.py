@@ -79,6 +79,7 @@ class MctsSettings:
     games_per_round: int
     n_rounds: int
     search_count: int
+    num_determinizations: int
     epochs_per_round: int
     batch_size: int
     learning_rate: float
@@ -106,6 +107,7 @@ class MctsSettings:
             games_per_round=config.games_per_round,
             n_rounds=config.n_rounds,
             search_count=int(settings["search_count"]),
+            num_determinizations=int(settings["num_determinizations"]),
             epochs_per_round=int(settings["epochs_per_round"]),
             batch_size=int(settings["batch_size"]),
             learning_rate=float(settings["learning_rate"]),
@@ -273,6 +275,7 @@ class _SelfplayWorkerContext:
     deck: list[int]
     opponent_deck_pool: list[list[int]]
     search_count: int
+    num_determinizations: int
     mode: SelfplayMode
     seed: int
     sampling_snapshot: Path
@@ -321,6 +324,7 @@ def _play_one_selfplay_game(game_index: int) -> tuple[list[Sample], int]:
         context.search_count,
         context.mode,
         fixed_deck_seat_for_game(context.mode, game_index),
+        context.num_determinizations,
     )
 
 
@@ -340,6 +344,7 @@ def _evaluate(
         opponent_deck_pool,
         matchups,
         search_count=settings.search_count,
+        num_determinizations=settings.num_determinizations,
         sampling_snapshot=settings.sampling_snapshot,
         seed=settings.seed + 100_000,
         num_workers=settings.workers,
@@ -412,6 +417,7 @@ def run_training_loop(
             deck=deck,
             opponent_deck_pool=opponent_deck_pool,
             search_count=settings.search_count,
+            num_determinizations=settings.num_determinizations,
             mode=settings.selfplay_mode,
             seed=settings.seed,
             sampling_snapshot=settings.sampling_snapshot,

@@ -32,6 +32,7 @@ def mcts_agent_factory(
     *,
     opponent_deck_pool: list[list[int]],
     search_count: int,
+    num_determinizations: int,
 ):
     """MCTS探索で1手選ぶagentを作る。
 
@@ -43,7 +44,12 @@ def mcts_agent_factory(
         if obs.select is None:
             return deck
         select, _policy, _value, _actions = run_determinized_mcts(
-            network, obs, deck, opponent_deck_pool, search_count
+            network,
+            obs,
+            deck,
+            opponent_deck_pool,
+            search_count,
+            num_determinizations=num_determinizations,
         )
         return select
 
@@ -57,6 +63,7 @@ def evaluate_mcts_networks_parallel(
     matchups: list[tuple[list[int], list[int]]],
     *,
     search_count: int,
+    num_determinizations: int,
     sampling_snapshot: Path,
     seed: int,
     num_workers: int,
@@ -75,6 +82,7 @@ def evaluate_mcts_networks_parallel(
             mcts_agent_factory,
             opponent_deck_pool=opponent_deck_pool,
             search_count=search_count,
+            num_determinizations=num_determinizations,
         ),
         sampling_snapshot=sampling_snapshot,
         seed=seed,
