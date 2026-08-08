@@ -12,20 +12,21 @@ data:
 
 runtime:
   seed: 0
-  workers: 4
+  workers: 8
   game_timeout_seconds: 300
-  round_timeout_seconds: 1800
+  round_timeout_seconds: 7200
   max_restarts: 50
   retry_delay_seconds: 5
 
 training:
   selfplay_mode: generalist
+  deck_path: null
   games_per_round: 200
-  rounds: 40
+  rounds: 50
   search_count: 50
-  learning_rate: 0.001
-  batch_size: 32
-  epochs_per_round: 3
+  learning_rate: 0.0003
+  batch_size: 64
+  epochs_per_round: 2
   eval_games_per_round: 32
   gating_win_rate: 0.5
   checkpoint_pool_size: 3

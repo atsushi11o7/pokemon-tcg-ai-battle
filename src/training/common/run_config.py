@@ -30,6 +30,7 @@ class RuntimeConfig:
     round_timeout_seconds: float
     max_restarts: int
     retry_delay_seconds: float
+    keep_last_checkpoints: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,10 @@ class RunConfig:
     @property
     def checkpoint_dir(self) -> Path:
         return self.output_dir / "checkpoints"
+
+    @property
+    def worker_event_log_path(self) -> Path:
+        return self.output_dir / "worker_events.jsonl"
 
     @property
     def deck(self) -> list[int]:
@@ -159,7 +164,9 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
     if mode != "generalist" and not training.get("deck_path"):
         raise ValueError(f"training.deck_path is required for selfplay_mode={mode!r}")
 
-    _positive_int(training["games_per_round"], "training.games_per_round")
+    games_per_round = _positive_int(training["games_per_round"], "training.games_per_round")
+    if mode == "asymmetric" and games_per_round % 2 != 0:
+        raise ValueError("training.games_per_round must be even for selfplay_mode='asymmetric'")
     _positive_int(training["rounds"], "training.rounds")
     _positive(training["learning_rate"], "training.learning_rate")
     _positive_int(training["epochs_per_round"], "training.epochs_per_round")
@@ -215,6 +222,7 @@ def load_run_config(path: Path) -> RunConfig:
             "round_timeout_seconds",
             "max_restarts",
             "retry_delay_seconds",
+            "keep_last_checkpoints",
         },
         "runtime",
     )
@@ -233,6 +241,10 @@ def load_run_config(path: Path) -> RunConfig:
     max_restarts = _non_negative_int(runtime.get("max_restarts", 50), "runtime.max_restarts")
     retry_delay = _non_negative(
         runtime.get("retry_delay_seconds", 5), "runtime.retry_delay_seconds"
+    )
+    # 1ラウンドあたり重み+optimizerで300MB超。既定では直近数ラウンドだけ残す(0で無制限)。
+    keep_last_checkpoints = _non_negative_int(
+        runtime.get("keep_last_checkpoints", 3), "runtime.keep_last_checkpoints"
     )
     deck_value = training.get("deck_path")
     if deck_value is not None:
@@ -256,6 +268,7 @@ def load_run_config(path: Path) -> RunConfig:
             ),
             max_restarts=max_restarts,
             retry_delay_seconds=retry_delay,
+            keep_last_checkpoints=keep_last_checkpoints,
         ),
         selfplay_mode=mode,
         deck_path=_resolve(deck_value),
