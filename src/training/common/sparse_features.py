@@ -25,6 +25,8 @@ from cg.api import (  # noqa: E402
     all_card_data,
 )
 
+from . import model_config  # noqa: E402
+
 _card_table: dict[int, object] | None = None
 _attack_table: dict[int, object] | None = None
 _card_count: int | None = None
@@ -157,10 +159,15 @@ def _decoder_attack_numeric_offset() -> int:
 
 # ATTACK技の数値特徴のブロック内レイアウト: ダメージ1 + 必要エネルギー(タイプ別) + 現在の付与エネルギー(タイプ別)
 _DECODER_ATTACK_DAMAGE_INDEX = 0
+# 実効ダメージ、KO可否、相手残りHPに対する割合
+_DECODER_ATTACK_EFFECTIVE_INDEX = 1
+_DECODER_ATTACK_KO_INDEX = 2
+_DECODER_ATTACK_RATIO_INDEX = 3
+_DECODER_ATTACK_EXTRA = 3
 
 
 def _decoder_attack_required_energy_offset() -> int:
-    return _DECODER_ATTACK_DAMAGE_INDEX + 1
+    return _DECODER_ATTACK_DAMAGE_INDEX + 1 + _DECODER_ATTACK_EXTRA
 
 
 def _decoder_attack_attached_energy_offset() -> int:
@@ -207,9 +214,105 @@ def _decoder_card_offset() -> int:
     return _decoder_switch_numeric_offset() + _decoder_switch_numeric_size()
 
 
-# ポケモン1体分の追加特徴(ex/megaEx/弱点/抵抗力/にげるコスト)のブロック幅
+# --- 特徴量レイアウト -------------------------------------------------------
+# "per_role"    : カードIDのone-hotを出現箇所ごとに独立したブロックとして持つ(17ブロック)。
+#                 同じカードでも手札とトラッシュで完全に別のベクトルになる。
+# "shared_card" : 出現箇所をまたいでカード表を共有し、パラメータを減らす。
+#
+# 共有してよいのは「同一トークン内で同時に出現しない」役割だけ。`EmbeddingBag`はsumなので、
+# 1トークンに複数のカードが入ると全部足され、どのカードがどの役割だったかの対応は失われる
+# (役割ベクトルを足しても加算は交換法則が成り立つため結合できない)。
+# 逆に別トークンにあるものは、network側のowner/zone埋め込みがトークン単位で区別するので
+# 安全に共有できる。
+#
+#   本体 / 道具 / エネルギー … 同じポケモンのトークン内で同居するため分ける(3ブロック)
+#                              ただし4つのポケモン枠(自他 × アクティブ/ベンチ)は
+#                              別トークンなので、枠をまたいで共有する
+#   手札 / デッキ / トラッシュ / スタジアム … すべて別トークンなので1ブロックに統合
+#
+# 結果、エンコーダのカードブロックは17 → 4に減る。
+# レイアウトが変わると`encoder_size`/`decoder_size`が変わるため、学習時と推論時で
+# 食い違えば`load_state_dict`が形状不一致で必ず落ちる(黙って誤動作しない)。
+
+# エンコーダのカード役割。0〜2は同一トークン内で同居しうるので別ブロック、
+# 3は別トークンにしか現れない役割をまとめたもの。
+(
+    CARD_ROLE_POKEMON,
+    CARD_ROLE_TOOL,
+    CARD_ROLE_ENERGY,
+    CARD_ROLE_ZONE,
+) = range(4)
+ENCODER_CARD_BLOCKS = 4
+
+_layout: str = model_config.FEATURE_LAYOUT
+
+
+def configure_feature_layout(layout: str) -> None:
+    """特徴量レイアウトを切り替える。
+
+    spawnワーカーはこのmoduleを再importするため、親で設定しても引き継がれない。
+    ワーカー初期化でも必ず呼ぶこと。
+
+    Args:
+        layout: "per_role" または "shared_card"。
+    """
+    global _layout
+    if layout not in ("per_role", "shared_card"):
+        raise ValueError(f"unknown feature layout: {layout!r}")
+    _layout = layout
+
+
+def feature_layout() -> str:
+    """現在の特徴量レイアウト。"""
+    return _layout
+
+
+def _shared() -> bool:
+    return _layout == "shared_card"
+
+
+def _encoder_block_base() -> int:
+    """共有レイアウトで、トークンごとにスライドする非カードブロックの開始位置。
+
+    先頭を共有カード表4ブロックが占めるため、その直後から始める。
+    """
+    return ENCODER_CARD_BLOCKS * card_count()
+
+
+def _decoder_context_role_offset() -> int:
+    """共有レイアウトで、SelectContextを表す役割インデックスの先頭。
+
+    1つの選択(select)の中でcontextは常に同一なので、contextごとにカード表を持つ必要はなく、
+    カード表1つ + contextを示す役割インデックス、で表せる。
+    """
+    return _decoder_card_offset() + (DECODER_MAIN_FEATURE + 1) * card_count()
+
+
+# 残りHP比のバケット数。スカラー1本だと「HPが2割を切ったか」のような閾値的な判断が
+# 表現しにくい(埋め込み行のスカラー倍=1本の直線方向にしかならない)ため、
+# 生のスカラーと併用する形で離散化した表現も与える。
+HP_RATIO_BUCKETS = 10
+
+# ターン数のバケット数。`turn / 10`は上限が無く、30ターン目には3.0という
+# 他の特徴と桁の違う値が入る。序盤/中盤/終盤の区別は離散表現の方が扱いやすい。
+TURN_BUCKETS = 8
+
+
+def _hp_ratio_bucket(ratio: float) -> int:
+    """残りHP比を`HP_RATIO_BUCKETS`段階へ量子化する(0が瀕死、最大値が満タン)。"""
+    if ratio <= 0.0:
+        return 0
+    return min(HP_RATIO_BUCKETS - 1, int(ratio * HP_RATIO_BUCKETS))
+
+
 def _pokemon_extra_size() -> int:
-    return 2 + 2 * energy_type_count() + 1
+    """`add_pokemon`が1枠に書き込む、カードID以外の特徴のブロック幅。
+
+    `add_pokemon`の書き込みと1対1で対応している必要がある。ずれるとブロック境界が
+    重なって静かに壊れるため、`tests/test_feature_layout.py`で実測値と突き合わせている。
+    """
+    scalars = 9  # ex, megaEx, にげるコスト, 最大HP, 残りHP比, 進化段階3種, 逃走可否
+    return scalars + 2 * energy_type_count() + HP_RATIO_BUCKETS + 2 + 1
 
 
 def encoder_size() -> int:
@@ -221,7 +324,11 @@ def encoder_size() -> int:
     Returns:
         int: エンコーダ側の疎ベクトルの総次元数。
     """
-    return 43 + 17 * card_count() + 4 * _pokemon_extra_size()
+    # 43 = プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠
+    non_card = 43 + TURN_BUCKETS + 1 + 4 * _pokemon_extra_size()
+    if _shared():
+        return ENCODER_CARD_BLOCKS * card_count() + non_card
+    return non_card + 17 * card_count()
 
 
 def decoder_size() -> int:
@@ -235,6 +342,9 @@ def decoder_size() -> int:
         int: デコーダの疎ベクトルの総次元数。
     """
     n_context = int(SelectContext.RECOVER_SPECIAL_CONDITION) + 1
+    if _shared():
+        # MAINの8ブロック + context共通のカード表1ブロック + contextを示す役割インデックス
+        return _decoder_card_offset() + (DECODER_MAIN_FEATURE + 1) * card_count() + n_context
     return _decoder_card_offset() + (1 + DECODER_MAIN_FEATURE + n_context) * card_count()
 
 
@@ -261,6 +371,20 @@ class SparseVector:
         """
         if value != 0.0:
             self.index.append(self.pos + index)
+            self.value.append(float(value))
+
+    def add_absolute(self, index: int, value: float) -> None:
+        """`pos`に依らない絶対インデックスへ値を加える。
+
+        共有カード表のように、トークンごとにスライドするブロックの外側にある
+        グローバルな領域へ書き込むために使う。
+
+        Args:
+            index: 疎ベクトル全体での絶対インデックス。
+            value: 加える値(0の場合は書き込まない)。
+        """
+        if value != 0.0:
+            self.index.append(index)
             self.value.append(float(value))
 
     def add_pos(self, pos: int) -> None:
@@ -300,30 +424,90 @@ class SparseVector:
         )
 
 
-def add_card(sv: SparseVector, card: "Card | Pokemon | None") -> None:
+def add_card(sv: SparseVector, card: "Card | Pokemon | None", role: int) -> None:
     """1枚のカード(またはNone)を、cardIdのone-hotとしてエンコーダに書き込む。
 
     Args:
         sv: 書き込み先の`SparseVector`。
         card: 対象のカード。存在しない場合はNone。
+        role: `CARD_ROLE_*`。共有レイアウトでどのカード表へ書くかを決める。
+            per_roleレイアウトでは使用しない。
     """
+    if _shared():
+        if card is not None:
+            sv.add_absolute(role * card_count() + card.id, 1)
+        return
     if card is not None:
         sv.add(card.id, 1)
     sv.add_pos(card_count())
 
 
-def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float) -> None:
+def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float, role: int) -> None:
     """複数のカードを、cardIdごとの出現回数(重み`value`倍)としてエンコーダに書き込む。
 
     Args:
         sv: 書き込み先の`SparseVector`。
         cards: 対象のカード一覧(discard等)。Noneの場合は何も書き込まない。
         value: 1枚あたりの重み。
+        role: `CARD_ROLE_*`。共有レイアウトでどのカード表へ書くかを決める。
     """
+    if _shared():
+        if cards is not None:
+            base = role * card_count()
+            for card in cards:
+                sv.add_absolute(base + card.id, value)
+        return
     if cards is not None:
         for card in cards:
             sv.add(card.id, value)
     sv.add_pos(card_count())
+
+
+_max_damage_cache: dict[int, float] = {}
+
+
+def _max_attack_damage(card_id: int) -> float:
+    """そのカードが持つ技の最大ダメージ。技が無ければ0。"""
+    cached = _max_damage_cache.get(card_id)
+    if cached is None:
+        card = card_table()[card_id]
+        table = attack_table()
+        damages = [float(table[a].damage) for a in (card.attacks or []) if a in table]
+        cached = max(damages) if damages else 0.0
+        _max_damage_cache[card_id] = cached
+    return cached
+
+
+# 現行レギュレーションの弱点・抵抗力の補正値。
+WEAKNESS_MULTIPLIER = 2.0
+RESISTANCE_REDUCTION = 30.0
+
+
+def effective_damage(damage: float, attacker_card, defender_card) -> float:
+    """弱点・抵抗力を反映した実効ダメージ。
+
+    素のダメージと防御側の弱点/抵抗力は別々の特徴として渡っているが、両者を突き合わせて
+    倍率を適用する計算は、別タワーに分かれた注意機構に学習させるには割に合わない。
+    決定的に計算できるのでここで済ませる。
+
+    Args:
+        damage: 技の素のダメージ。
+        attacker_card: 攻撃側のCardData(タイプ判定に使う)。
+        defender_card: 防御側のCardData(弱点/抵抗力を持つ)。
+
+    Returns:
+        float: 補正後のダメージ(0未満にはしない)。
+    """
+    if damage <= 0 or defender_card is None or attacker_card is None:
+        return max(0.0, damage)
+    attacker_type = attacker_card.energyType
+    if attacker_type is None:
+        return damage
+    if defender_card.weakness is not None and int(defender_card.weakness) == int(attacker_type):
+        damage *= WEAKNESS_MULTIPLIER
+    if defender_card.resistance is not None and int(defender_card.resistance) == int(attacker_type):
+        damage -= RESISTANCE_REDUCTION
+    return max(0.0, damage)
 
 
 def add_energy_type(sv: SparseVector, energy_type: "EnergyType | None") -> None:
@@ -350,19 +534,45 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
     """
     if poke is None:
         sv.add_single(1)
-        sv.add_pos(1 + 3 * card_count() + _pokemon_extra_size())
+        skipped_cards = 0 if _shared() else 3 * card_count()
+        sv.add_pos(1 + skipped_cards + _pokemon_extra_size())
     else:
         sv.add_single(0)
         sv.add_single(poke.hp / 400)
-        add_card(sv, poke)
-        add_cards(sv, poke.tools, 1.0)
-        add_cards(sv, poke.energyCards, 0.5)
+        add_card(sv, poke, CARD_ROLE_POKEMON)
+        add_cards(sv, poke.tools, 1.0, CARD_ROLE_TOOL)
+        add_cards(sv, poke.energyCards, 0.5, CARD_ROLE_ENERGY)
         card = card_table()[poke.id]
         sv.add_single(card.ex)
         sv.add_single(card.megaEx)
         add_energy_type(sv, card.weakness)
         add_energy_type(sv, card.resistance)
         sv.add_single(card.retreatCost / 4)
+
+        # 現在HPの絶対値だけでは、同じ0.3でもHP70のポケモンが満タンなのか
+        # HP340のポケモンが瀕死なのか区別できない。最大HPと残り比率を明示的に渡す。
+        max_hp = float(card.hp or 0)
+        sv.add_single(max_hp / 400)
+        ratio = (poke.hp / max_hp) if max_hp > 0 else 0.0
+        sv.add_single(ratio)
+        sv.add(_hp_ratio_bucket(ratio), 1)
+        sv.add_pos(HP_RATIO_BUCKETS)
+
+        # 進化段階
+        sv.add_single(card.basic)
+        sv.add_single(card.stage1)
+        sv.add_single(card.stage2)
+
+        # 特殊ルール
+        sv.add_single(card.aceSpec)
+        sv.add_single(card.tera)
+
+        # 今すぐ逃げられるか
+        energy_count = len(poke.energyCards) if poke.energyCards else 0
+        sv.add_single(1.0 if energy_count >= card.retreatCost else 0.0)
+
+        # このポケモンの技の最大打点。相手側の枠なら脅威度の指標になる。
+        sv.add_single(_max_attack_damage(poke.id) / 400)
 
 
 def add_player(sv: SparseVector, ps: PlayerState) -> None:
@@ -386,7 +596,7 @@ def add_player(sv: SparseVector, ps: PlayerState) -> None:
     sv.add_single(ps.paralyzed)
     sv.add_single(ps.confused)
 
-    add_cards(sv, ps.discard, 0.25)
+    add_cards(sv, ps.discard, 0.25, CARD_ROLE_ZONE)
 
 
 def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
@@ -408,6 +618,8 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     state = obs.current
 
     sv = SparseVector()
+    if _shared():
+        sv.add_pos(_encoder_block_base())
     for i in range(2):
         ps = state.players[i ^ your_index]
         for j in range(8):  # ベンチ最大8枠
@@ -431,20 +643,43 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
         add_player(sv, ps)
 
     sv.word_start()
-    add_cards(sv, state.players[your_index].hand, 0.25)
+    add_cards(sv, state.players[your_index].hand, 0.25, CARD_ROLE_ZONE)
 
     sv.word_start()
-    for card_id in your_deck:
-        sv.add(card_id, 0.25)
-    sv.add_pos(card_count())
+    if _shared():
+        base = CARD_ROLE_ZONE * card_count()
+        for card_id in your_deck:
+            sv.add_absolute(base + card_id, 0.25)
+    else:
+        for card_id in your_deck:
+            sv.add(card_id, 0.25)
+        sv.add_pos(card_count())
 
     sv.word_start()
-    add_cards(sv, state.stadium, 1.0)
+    add_cards(sv, state.stadium, 1.0, CARD_ROLE_ZONE)
 
     sv.word_start()
     sv.add_single(1)
     sv.add_single(state.turn / 10)
     sv.add_single(state.firstPlayer == your_index)
+    # ターン数の離散表現(生のスカラーと併用)
+    sv.add(min(TURN_BUCKETS - 1, max(0, state.turn)), 1)
+    sv.add_pos(TURN_BUCKETS)
+    # 相手アクティブの最大打点で、自分のアクティブが落ちるか。
+    # 逃げる/入れ替えるの判断に直結するが、両者の情報は別トークンに散っている。
+    me_state = state.players[your_index]
+    opp_state = state.players[1 - your_index]
+    me_active = me_state.active[0] if me_state.active else None
+    opp_active = opp_state.active[0] if opp_state.active else None
+    threatened = 0.0
+    if me_active is not None and opp_active is not None:
+        incoming = effective_damage(
+            _max_attack_damage(opp_active.id),
+            card_table()[opp_active.id],
+            card_table()[me_active.id],
+        )
+        threatened = 1.0 if incoming >= me_active.hp else 0.0
+    sv.add_single(threatened)
 
     return sv
 
@@ -501,6 +736,12 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
         context: 選択の`SelectContext`。
         card_id: 参照しているカードのID。
     """
+    if _shared():
+        # contextは1つのselect内で常に同一なので、カード表は1つで足りる。
+        # どのcontextだったかは別の役割インデックスで示す。
+        sv.add(_decoder_card_offset() + DECODER_MAIN_FEATURE * card_count() + card_id, 1)
+        sv.add(_decoder_context_role_offset() + int(context), 1)
+        return
     offset = _decoder_card_offset() + (DECODER_MAIN_FEATURE + int(context)) * card_count()
     sv.add(offset + card_id, 1)
 
@@ -560,6 +801,25 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 attack = attack_table()[o.attackId]
                 numeric_offset = _decoder_attack_numeric_offset()
                 sv.add(numeric_offset + _DECODER_ATTACK_DAMAGE_INDEX, attack.damage / 400)
+                # 素のダメージはデコーダ側、相手の残りHPはエンコーダ側にあり、
+                # 両者を突き合わせる比較は注意機構で学習するしかない形になっていた。
+                # 決定的に計算できるのでここで済ませる。
+                opponent = obs.current.players[1 - your_index]
+                defender = opponent.active[0] if opponent.active else None
+                if defender is not None:
+                    attacker = ps.active[0] if ps.active else None
+                    attacker_card = card_table()[attacker.id] if attacker is not None else None
+                    defender_card = card_table()[defender.id]
+                    eff = effective_damage(float(attack.damage), attacker_card, defender_card)
+                    sv.add(numeric_offset + _DECODER_ATTACK_EFFECTIVE_INDEX, eff / 400)
+                    sv.add(
+                        numeric_offset + _DECODER_ATTACK_KO_INDEX,
+                        1.0 if eff >= defender.hp else 0.0,
+                    )
+                    sv.add(
+                        numeric_offset + _DECODER_ATTACK_RATIO_INDEX,
+                        min(1.0, eff / defender.hp) if defender.hp > 0 else 1.0,
+                    )
                 required_offset = numeric_offset + _decoder_attack_required_energy_offset()
                 _add_energy_counts(sv, required_offset, Counter(int(e) for e in attack.energies))
                 attached_offset = numeric_offset + _decoder_attack_attached_energy_offset()

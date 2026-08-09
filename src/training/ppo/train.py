@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
+from ..common import model_config
 from ..common.checkpoints import (
     checkpoint_path,
     optimizer_path,
@@ -55,6 +56,7 @@ from ..common.run_config import (
 )
 from ..common.selfplay_modes import SelfplayMode, fixed_deck_seat_for_game
 from ..common.selfplay_round import run_selfplay_round
+from ..common.sparse_features import configure_feature_layout
 from ..common.training_utils import (
     ListDataset,
     move_optimizer_state_to,
@@ -78,6 +80,7 @@ class PpoSettings:
     output_dir: Path
     event_log_path: Path
     sampling_snapshot: Path
+    feature_layout: str
     selfplay_mode: SelfplayMode
     games_per_round: int
     n_rounds: int
@@ -350,6 +353,9 @@ def _init_selfplay_worker(state_dict: dict, context: _SelfplayWorkerContext) -> 
     """
     global _worker_context, _worker_network
     torch.set_num_threads(1)
+    # spawnワーカーはこのmoduleを再importするため、親の設定は引き継がれない。
+    # レイアウトが食い違うと埋め込み行列の形状が変わり、意味の違う重みを読むことになる。
+    configure_feature_layout(context.feature_layout)
     configure_sampling_snapshot(context.sampling_snapshot)
     _worker_network = build_policy_value_net(state_dict, assign=True)
     _worker_context = context
@@ -455,6 +461,7 @@ def run_training_loop(
             gae_lambda=settings.gae_lambda,
             seed=settings.seed,
             sampling_snapshot=settings.sampling_snapshot,
+            feature_layout=model_config.FEATURE_LAYOUT,
         )
         all_samples, results = run_selfplay_round(
             algorithm="ppo",

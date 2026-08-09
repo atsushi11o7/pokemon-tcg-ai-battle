@@ -291,5 +291,27 @@ def validate_algorithm(config: RunConfig, expected: Algorithm) -> None:
 
 
 def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
+    """run configと、そのrunで使ったネットワーク構成を出力先に記録する。
+
+    入力仕様やD_MODELを変えるとチェックポイントの互換性が切れるため、
+    「この重みはどの構成で学習されたか」を後から辿れるようにする。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(config_path, output_dir / "run_config.yaml")
+
+    from . import model_config
+
+    architecture = {
+        name: getattr(model_config, name)
+        for name in (
+            "FEATURE_LAYOUT",
+            "D_MODEL",
+            "NUM_HEADS",
+            "D_FEEDFORWARD",
+            "NUM_LAYERS_ENCODER",
+            "NUM_LAYERS_DECODER",
+        )
+    }
+    (output_dir / "architecture.yaml").write_text(
+        yaml.safe_dump(architecture, sort_keys=False), encoding="utf-8"
+    )
