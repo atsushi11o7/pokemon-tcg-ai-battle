@@ -138,7 +138,8 @@ NUMBER_BUCKETS = 8
 _HEAD_NUMBER_RAW = _HEAD_NUMBER + NUMBER_BUCKETS
 _HEAD_REMAIN_ENERGY = _HEAD_NUMBER_RAW + 1
 _HEAD_REMAIN_DAMAGE = _HEAD_REMAIN_ENERGY + 1
-DECODER_HEAD_SIZE = _HEAD_REMAIN_DAMAGE + 1
+_HEAD_ENERGY_UNITS = _HEAD_REMAIN_DAMAGE + 1
+DECODER_HEAD_SIZE = _HEAD_ENERGY_UNITS + 1
 # decoder_main(MAIN選択の各種カード参照)が使う特徴インデックス数
 # (PLAY, ATTACH対象カード, ATTACHの装着先, EVOLVE対象カード, EVOLVEの進化先,
 #  ABILITY, DISCARD, RETREATの8種)
@@ -1100,6 +1101,11 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 decoder_scope(sv, o.area, o.playerIndex, your_index)
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.energyCards[o.energyIndex])
+                # そのエネルギーが何個分に相当するか。コストは個数で払うため、
+                # 1枚で複数個を供給する特殊エネルギーは外す影響が大きい。
+                # 現在のカードプールでは実測で常に1だが、増えたときに効く。
+                if o.count:
+                    sv.add(_HEAD_ENERGY_UNITS, min(o.count, 5) / 5)
             elif o.type == OptionType.SKILL:
                 decoder_card_id(sv, context, o.cardId)
 
