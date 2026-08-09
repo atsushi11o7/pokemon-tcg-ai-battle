@@ -24,7 +24,7 @@ training:
   deck_path: null
   games_per_round: 300
   rounds: 350
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   minibatch_size: 64
   epochs_per_round: 4
   target_kl: 0.02
