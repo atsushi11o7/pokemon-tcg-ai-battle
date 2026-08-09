@@ -112,6 +112,7 @@ class PolicyValueNet(nn.Module):
         self.d_model = d_model
 
         self.encoder_bag = nn.EmbeddingBag(encoder_size(), d_model, mode="sum")
+        self.encoder_bag_norm = nn.LayerNorm(d_model)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         # ベンチはゲームルール上スロット番号に意味が無いため、個別の位置埋め込みではなく
         # 所有者(自分/相手/共通)とゾーン(ベンチ/アクティブ/手札等)の埋め込みの和で表す
@@ -130,6 +131,7 @@ class PolicyValueNet(nn.Module):
         )
 
         self.decoder_bag = nn.EmbeddingBag(decoder_size(), d_model, mode="sum")
+        self.decoder_bag_norm = nn.LayerNorm(d_model)
         self.decoder = nn.ModuleList(
             [DecoderLayer(d_model, num_heads, d_feedforward) for _ in range(num_layers_decoder)]
         )
@@ -137,26 +139,9 @@ class PolicyValueNet(nn.Module):
             nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1)
         )
 
-        self._scale_embedding_init()
-
-    def _scale_embedding_init(self) -> None:
-        """埋め込みの初期値を`1/sqrt(d_model)`倍に縮める。
-
-        `nn.EmbeddingBag`の既定は`N(0, 1)`で、d_model=128だと1行のノルムが約11になる。
-        トークンはその和なので、初期状態で注意のlogitが飽和し、1層目がほぼ乱択の
-        hard attentionになる(実測でエントロピー2.07、一様なら3.26)。
-        あわせて、学習データに出てこないカードの行は初期値のまま残るため、
-        本番で未知のカードが出たときに盤面へ注入されるノイズも小さくなる。
-        """
-        scale = self.d_model**-0.5
-        for embedding in (
-            self.encoder_bag,
-            self.decoder_bag,
-            self.owner_embedding,
-            self.zone_embedding,
-        ):
-            with torch.no_grad():
-                embedding.weight.mul_(scale)
+        # owner/zoneは正規化済みトークンへの加算なので、内容を覆い隠さない程度に小さく始める。
+        for embedding in (self.owner_embedding, self.zone_embedding):
+            nn.init.normal_(embedding.weight, std=0.02)
 
     def forward(
         self,
@@ -183,7 +168,10 @@ class PolicyValueNet(nn.Module):
                 policy_scores: 形状`(batch, max_actions)`の方策の生ロジット(tanhなし、
                     呼び出し側でsoftmax/log_softmaxする前提)。
         """
-        v = self.encoder_bag(index_encoder, offset_encoder, value_encoder)
+        # EmbeddingBagは有効な特徴の「和」なので、トークンの大きさが特徴数に比例する。
+        # 盤面トークンは数十個を足すのに対し行動トークンは数個しか足さないため、
+        # 正規化しないと交差注意で行動の情報が盤面に埋もれ、全行動が同じスコアになる。
+        v = self.encoder_bag_norm(self.encoder_bag(index_encoder, offset_encoder, value_encoder))
         v = v.reshape(-1, NUM_WORDS_ENCODER, self.d_model).transpose(0, 1)
         batch_size = v.size(1)
 
@@ -195,7 +183,7 @@ class PolicyValueNet(nn.Module):
         encoder_out = self.encoder(v)
         value = torch.tanh(self.encoder_fc(encoder_out[0]))  # CLSトークンの出力だけを価値に使う
 
-        p = self.decoder_bag(index_decoder, offset_decoder, value_decoder)
+        p = self.decoder_bag_norm(self.decoder_bag(index_decoder, offset_decoder, value_decoder))
         p = p.reshape(batch_size, -1, self.d_model).transpose(0, 1)
         for layer in self.decoder:
             p = layer(p, encoder_out)
