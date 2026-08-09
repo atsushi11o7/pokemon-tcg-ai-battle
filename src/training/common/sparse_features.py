@@ -236,8 +236,8 @@ def _decoder_scope_offset() -> int:
     """選択対象が「誰の」「どの領域」かを表すブロックの先頭。
 
     カードIDとcontextだけでは、同じカードを自分のベンチから選ぶのか相手のベンチから
-    選ぶのかを区別できない(実測でBENCH/自分102回・BENCH/相手92回)。所有者と領域を
-    渡さないと、異なる合法手が同一のトークンになり方策が学習できない。
+    選ぶのかを区別できない。所有者と領域が無いと、異なる合法手が同一のトークンになり、
+    方策は必ず同じスコアを出すことになる。
     """
     return _decoder_main_target_offset() + _decoder_main_target_size()
 
@@ -362,8 +362,7 @@ def _decoder_context_role_offset() -> int:
 HP_RATIO_BUCKETS = 10
 
 # ターン数のバケット境界。`state.turn`は半ターン単位で進むため、等間隔で切ると
-# 4巡目以降がすべて最終バケットに入って定数と変わらなくなる(実測で83.5%が最終箱)。
-# 序盤を細かく、終盤を粗く見る非線形な区切りにする。
+# 序盤以外がすべて最終バケットに入って定数と変わらなくなる。序盤を細かく見る。
 TURN_BUCKET_EDGES = (1, 2, 3, 4, 6, 8, 11, 15, 21, 30)
 TURN_BUCKETS = len(TURN_BUCKET_EDGES) + 1
 
@@ -384,7 +383,7 @@ def _pokemon_extra_size() -> int:
     """`add_pokemon`が1枠に書き込む、カードID以外の特徴のブロック幅。
 
     `add_pokemon`の書き込みと1対1で対応している必要がある。ずれるとブロック境界が
-    重なって静かに壊れるため、`tests/test_feature_layout.py`で実測値と突き合わせている。
+    重なって静かに壊れるため、`tests/test_feature_layout.py`で実際の書き込み量と照合する。
     """
     # ex, megaEx, にげるコスト, 最大HP, 印刷HP, HP強化量, 残りHP比, 進化段階3種,
     # aceSpec, tera, 逃走可否, このターン出たばかりか, 進化元の枚数, 技の最大打点
@@ -395,8 +394,8 @@ def _pokemon_extra_size() -> int:
 def encoder_size() -> int:
     """エンコーダ側の疎ベクトルの総次元数(EmbeddingBagの語彙数)。
 
-    `get_encoder_input`が書き込む全ブロックの合計サイズ。
-    値は`get_encoder_input`呼び出し後の`SparseVector.pos`と実測一致することを確認済み。
+    `get_encoder_input`が書き込む全ブロックの合計。`SparseVector.pos`との一致は
+    `tests/test_feature_layout.py`が実局面で検証する。
 
     Returns:
         int: エンコーダ側の疎ベクトルの総次元数。
@@ -657,10 +656,9 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
 
         # 現在HPの絶対値だけでは、同じ0.3でもHP70のポケモンが満タンなのか
         # HP340のポケモンが瀕死なのか区別できない。最大HPと残り比率を明示的に渡す。
-        # 最大HPは道具や効果で印刷値から変動するため、KO判定には盤面側の`maxHp`を使う
-        # (実測で約20%のポケモンが印刷値と不一致)。印刷値も併せて渡す。カードの静的属性は
-        # 出現回数の少ないカードでも他カードと共有された統計として効き、両者の差は
-        # 「HP強化がかかっている」という盤面の状態そのものを表す。
+        # 最大HPは道具や効果で印刷値から変わるため、KO判定には盤面側の`maxHp`を使う。
+        # 印刷値も渡す。カードの静的属性は出現の少ないカードの汎化に効き、両者の差は
+        # 「HP強化がかかっている」という盤面の状態を表す。
         printed_hp = float(card.hp or 0)
         max_hp = float(poke.maxHp or printed_hp)
         sv.add_single(max_hp / 400)
@@ -804,9 +802,8 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.word_start()
     add_cards(sv, state.stadium, 1.0, CARD_ROLE_ZONE)
 
-    # この選択の文脈となっているカード。`effect`とは別物で、メタの多様なデッキでの実測では
-    # 2,587局面中42件(1.6%)が`effect`で代替できなかった(値が異なる25件、effectが無い17件)。
-    # `effect`と同じトークンに置くと加算で混ざるため、専用トークンにする。
+    # この選択の文脈となっているカード。`effect`とは別物で、片方しか無い局面も
+    # 値が食い違う局面もある。`effect`と同じトークンに置くと加算で混ざるため分ける。
     sv.word_start()
     add_card(
         sv,
@@ -837,8 +834,8 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.add_single(state.energyAttached)
     sv.add_single(state.retreated)
     sv.add_single(min(state.turnActionCount, 20) / 20)
-    # この選択を引き起こしたカード。同じcontextでも、どのカードの効果で選ばされて
-    # いるかで最適な選択は変わる(実測で選択の約20%に値が入る)。
+    # この選択を引き起こしたカード。同じcontextでも、どのカードの効果によるかで
+    # 最適な選択は変わる。
     add_card(sv, obs.select.effect if obs.select is not None else None, CARD_ROLE_ZONE)
     # 相手アクティブの最大打点で、自分のアクティブが落ちるか。
     # 逃げる/入れ替えるの判断に直結するが、両者の情報は別トークンに散っている。
@@ -1101,9 +1098,8 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 decoder_scope(sv, o.area, o.playerIndex, your_index)
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.energyCards[o.energyIndex])
-                # そのエネルギーが何個分に相当するか。コストは個数で払うため、
-                # 1枚で複数個を供給する特殊エネルギーは外す影響が大きい。
-                # 現在のカードプールでは実測で常に1だが、増えたときに効く。
+                # そのエネルギーが何個分か。コストは個数で払うため、1枚で複数個を
+                # 供給する特殊エネルギーは外したときの影響が大きい。
                 if o.count:
                     sv.add(_HEAD_ENERGY_UNITS, min(o.count, 5) / 5)
             elif o.type == OptionType.SKILL:
