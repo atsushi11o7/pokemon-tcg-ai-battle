@@ -124,11 +124,11 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
     def test_layouts_carry_the_same_information(self) -> None:
         """2つのレイアウトが同じ情報を運んでいること。
 
-        共有レイアウトは添字の付け方を変えるだけで、トークンごとに書き込む値の
-        多重集合は`per_role`と一致するはず。デコーダだけは行動トークンごとに
-        contextを示す1.0が1つ増える。ここがずれると、片方のレイアウトだけ
-        情報が欠けたり重複したりしていることになる
-        (以前、共有側でcontextマーカーがカード枚数ぶん重複加算されていた)。
+        共有レイアウトは添字の付け方を変えるだけなので、トークンごとに書き込む値の
+        多重集合はencoder/decoderとも`per_role`と一致するはず。ずれていれば、
+        片方のレイアウトだけ情報が欠けているか重複している
+        (以前、共有側でcontextマーカーがカード枚数ぶん重複加算されており、
+        さらに`per_role`ではカードを伴わない選択でcontextが落ちていた)。
         """
         from cg.api import to_observation_class
 
@@ -147,8 +147,7 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
                 shared_dec = _token_values(sf.get_decoder_input(obs, actions))
 
                 self.assertEqual(per_enc, shared_enc, "encoderの情報量がレイアウト間でずれた")
-                for per_token, shared_token in zip(per_dec, shared_dec, strict=True):
-                    self.assertEqual(sorted(per_token + [1.0]), shared_token)
+                self.assertEqual(per_dec, shared_dec, "decoderの情報量がレイアウト間でずれた")
         finally:
             sf.configure_feature_layout(original)
 

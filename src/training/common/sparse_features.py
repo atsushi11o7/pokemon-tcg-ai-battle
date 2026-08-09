@@ -127,11 +127,25 @@ def _add_energy_counts(sv: "SparseVector", base_offset: int, counts: dict[int, i
 # index 3: NO
 # index 4-8: SPECIAL_CONDITION(POISON/BURN/SLEEP/PARALYZE/CONFUSEの5種)
 # index 9-13: NUMBER(0〜4以上を5段階に丸めたもの)
-DECODER_HEAD_SIZE = 14
+# デコーダ先頭ブロックの内訳。ここは行動トークンごとに書かれる。
+_HEAD_EMPTY = 0  # 何も選ばない行動
+_HEAD_END = 1
+_HEAD_YES = 2
+_HEAD_NO = 3
+_HEAD_SPECIAL_CONDITION = 4  # 5種
+_HEAD_NUMBER = 9  # 0〜6と7以上で8段階
+NUMBER_BUCKETS = 8
+_HEAD_NUMBER_RAW = _HEAD_NUMBER + NUMBER_BUCKETS
+_HEAD_REMAIN_ENERGY = _HEAD_NUMBER_RAW + 1
+_HEAD_REMAIN_DAMAGE = _HEAD_REMAIN_ENERGY + 1
+DECODER_HEAD_SIZE = _HEAD_REMAIN_DAMAGE + 1
 # decoder_main(MAIN選択の各種カード参照)が使う特徴インデックス数
 # (PLAY, ATTACH対象カード, ATTACHの装着先, EVOLVE対象カード, EVOLVEの進化先,
 #  ABILITY, DISCARD, RETREATの8種)
 DECODER_MAIN_FEATURE = 8
+
+# SelectContextの種類数
+N_SELECT_CONTEXT = int(SelectContext.RECOVER_SPECIAL_CONDITION) + 1
 
 
 def _decoder_attack_offset() -> int:
@@ -210,8 +224,8 @@ def _decoder_main_target_offset() -> int:
 
 
 def _decoder_main_target_size() -> int:
-    """残りHP + タイプ別の付与エネルギー個数。"""
-    return 1 + energy_type_count()
+    """残りHP + タイプ別の付与エネルギー個数 + このターン出たばかりか + 進化段数。"""
+    return 1 + energy_type_count() + 2
 
 
 AREA_COUNT = 13  # AreaTypeの最大値+1
@@ -319,13 +333,26 @@ def _encoder_block_base() -> int:
     return _encoder_skill_offset() + skill_count()
 
 
-def _decoder_context_role_offset() -> int:
-    """共有レイアウトで、SelectContextを表す役割インデックスの先頭。
+def _decoder_card_block_count() -> int:
+    """デコーダのカード参照ブロック数。
 
-    1つの選択(select)の中でcontextは常に同一なので、contextごとにカード表を持つ必要はなく、
-    カード表1つ + contextを示す役割インデックス、で表せる。
+    共有レイアウトはMAINの8種 + context共通の1つ。`per_role`はcontextごとに
+    独立したブロックを持つ。
     """
-    return _decoder_card_offset() + (DECODER_MAIN_FEATURE + 1) * card_count()
+    if _shared():
+        return DECODER_MAIN_FEATURE + 1
+    return 1 + DECODER_MAIN_FEATURE + N_SELECT_CONTEXT
+
+
+def _decoder_context_role_offset() -> int:
+    """SelectContextを表す役割インデックスの先頭。
+
+    1つの選択(select)の中でcontextは常に同一なので、カード表とは別に、
+    行動トークンごとに1つの添字で表せる。`per_role`はcontextごとのカード表を
+    持つが、カードを伴わない選択(YES/NO/NUMBER)ではcontextが落ちるため、
+    両レイアウトでここに書く。
+    """
+    return _decoder_card_offset() + _decoder_card_block_count() * card_count()
 
 
 # 残りHP比のバケット数。スカラー1本だと「HPが2割を切ったか」のような閾値的な判断が
@@ -386,18 +413,13 @@ def encoder_size() -> int:
 def decoder_size() -> int:
     """デコーダの疎ベクトルの総次元数(EmbeddingBagの語彙数)。
 
-    先頭ブロック(NUMBER/YES/NO/SPECIAL_CONDITION/空選択) + ATTACK特徴(one-hot) +
-    ATTACK数値特徴 + 交代先数値特徴 + (decoder_mainの8種 + SelectContextの種類数+ 1)個の
-    カード参照ブロック、という構成。
+    先頭ブロック + ATTACK特徴 + ATTACK数値特徴 + 交代先数値特徴 + MAIN対象の状態 +
+    所有者/領域 + カード参照ブロック + contextの役割インデックス、という構成。
 
     Returns:
         int: デコーダの疎ベクトルの総次元数。
     """
-    n_context = int(SelectContext.RECOVER_SPECIAL_CONDITION) + 1
-    if _shared():
-        # MAINの8ブロック + context共通のカード表1ブロック + contextを示す役割インデックス
-        return _decoder_card_offset() + (DECODER_MAIN_FEATURE + 1) * card_count() + n_context
-    return _decoder_card_offset() + (1 + DECODER_MAIN_FEATURE + n_context) * card_count()
+    return _decoder_context_role_offset() + N_SELECT_CONTEXT
 
 
 class SparseVector:
@@ -870,15 +892,25 @@ def decoder_target_state(sv: SparseVector, target) -> None:
     offset = _decoder_main_target_offset()
     sv.add(offset, target.hp / 400)
     _add_energy_counts(sv, offset + 1, energy_unit_counts(target.energies))
+    # 今出したばかりかは進化可否に関わり、進化段数は同じカードでも状態が違う。
+    # これが無いと、同じベンチ枠の同種ポケモンを区別できない局面が残る。
+    tail = offset + 1 + energy_type_count()
+    sv.add(tail, 1.0 if getattr(target, "appearThisTurn", False) else 0.0)
+    sv.add(tail + 1, len(getattr(target, "preEvolution", None) or []) / 2)
 
 
-def decoder_scope(sv: SparseVector, area, player_index: int, your_index: int) -> None:
-    """選択対象の所有者と領域を書き込む。"""
+def decoder_scope(sv: SparseVector, area, player_index, your_index: int) -> None:
+    """選択対象の所有者と領域を書き込む。
+
+    選択肢の型によっては`area`/`playerIndex`が設定されない(END/PLAY/ATTACK等)。
+    その場合は何も書かず、「所有者も領域も指定されていない」ことが値の不在として
+    表現される。
+    """
     offset = _decoder_scope_offset()
-    sv.add(offset, 1.0 if player_index == your_index else -1.0)
-    area_index = int(area)
-    if 0 <= area_index < AREA_COUNT:
-        sv.add(offset + 1 + area_index, 1)
+    if player_index is not None:
+        sv.add(offset, 1.0 if player_index == your_index else -1.0)
+    if area is not None and 0 <= int(area) < AREA_COUNT:
+        sv.add(offset + 1 + int(area), 1)
 
 
 def decoder_main(sv: SparseVector, feature_index: int, card) -> None:
@@ -901,8 +933,7 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
         context: 選択の`SelectContext`。
         card_id: 参照しているカードのID。
     """
-    n_context = int(SelectContext.RECOVER_SPECIAL_CONDITION) + 1
-    if int(context) >= n_context:
+    if int(context) >= N_SELECT_CONTEXT:
         # エンジン更新でSelectContextが増えると、共有レイアウトでは語彙の外へ書いてしまう。
         # 黙って壊れるより、原因の分かる例外にする。
         raise ValueError(f"SelectContext {int(context)} is outside the known range")
@@ -917,13 +948,16 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
 
 
 def _mark_context(sv: SparseVector, context) -> None:
-    """共有レイアウトで、この行動トークンのSelectContextを1回だけ記録する。
+    """この行動トークンのSelectContextを1回だけ記録する。
 
-    `EmbeddingBag`はsumなので、カード参照のたびに立てると「その行動が何枚選ぶか」が
-    contextの埋め込みに掛かった形で混入し、`per_role`と情報が非等価になる。
+    共有レイアウトではcontextごとのカード表を持たないため必須。`per_role`でも、
+    YES/NO/NUMBERのようにカードを伴わない選択ではcontextがどこにも入らないため、
+    両レイアウトで書く。
+
+    カード参照のたびに立てると「その行動が何枚選ぶか」がcontextの埋め込みに
+    掛かった形で混入するので、行動トークンごとに1回だけにする。
     """
-    if _shared():
-        sv.add(_decoder_context_role_offset() + int(context), 1)
+    sv.add(_decoder_context_role_offset() + int(context), 1)
 
 
 def decoder_card(sv: SparseVector, context, card) -> None:
@@ -957,26 +991,35 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
     ps = obs.current.players[your_index]
     context = obs.select.context
 
+    remain_energy = obs.select.remainEnergyCost or 0
+    remain_damage = obs.select.remainDamageCounter or 0
     for action in actions:
         sv.word_start()
         _mark_context(sv, context)
+        # 残り支払い量。エネルギー支払いやダメカン配置の選択では、あと何個必要かが
+        # 分からないと何枚選ぶべきか判断できない。
+        sv.add(_HEAD_REMAIN_ENERGY, min(remain_energy, 10) / 10)
+        sv.add(_HEAD_REMAIN_DAMAGE, min(remain_damage, 20) / 20)
 
         if len(action) == 0:
-            sv.add(0, 1)
+            sv.add(_HEAD_EMPTY, 1)
             continue
 
         for i in action:
             o = obs.select.option[i]
             if o.type == OptionType.END:
-                sv.add(1, 1)
+                sv.add(_HEAD_END, 1)
             elif o.type == OptionType.YES:
-                sv.add(2, 1)
+                sv.add(_HEAD_YES, 1)
             elif o.type == OptionType.NO:
-                sv.add(3, 1)
+                sv.add(_HEAD_NO, 1)
             elif o.type == OptionType.SPECIAL_CONDITION:
-                sv.add(4 + int(o.specialConditionType), 1)
+                sv.add(_HEAD_SPECIAL_CONDITION + int(o.specialConditionType), 1)
             elif o.type == OptionType.NUMBER:
-                sv.add(9 + min(o.number, 4), 1)
+                # 個数はバケットと生値の両方。以前は4以上を1つにまとめており、
+                # 「4個捨てる」と「7個捨てる」が同じ表現になっていた。
+                sv.add(_HEAD_NUMBER + min(o.number, NUMBER_BUCKETS - 1), 1)
+                sv.add(_HEAD_NUMBER_RAW, min(o.number, 20) / 20)
             elif o.type == OptionType.ATTACK:
                 sv.add(_decoder_attack_offset() + o.attackId, 1)
                 attack = attack_table()[o.attackId]
@@ -1012,15 +1055,18 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 target = get_card(obs, o.inPlayArea, o.inPlayIndex, your_index)
                 decoder_main(sv, 2, target)
                 decoder_target_state(sv, target)
+                decoder_scope(sv, o.inPlayArea, your_index, your_index)
             elif o.type == OptionType.EVOLVE:
                 decoder_main(sv, 3, get_card(obs, o.area, o.index, your_index))
                 evolving = get_card(obs, o.inPlayArea, o.inPlayIndex, your_index)
                 decoder_main(sv, 4, evolving)
                 decoder_target_state(sv, evolving)
+                decoder_scope(sv, o.inPlayArea, your_index, your_index)
             elif o.type == OptionType.ABILITY:
                 target = get_card(obs, o.area, o.index, your_index)
                 decoder_main(sv, 5, target)
                 decoder_target_state(sv, target)
+                decoder_scope(sv, o.area, your_index, your_index)
             elif o.type == OptionType.DISCARD:
                 decoder_main(sv, 6, get_card(obs, o.area, o.index, your_index))
             elif o.type == OptionType.RETREAT:
