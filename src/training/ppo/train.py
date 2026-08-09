@@ -40,6 +40,7 @@ from ..common.checkpoints import (
     restore_optimizer_state,
 )
 from ..common.evaluation_plan import build_fixed_matchups
+from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
@@ -520,6 +521,14 @@ def run_training_loop(
             settings.checkpoint_dir, settings.selfplay_mode, settings.keep_last_checkpoints
         )
         print(f"  saved checkpoint to {saved_path}")
+        append_round_metrics(
+            settings.output_dir / "metrics.jsonl",
+            round_num,
+            algorithm="ppo",
+            selfplay_results=results,
+            samples=len(all_samples),
+            vs_baseline=vs_baseline,
+        )
 
     return network
 

@@ -167,6 +167,27 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
         finally:
             sf.configure_feature_layout(original)
 
+    def test_token_count_matches_network_definition(self) -> None:
+        """書き込むトークン数と`network.py`のowner/zone定義が一致すること。
+
+        ずれると`reshape`で無関係なトークンが混ざるか、実行時に落ちる。
+        """
+        from cg.api import to_observation_class
+
+        from training.common import network
+
+        original = sf.feature_layout()
+        observations, deck = self._mid_game_observations()
+        try:
+            for layout in ("per_role", "shared_card"):
+                sf.configure_feature_layout(layout)
+                for obs_dict in observations:
+                    written = sf.get_encoder_input(to_observation_class(obs_dict), deck)
+                    self.assertEqual(len(written.offset), network.NUM_WORDS_ENCODER, layout)
+        finally:
+            sf.configure_feature_layout(original)
+        self.assertEqual(len(network._TOKEN_OWNER_ZONE), network.NUM_WORDS_ENCODER + 1)
+
     def test_non_empty_pokemon_branch_is_actually_exercised(self) -> None:
         """上の2テストが場の空な局面だけを見ていないことを保証する。"""
         from cg.api import to_observation_class

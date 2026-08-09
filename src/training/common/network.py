@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from .sparse_features import SparseVector, decoder_size, encoder_size
 
-NUM_WORDS_ENCODER = 24  # get_encoder_inputが作るトークン数(ベンチ8x2+アクティブ2+盤面2+手札1+デッキ1+スタジアム1+ターン情報1)
+NUM_WORDS_ENCODER = 25  # ベンチ8x2 + アクティブ2 + プレイヤー情報2 + 手札1 + デッキ1 + スタジアム1 + 公開中1 + ターン情報1
 
 # 所有者(誰の情報か)とゾーン(何の種類の情報か)。ベンチ8枠はゲームルール上並び順に
 # 意味が無いため、スロットごとに別の埋め込みを持たせず、所有者ごとに1つを共有する。
@@ -27,9 +27,10 @@ _NUM_OWNERS = 3
     _ZONE_HAND,
     _ZONE_DECK,
     _ZONE_STADIUM,
+    _ZONE_LOOKING,
     _ZONE_TURN,
-) = range(8)
-_NUM_ZONES = 8
+) = range(9)
+_NUM_ZONES = 9
 
 # get_encoder_inputの出力順(CLSを先頭に追加した後)に対応する(owner, zone)の並び
 _TOKEN_OWNER_ZONE = (
@@ -39,7 +40,8 @@ _TOKEN_OWNER_ZONE = (
     + [(_OWNER_OWN, _ZONE_ACTIVE), (_OWNER_OPP, _ZONE_ACTIVE)]
     + [(_OWNER_OWN, _ZONE_PLAYER_INFO), (_OWNER_OPP, _ZONE_PLAYER_INFO)]
     + [(_OWNER_OWN, _ZONE_HAND), (_OWNER_OWN, _ZONE_DECK)]
-    + [(_OWNER_SHARED, _ZONE_STADIUM), (_OWNER_SHARED, _ZONE_TURN)]
+    + [(_OWNER_SHARED, _ZONE_STADIUM), (_OWNER_SHARED, _ZONE_LOOKING)]
+    + [(_OWNER_SHARED, _ZONE_TURN)]
 )
 assert len(_TOKEN_OWNER_ZONE) == NUM_WORDS_ENCODER + 1
 

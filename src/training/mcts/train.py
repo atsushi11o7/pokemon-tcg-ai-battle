@@ -33,6 +33,7 @@ from ..common.checkpoints import (
     restore_optimizer_state,
 )
 from ..common.evaluation_plan import build_fixed_matchups
+from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
@@ -546,6 +547,19 @@ def run_training_loop(
             settings.checkpoint_dir, settings.selfplay_mode, settings.keep_last_checkpoints
         )
         print(f"  saved checkpoint and MCTS training state to {saved_path}")
+        append_round_metrics(
+            settings.output_dir / "metrics.jsonl",
+            round_num,
+            algorithm="mcts",
+            selfplay_results=results,
+            samples=len(all_samples),
+            train_samples=len(train_samples),
+            gating={name: gating_results[name] for name, _net in gating_opponents},
+            pooled_win_rate=pooled_win_rate,
+            gating_complete=gating_complete,
+            accepted=accepted,
+            vs_baseline=vs_baseline,
+        )
 
     return best_network
 

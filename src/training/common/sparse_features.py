@@ -335,7 +335,7 @@ def encoder_size() -> int:
     non_card = 43 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
     if _shared():
         return ENCODER_CARD_BLOCKS * card_count() + non_card
-    return non_card + 17 * card_count()
+    return non_card + 19 * card_count()
 
 
 def decoder_size() -> int:
@@ -678,6 +678,11 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.word_start()
     add_cards(sv, state.stadium, 1.0, CARD_ROLE_ZONE)
 
+    # サーチ効果などで今まさに公開されているカード。選択肢の対象としては見えていたが、
+    # 「どの候補の中から選ばされているか」という盤面情報としては渡っていなかった。
+    sv.word_start()
+    add_cards(sv, state.looking, 1.0, CARD_ROLE_ZONE)
+
     sv.word_start()
     sv.add_single(1)
     sv.add_single(state.turn / 10)
@@ -692,6 +697,9 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.add_single(state.energyAttached)
     sv.add_single(state.retreated)
     sv.add_single(min(state.turnActionCount, 20) / 20)
+    # この選択を引き起こしたカード。同じcontextでも、どのカードの効果で選ばされて
+    # いるかで最適な選択は変わる(実測で選択の約20%に値が入る)。
+    add_card(sv, obs.select.effect if obs.select is not None else None, CARD_ROLE_ZONE)
     # 相手アクティブの最大打点で、自分のアクティブが落ちるか。
     # 逃げる/入れ替えるの判断に直結するが、両者の情報は別トークンに散っている。
     me_state = state.players[your_index]
