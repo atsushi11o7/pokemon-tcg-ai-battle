@@ -19,7 +19,9 @@ Algorithm = Literal["ppo", "mcts"]
 
 @dataclass(frozen=True)
 class ModelConfig:
-    initial_checkpoint: Path
+    # Noneならランダム初期化から学習する。入力仕様やD_MODELを変えると
+    # 既存チェックポイントは形状不一致で読めなくなるため、その場合はNoneにする。
+    initial_checkpoint: Path | None
 
 
 @dataclass(frozen=True)
@@ -239,8 +241,12 @@ def load_run_config(path: Path) -> RunConfig:
         raise ValueError("algorithm must be either 'ppo' or 'mcts'")
     mode = _validate_training(training, algorithm)
 
-    checkpoint_value = _required_text(model.get("initial_checkpoint"), "model.initial_checkpoint")
-    checkpoint = ROOT / checkpoint_value
+    # 入力仕様やD_MODELを変えると既存チェックポイントは形状不一致で読めなくなる。
+    # その場合はnullを指定してランダム初期化から学習する。
+    checkpoint_value = model.get("initial_checkpoint")
+    if checkpoint_value is not None:
+        checkpoint_value = _required_text(checkpoint_value, "model.initial_checkpoint")
+    checkpoint = ROOT / checkpoint_value if checkpoint_value is not None else None
 
     workers = _positive_int(
         runtime.get("workers", max(1, (os.cpu_count() or 4) - 2)), "runtime.workers"

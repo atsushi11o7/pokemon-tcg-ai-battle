@@ -200,6 +200,20 @@ def _decoder_switch_numeric_size() -> int:
     return _decoder_switch_energy_offset() + energy_type_count()
 
 
+def _decoder_main_target_offset() -> int:
+    """MAIN選択の対象が場のポケモンのとき、その個体の状態を書くブロックの先頭。
+
+    SWITCH用のブロックとは分ける。1つの行動トークンにSWITCH対象とMAIN対象が
+    同時に入ることは無いが、同じ添字を共有すると将来どちらか判別できなくなる。
+    """
+    return _decoder_switch_numeric_offset() + _decoder_switch_numeric_size()
+
+
+def _decoder_main_target_size() -> int:
+    """残りHP + タイプ別の付与エネルギー個数。"""
+    return 1 + energy_type_count()
+
+
 def _decoder_card_offset() -> int:
     """デコーダの疎ベクトルにおける、カード参照系特徴の先頭インデックス。
 
@@ -208,7 +222,7 @@ def _decoder_card_offset() -> int:
     Returns:
         int: それらのブロックの直後のインデックス。
     """
-    return _decoder_switch_numeric_offset() + _decoder_switch_numeric_size()
+    return _decoder_main_target_offset() + _decoder_main_target_size()
 
 
 # --- 特徴量レイアウト -------------------------------------------------------
@@ -268,12 +282,23 @@ def _shared() -> bool:
     return _layout == "shared_card"
 
 
+def _encoder_attack_offset() -> int:
+    """共有レイアウトで、ポケモンが持つ技のブロックの先頭。"""
+    return ENCODER_CARD_BLOCKS * card_count()
+
+
+def _encoder_skill_offset() -> int:
+    """共有レイアウトで、ポケモンが持つ特性のブロックの先頭。"""
+    return _encoder_attack_offset() + attack_count()
+
+
 def _encoder_block_base() -> int:
     """共有レイアウトで、トークンごとにスライドする非カードブロックの開始位置。
 
-    先頭を共有カード表4ブロックが占めるため、その直後から始める。
+    先頭を共有カード表4ブロックと、技・特性のブロックが占める。技も特性も
+    4つのポケモン枠それぞれが別トークンなので、枠をまたいで共有できる。
     """
-    return ENCODER_CARD_BLOCKS * card_count()
+    return _encoder_skill_offset() + skill_count()
 
 
 def _decoder_context_role_offset() -> int:
@@ -316,9 +341,9 @@ def _pokemon_extra_size() -> int:
     重なって静かに壊れるため、`tests/test_feature_layout.py`で実測値と突き合わせている。
     """
     # ex, megaEx, にげるコスト, 最大HP, 印刷HP, HP強化量, 残りHP比, 進化段階3種,
-    # 逃走可否, このターン出たばかりか, 進化元の枚数, 技の最大打点
-    scalars = 14
-    return scalars + 2 * energy_type_count() + HP_RATIO_BUCKETS + 2
+    # aceSpec, tera, 逃走可否, このターン出たばかりか, 進化元の枚数, 技の最大打点
+    scalars = 16
+    return scalars + 3 * energy_type_count() + HP_RATIO_BUCKETS
 
 
 def encoder_size() -> int:
@@ -333,9 +358,11 @@ def encoder_size() -> int:
     # プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠 = 43
     # ターン資源フラグ4 + turnActionCount 1 + 被KO判定1 + ターンのバケット
     non_card = 43 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
+    traits = attack_count() + skill_count()
     if _shared():
-        return ENCODER_CARD_BLOCKS * card_count() + non_card
-    return non_card + 19 * card_count()
+        # カード表4 + 技 + 特性は、いずれも枠をまたいで共有する
+        return _encoder_block_base() + non_card
+    return non_card + 19 * card_count() + 4 * traits
 
 
 def decoder_size() -> int:
@@ -473,6 +500,36 @@ def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float, role: 
 _max_damage_cache: dict[int, float] = {}
 
 
+_skill_ids: dict[str, int] | None = None
+_card_skill_ids: dict[int, list[int]] | None = None
+
+
+def skill_count() -> int:
+    """特性の種類数(埋め込みテーブルの幅)。"""
+    return len(_skill_table())
+
+
+def _skill_table() -> dict[str, int]:
+    """特性名に通し番号を振る。`Skill`はIDを持たず名前とテキストしかないため。"""
+    global _skill_ids
+    if _skill_ids is None:
+        names = sorted({s.name for c in all_card_data() for s in (c.skills or [])})
+        _skill_ids = {name: index for index, name in enumerate(names)}
+    return _skill_ids
+
+
+def card_skill_ids(card_id: int) -> list[int]:
+    """そのカードが持つ特性の通し番号。"""
+    global _card_skill_ids
+    if _card_skill_ids is None:
+        table = _skill_table()
+        _card_skill_ids = {
+            c.cardId: [table[s.name] for s in (c.skills or []) if s.name in table]
+            for c in all_card_data()
+        }
+    return _card_skill_ids.get(card_id, [])
+
+
 def _max_attack_damage(card_id: int) -> float:
     """そのカードが持つ技の最大ダメージ。技が無ければ0。"""
     cached = _max_damage_cache.get(card_id)
@@ -542,7 +599,8 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
     if poke is None:
         sv.add_single(1)
         skipped_cards = 0 if _shared() else 3 * card_count()
-        sv.add_pos(1 + skipped_cards + _pokemon_extra_size())
+        skipped_traits = 0 if _shared() else attack_count() + skill_count()
+        sv.add_pos(1 + skipped_cards + skipped_traits + _pokemon_extra_size())
     else:
         sv.add_single(0)
         sv.add_single(poke.hp / 400)
@@ -581,6 +639,12 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         sv.add_single(card.aceSpec)
         sv.add_single(card.tera)
 
+        # タイプ別の付与エネルギー個数。カードIDの重み付き和だけだと「炎が2個以上あるか」
+        # のような閾値がスカラー1方向でしか表現できず、技のコストを満たせるかの判断に
+        # 直結する情報が潰れる。デコーダはアクティブについて既に同じ情報を渡している。
+        _add_energy_counts(sv, 0, energy_unit_counts(poke.energies))
+        sv.add_pos(energy_type_count())
+
         # にげるコストを払えるか。コストはエネルギー「個数」で払うため、カード枚数では
         # なく`energies`(タイプの並び)の長さで数える(特殊エネルギーは1枚で複数個)。
         energy_units = len(poke.energies) if poke.energies else 0
@@ -593,6 +657,27 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
 
         # このポケモンの技の最大打点。相手側の枠なら脅威度の指標になる。
         sv.add_single(_max_attack_damage(poke.id) / 400)
+
+        # 持っている技そのもの。選択肢として提示された技はデコーダ側で識別できるが、
+        # 盤面としては最大打点しか渡っておらず、相手が何をしてくるかが分からなかった。
+        # 1体の技は同じ役割なので、1ブロックにまとめて書ける。
+        if _shared():
+            for attack_id in card.attacks or []:
+                sv.add_absolute(_encoder_attack_offset() + attack_id, 1)
+        else:
+            for attack_id in card.attacks or []:
+                sv.add(attack_id, 1)
+            sv.add_pos(attack_count())
+
+        # 持っている特性。ポケモンの21%が特性持ちで、使える瞬間はABILITY選択肢として
+        # 現れるが、「相手のベンチに特性持ちがいる」という盤面の把握ができていなかった。
+        if _shared():
+            for skill_id in card_skill_ids(poke.id):
+                sv.add_absolute(_encoder_skill_offset() + skill_id, 1)
+        else:
+            for skill_id in card_skill_ids(poke.id):
+                sv.add(skill_id, 1)
+            sv.add_pos(skill_count())
 
 
 def add_player(sv: SparseVector, ps: PlayerState) -> None:
@@ -751,6 +836,20 @@ def get_card(obs: Observation, area: AreaType, index: int, player_index: int):
     return None
 
 
+def decoder_target_state(sv: SparseVector, target) -> None:
+    """MAIN選択の対象が場のポケモンなら、その個体の状態を書き添える。
+
+    `decoder_main`はカードIDしか書かないため、同種のポケモンが2体並ぶと
+    「傷ついた方」と「無傷の方」が同一トークンになり、方策が区別できなくなる。
+    交代先の選択(SWITCH)では既に同じ扱いをしている。
+    """
+    if target is None or not hasattr(target, "hp"):
+        return
+    offset = _decoder_main_target_offset()
+    sv.add(offset, target.hp / 400)
+    _add_energy_counts(sv, offset + 1, energy_unit_counts(target.energies))
+
+
 def decoder_main(sv: SparseVector, feature_index: int, card) -> None:
     """MAIN選択で参照しているカードを、`decoder_main_feature`内の該当スロットに書き込む。
 
@@ -879,16 +978,23 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 decoder_main(sv, 0, ps.hand[o.index])
             elif o.type == OptionType.ATTACH:
                 decoder_main(sv, 1, get_card(obs, o.area, o.index, your_index))
-                decoder_main(sv, 2, get_card(obs, o.inPlayArea, o.inPlayIndex, your_index))
+                target = get_card(obs, o.inPlayArea, o.inPlayIndex, your_index)
+                decoder_main(sv, 2, target)
+                decoder_target_state(sv, target)
             elif o.type == OptionType.EVOLVE:
-                decoder_main(sv, 3, get_card(obs, o.area, o.index, your_index))
+                target = get_card(obs, o.area, o.index, your_index)
+                decoder_main(sv, 3, target)
+                decoder_target_state(sv, target)
                 decoder_main(sv, 4, get_card(obs, o.inPlayArea, o.inPlayIndex, your_index))
             elif o.type == OptionType.ABILITY:
-                decoder_main(sv, 5, get_card(obs, o.area, o.index, your_index))
+                target = get_card(obs, o.area, o.index, your_index)
+                decoder_main(sv, 5, target)
+                decoder_target_state(sv, target)
             elif o.type == OptionType.DISCARD:
                 decoder_main(sv, 6, get_card(obs, o.area, o.index, your_index))
             elif o.type == OptionType.RETREAT:
                 decoder_main(sv, 7, ps.active[0])
+                decoder_target_state(sv, ps.active[0] if ps.active else None)
             elif o.type == OptionType.CARD:
                 target = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, target)

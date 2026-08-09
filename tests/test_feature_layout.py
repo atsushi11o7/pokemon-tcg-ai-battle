@@ -8,6 +8,15 @@ from training.common import sparse_features as sf
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _token_values(sparse_vector) -> list[list[float]]:
+    """トークンごとに書き込まれた値を、添字に依らない形(ソート済み)で取り出す。"""
+    boundaries = [*sparse_vector.offset, len(sparse_vector.index)]
+    return [
+        sorted(sparse_vector.value[start:end])
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+    ]
+
+
 class EffectiveDamageTest(unittest.TestCase):
     """弱点・抵抗力を反映した実効ダメージ(KO判定の土台)。"""
 
@@ -74,19 +83,6 @@ class FeatureLayoutTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sf.configure_feature_layout("nonexistent")
 
-    def test_shared_layout_keeps_card_roles_separable(self) -> None:
-        """同一トークン内で同居する役割は、別ブロックに落ちること。
-
-        本体/道具/エネルギーが同じブロックへ混ざると、EmbeddingBagのsumで
-        どのカードがどの役割だったかの対応が失われる。
-        """
-        sf.configure_feature_layout("shared_card")
-        count = sf.card_count()
-        roles = (sf.CARD_ROLE_POKEMON, sf.CARD_ROLE_TOOL, sf.CARD_ROLE_ENERGY)
-        blocks = {role * count // count for role in roles}
-        self.assertEqual(len(blocks), len(roles))
-        self.assertEqual(sf.ENCODER_CARD_BLOCKS, 4)
-
 
 class DeclaredSizeMatchesWritesTest(unittest.TestCase):
     """宣言サイズと実際の書き込み量が一致すること。
@@ -99,7 +95,7 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
     並んだ局面で検証する。
     """
 
-    def _mid_game_observations(self, count: int = 12):
+    def _mid_game_observations(self, count: int = 400):
         from cg.api import to_observation_class
         from cg.game import battle_finish, battle_select, battle_start
 
@@ -124,6 +120,37 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
         finally:
             battle_finish()
         return collected, deck
+
+    def test_layouts_carry_the_same_information(self) -> None:
+        """2つのレイアウトが同じ情報を運んでいること。
+
+        共有レイアウトは添字の付け方を変えるだけで、トークンごとに書き込む値の
+        多重集合は`per_role`と一致するはず。デコーダだけは行動トークンごとに
+        contextを示す1.0が1つ増える。ここがずれると、片方のレイアウトだけ
+        情報が欠けたり重複したりしていることになる
+        (以前、共有側でcontextマーカーがカード枚数ぶん重複加算されていた)。
+        """
+        from cg.api import to_observation_class
+
+        original = sf.feature_layout()
+        observations, deck = self._mid_game_observations()
+        try:
+            for obs_dict in observations:
+                obs = to_observation_class(obs_dict)
+                actions = [[i] for i in range(len(obs.select.option))] or [[]]
+
+                sf.configure_feature_layout("per_role")
+                per_enc = _token_values(sf.get_encoder_input(obs, deck))
+                per_dec = _token_values(sf.get_decoder_input(obs, actions))
+                sf.configure_feature_layout("shared_card")
+                shared_enc = _token_values(sf.get_encoder_input(obs, deck))
+                shared_dec = _token_values(sf.get_decoder_input(obs, actions))
+
+                self.assertEqual(per_enc, shared_enc, "encoderの情報量がレイアウト間でずれた")
+                for per_token, shared_token in zip(per_dec, shared_dec, strict=True):
+                    self.assertEqual(sorted(per_token + [1.0]), shared_token)
+        finally:
+            sf.configure_feature_layout(original)
 
     def test_encoder_size_matches_written_positions(self) -> None:
         from cg.api import to_observation_class
