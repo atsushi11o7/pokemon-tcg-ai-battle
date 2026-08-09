@@ -811,7 +811,7 @@ def decoder_card(sv: SparseVector, context, card) -> None:
 def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVector:
     """列挙済みの行動それぞれを、Transformerデコーダへの入力となる疎ベクトルに変換する。
 
-    行動1つ(選択肢のindexのリスト)につき1トークンを作る。`search._enumerate_actions`が
+    行動1つ(選択肢のindexのリスト)につき1トークンを作る。`search.enumerate_actions`が
     返す形式(各要素が`search_step`にそのまま渡せるindexのリスト)をそのまま受け取れる。
 
     Args:

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from training.mcts.determinize import determinize_for_search
-from training.mcts.search import MAX_ACTIONS_PER_NODE, _enumerate_actions
+from training.mcts.search import MAX_ACTIONS_PER_NODE, enumerate_actions
 from training.mcts.train import should_accept_candidate
 
 
@@ -56,7 +56,7 @@ class MctsQualityTest(unittest.TestCase):
 
     def test_action_cap_samples_full_combination_rank_space(self) -> None:
         select = SimpleNamespace(minCount=2, maxCount=4, option=[object()] * 20)
-        actions = _enumerate_actions(select)
+        actions = enumerate_actions(select)
 
         self.assertEqual(len(actions), MAX_ACTIONS_PER_NODE)
         self.assertTrue(any(0 in action for action in actions))
