@@ -37,10 +37,17 @@ def _worker_main(connection: Connection, initializer, initargs: tuple, task) -> 
 
 
 def _rss_bytes(pid: int) -> int | None:
-    """Linux /procからRSSを読む。終了済み・非LinuxならNone。"""
+    """Linux /procからワーカー固有の常駐メモリを読む。終了済み・非LinuxならNone。
+
+    `statm`のresident(field 1)そのままだと、親から共有されたネットワーク重み
+    (約107MB、torchが共有メモリ経由で1コピーを全workerへ渡す)が全workerのRSSに
+    二重計上され、実際にはリークしていなくても「8worker × 107MB」に見えてしまう。
+    リーク検知が目的なので、shared(field 2)を差し引いた固有分だけを記録する。
+    """
     try:
         fields = Path(f"/proc/{pid}/statm").read_text(encoding="ascii").split()
-        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+        resident_pages = int(fields[1]) - int(fields[2])
+        return max(0, resident_pages) * os.sysconf("SC_PAGE_SIZE")
     except (FileNotFoundError, IndexError, OSError, ValueError):
         return None
 

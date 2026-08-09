@@ -29,6 +29,10 @@ def build_fixed_matchups(
                 )
                 for _ in range(n_games // 4)
             ]
+        if mode == "asymmetric":
+            return [
+                (deck, sample_deck(opponent_deck_pool, "opponent")) for _ in range(n_games // 4)
+            ]
         return [(deck, deck) for _ in range(n_games // 4)]
     finally:
         random.setstate(random_state)

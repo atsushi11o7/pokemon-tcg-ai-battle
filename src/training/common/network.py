@@ -257,3 +257,50 @@ def collate_encoder_decoder[T](
     index_enc, value_enc, offset_enc = encoder_batch.to_tensors()
     index_dec, value_dec, offset_dec = decoder_batch.to_tensors()
     return index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask
+
+
+def build_policy_value_net(state_dict: dict | None = None, *, assign: bool = False):
+    """`model_config.py`の構成で`PolicyValueNet`を作り、必要なら重みを載せてeval modeにする。
+
+    構成引数を5箇所に散らさないための唯一の入口。`assign=True`はspawnワーカー向けで、
+    共有メモリ上のテンソルをコピーせずそのまま採用する。
+
+    Args:
+        state_dict: 読み込む重み。Noneなら初期化済みの空ネットワークを返す。
+        assign: `load_state_dict`の`assign`。
+
+    Returns:
+        PolicyValueNet: eval modeのネットワーク。
+    """
+    from .model_config import (
+        D_FEEDFORWARD,
+        D_MODEL,
+        NUM_HEADS,
+        NUM_LAYERS_DECODER,
+        NUM_LAYERS_ENCODER,
+    )
+
+    network = PolicyValueNet(
+        D_MODEL, NUM_HEADS, D_FEEDFORWARD, NUM_LAYERS_ENCODER, NUM_LAYERS_DECODER
+    )
+    if state_dict is not None:
+        network.load_state_dict(state_dict, assign=assign)
+    network.eval()
+    return network
+
+
+def load_policy_value_net(path, *, assign: bool = False):
+    """チェックポイントファイルから`PolicyValueNet`を復元する。
+
+    `map_location="cpu"`を必ず指定する。外部から持ち込んだGPU保存のチェックポイントでも
+    CPU専用機で読めるようにするため(指定を忘れるとload時にCUDA確保を試みて失敗する)。
+
+    Args:
+        path: `state_dict`を保存した`.pt`のパス。
+        assign: `load_state_dict`の`assign`。
+
+    Returns:
+        PolicyValueNet: eval modeのネットワーク。
+    """
+    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    return build_policy_value_net(state_dict, assign=assign)

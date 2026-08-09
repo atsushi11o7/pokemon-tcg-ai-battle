@@ -1,11 +1,11 @@
 run:
-  name: mcts_generalist
-  output_dir: outputs/runs/mcts_generalist
+  name: mcts_depth50_hyp1
+  output_dir: outputs/runs/mcts_depth50_hyp1
 
 algorithm: mcts
 
 model:
-  initial_checkpoint: outputs/runs/ppo_generalist/checkpoints/final.pt
+  initial_checkpoint: outputs/runs/ppo_asymmetric_crustle_team3/checkpoints/final.pt
 
 data:
   sampling_snapshot: data/meta/derived/sampling_snapshot.json
@@ -17,14 +17,15 @@ runtime:
   round_timeout_seconds: 7200
   max_restarts: 50
   retry_delay_seconds: 5
+  keep_last_checkpoints: 5
 
 training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 200
-  rounds: 50
+  rounds: 30
   search_count: 50
-  num_determinizations: 5
+  num_determinizations: 1
   learning_rate: 0.0003
   batch_size: 64
   epochs_per_round: 2

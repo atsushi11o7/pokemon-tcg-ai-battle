@@ -1,11 +1,11 @@
 run:
-  name: mcts_generalist
-  output_dir: outputs/runs/mcts_generalist
+  name: mcts_depth10_hyp5
+  output_dir: outputs/runs/mcts_depth10_hyp5
 
 algorithm: mcts
 
 model:
-  initial_checkpoint: outputs/runs/ppo_generalist/checkpoints/final.pt
+  initial_checkpoint: outputs/runs/ppo_asymmetric_crustle_team3/checkpoints/final.pt
 
 data:
   sampling_snapshot: data/meta/derived/sampling_snapshot.json
@@ -22,7 +22,7 @@ training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 200
-  rounds: 50
+  rounds: 8
   search_count: 50
   num_determinizations: 5
   learning_rate: 0.0003

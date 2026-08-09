@@ -18,13 +18,16 @@
     "--env-file", "${localWorkspaceFolder}/.env"
   ],
   "mounts": [
-    "source=claude-config,target=/root/.claude,type=volume"
+    "source=claude-config,target=/root/.claude,type=volume",
+    "source=codex-config,target=/root/.codex,type=volume"
   ],
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/root/.claude",
+    "CODEX_HOME": "/root/.codex",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8"
   },
+  "shutdownAction": "none", 
   "customizations": {
     "vscode": {
       "extensions": [

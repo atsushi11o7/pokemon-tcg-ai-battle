@@ -37,6 +37,14 @@ class FixedEvaluationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple of 4"):
             build_fixed_matchups("generalist", [], [[1] * 60], 10, 0)
 
+    def test_asymmetric_plan_uses_fixed_deck_against_sampled_opponents(self) -> None:
+        fixed_deck = [9] * 60
+        opponent_deck = [2] * 60
+
+        matchups = build_fixed_matchups("asymmetric", fixed_deck, [opponent_deck], 8, 0)
+
+        self.assertEqual(matchups, [(fixed_deck, opponent_deck)] * 2)
+
 
 if __name__ == "__main__":
     unittest.main()

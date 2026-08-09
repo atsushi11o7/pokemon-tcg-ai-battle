@@ -9,17 +9,12 @@ from pathlib import Path
 
 import torch
 
-from ..common.model_config import (
-    D_FEEDFORWARD,
-    D_MODEL,
-    NUM_HEADS,
-    NUM_LAYERS_DECODER,
-    NUM_LAYERS_ENCODER,
-)
-from ..common.network import PolicyValueNet
+from ..common.network import PolicyValueNet, build_policy_value_net
 from .selfplay import Sample
 
-_STATE_VERSION = 1
+# v2でcheckpoint poolをmanifest埋め込みから外部ファイル参照へ変更した。
+# 旧versionのstateは読めないが、重みだけの後方互換再開にフォールバックする。
+_STATE_VERSION = 2
 
 
 def _state_path(checkpoint_dir: Path) -> Path:
@@ -28,6 +23,21 @@ def _state_path(checkpoint_dir: Path) -> Path:
 
 def _replay_path(checkpoint_dir: Path, mode: str, round_num: int) -> Path:
     return checkpoint_dir.parent / "replay" / f"{mode}_round{round_num}.pt"
+
+
+def _pool_path(checkpoint_dir: Path, mode: str, round_num: int) -> Path:
+    return checkpoint_dir.parent / "pool" / f"{mode}_round{round_num}.pt"
+
+
+def _prune(directory: Path, mode: str, retained: set[int]) -> None:
+    """`retained`に無いラウンドのファイルを削除する。"""
+    if not directory.exists():
+        return
+    pattern = re.compile(rf"{re.escape(mode)}_round(\d+)\.pt$")
+    for path in directory.glob(f"{mode}_round*.pt"):
+        match = pattern.match(path.name)
+        if match and int(match.group(1)) not in retained:
+            path.unlink()
 
 
 def saved_training_state_round(checkpoint_dir: Path, mode: str) -> int | None:
@@ -51,10 +61,10 @@ def restore_training_state(
     mode: str,
     expected_round: int,
     replay_buffer_rounds: int,
-) -> tuple[deque[tuple[int, list[Sample]]], list[PolicyValueNet]]:
+) -> tuple[deque[tuple[int, list[Sample]]], list[tuple[int, PolicyValueNet]]]:
     """保存状態を復元する。不整合時は重みだけの後方互換再開として空を返す。"""
     replay_buffer: deque[tuple[int, list[Sample]]] = deque(maxlen=replay_buffer_rounds)
-    checkpoint_pool: list[PolicyValueNet] = []
+    checkpoint_pool: list[tuple[int, PolicyValueNet]] = []
     path = _state_path(checkpoint_dir)
     if expected_round <= 0 or not path.exists():
         return replay_buffer, checkpoint_pool
@@ -76,17 +86,15 @@ def restore_training_state(
             )
             replay_buffer.append((int(round_num), samples))
 
-        for state_dict in state["checkpoint_pool"]:
-            network = PolicyValueNet(
-                D_MODEL,
-                NUM_HEADS,
-                D_FEEDFORWARD,
-                NUM_LAYERS_ENCODER,
-                NUM_LAYERS_DECODER,
+        for round_num in state["pool_rounds"]:
+            state_dict = torch.load(
+                _pool_path(checkpoint_dir, mode, int(round_num)),
+                map_location="cpu",
+                weights_only=True,
             )
-            network.load_state_dict(state_dict, assign=True)
-            network.eval()
-            checkpoint_pool.append(network)
+            checkpoint_pool.append(
+                (int(round_num), build_policy_value_net(state_dict, assign=True))
+            )
     except Exception as exc:
         print(f"warning: MCTS replay/pool restore failed; continuing empty: {exc}")
         replay_buffer.clear()
@@ -105,9 +113,15 @@ def save_training_state(
     mode: str,
     completed_round: int,
     replay_buffer: deque[tuple[int, list[Sample]]],
-    checkpoint_pool: list[PolicyValueNet],
+    checkpoint_pool: list[tuple[int, PolicyValueNet]],
 ) -> None:
-    """replayを分割保存し、manifest/poolをatomic replaceする。"""
+    """replayとpoolをラウンド単位のファイルへ分割保存し、manifestをatomic replaceする。
+
+    replayもpoolも「そのラウンドの内容は不変」なので、既にファイルがあれば書き直さない。
+    poolの重みは1体約107MBあり、毎ラウンド全部を書き直すとpool 3体で300MB超の
+    無駄書き込みがクラッシュ復旧のホットパスに乗ってしまうため、manifestには
+    ラウンド番号だけを載せる。
+    """
     replay_dir = checkpoint_dir.parent / "replay"
     replay_dir.mkdir(parents=True, exist_ok=True)
     replay_rounds: list[int] = []
@@ -117,21 +131,26 @@ def save_training_state(
         if not replay_path.exists():
             torch.save(samples, replay_path)
 
+    pool_dir = checkpoint_dir.parent / "pool"
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    pool_rounds: list[int] = []
+    for round_num, network in checkpoint_pool:
+        pool_rounds.append(round_num)
+        pool_path = _pool_path(checkpoint_dir, mode, round_num)
+        if not pool_path.exists():
+            torch.save(network.state_dict(), pool_path)
+
     state = {
         "version": _STATE_VERSION,
         "selfplay_mode": mode,
         "completed_round": completed_round,
         "replay_rounds": replay_rounds,
-        "checkpoint_pool": [network.state_dict() for network in checkpoint_pool],
+        "pool_rounds": pool_rounds,
     }
     path = _state_path(checkpoint_dir)
     temporary_path = path.with_suffix(".tmp")
     torch.save(state, temporary_path)
     os.replace(temporary_path, path)
 
-    pattern = re.compile(rf"{re.escape(mode)}_round(\d+)\.pt$")
-    retained = set(replay_rounds)
-    for replay_path in replay_dir.glob(f"{mode}_round*.pt"):
-        match = pattern.match(replay_path.name)
-        if match and int(match.group(1)) not in retained:
-            replay_path.unlink()
+    _prune(replay_dir, mode, set(replay_rounds))
+    _prune(pool_dir, mode, set(pool_rounds))

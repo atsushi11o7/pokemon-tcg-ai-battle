@@ -11,8 +11,6 @@ sys.path.insert(0, str(SAMPLE_SUBMISSION_DIR))
 
 from cg.api import CardType, all_card_data  # noqa: E402
 
-from ..common.opponent_pool import load_opponent_deck_pool  # noqa: E402
-
 _pokemon_card_ids: set[int] | None = None
 
 
@@ -80,13 +78,20 @@ def _choose_compatible_deck(
 def determinize_for_search(
     obs,
     own_deck: list[int],
-    opponent_deck_pool: list[list[int]] | None = None,
+    opponent_deck_pool: list[list[int]],
 ) -> tuple[dict, list[list[int]]]:
     """探索側から見える情報だけで隠れ状態を作る。
+
+    `opponent_deck_pool`は必須。以前はNoneならプロセスグローバルなキャッシュから
+    遅延ロードしていたが、spawnワーカーは親の`configure_sampling_snapshot`を引き継がない
+    ため、そのフォールバックは「設定と違うsnapshotを黙って読む」経路になっていた。
+    呼び出し側が必ず明示的に渡す形にして、取り違えを型と例外で防ぐ。
 
     Returns:
         (search_beginへ渡すkwargs, playerIndex順の仮定フルデッキ)。
     """
+    if not opponent_deck_pool:
+        raise ValueError("opponent_deck_pool is required for determinization")
     state = obs.current
     your_index = state.yourIndex
     opponent_index = 1 - your_index
@@ -107,7 +112,7 @@ def determinize_for_search(
     hidden_own_prizes = iter(own_remaining[me.deckCount : own_hidden_count])
     your_prize = [card.id if card is not None else next(hidden_own_prizes) for card in me.prize]
 
-    candidates = opponent_deck_pool or load_opponent_deck_pool()
+    candidates = opponent_deck_pool
     opponent_known = visible_cards(state, opponent_index)
     face_down_active = bool(opponent.active and opponent.active[0] is None)
     opponent_unknown_prizes = sum(card is None for card in opponent.prize)
@@ -150,9 +155,3 @@ def determinize_for_search(
         "opponent_active": opponent_active,
     }
     return kwargs, assumed_decks
-
-
-def search_begin_kwargs(obs, our_deck: list[int]) -> dict:
-    """後方互換用。本番探索向けの隠れ情報kwargsだけを返す。"""
-    kwargs, _assumed_decks = determinize_for_search(obs, our_deck)
-    return kwargs

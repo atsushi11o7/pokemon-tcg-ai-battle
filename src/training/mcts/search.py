@@ -192,9 +192,19 @@ def _select_child(node: "Node", your_index: int) -> "Child":
         if node.state.observation.current.yourIndex != your_index:
             avg_value = -avg_value
         score = avg_value + c * child.prob / (1 + visit)
+        # NaNは比較が常にFalseになるため、素通しすると`best_child`がNoneのまま返り、
+        # 呼び出し側が原因の分からないAttributeErrorで落ちる。NaNの子は選ばないだけに留め、
+        # 全部がNaN(=ネットワーク出力が壊れている)のときだけ下で明示的に落とす。
+        if math.isnan(score):
+            continue
         if score > best_score:
             best_score = score
             best_child = child
+    if best_child is None:
+        raise RuntimeError(
+            "all PUCT scores are NaN; the policy network likely produced NaN priors "
+            f"(children={len(node.children)})"
+        )
     return best_child
 
 

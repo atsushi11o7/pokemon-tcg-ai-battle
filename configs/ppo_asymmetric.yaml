@@ -1,11 +1,11 @@
 run:
-  name: ppo_generalist
-  output_dir: outputs/runs/ppo_generalist
+  name: ppo_asymmetric_crustle_team3
+  output_dir: outputs/runs/ppo_asymmetric_crustle_team3
 
 algorithm: ppo
 
 model:
-  initial_checkpoint: outputs/saved_checkpoints/generalist_round250.pt
+  initial_checkpoint: outputs/runs/ppo_generalist/checkpoints/final.pt
 
 data:
   sampling_snapshot: data/meta/derived/sampling_snapshot.json
@@ -19,11 +19,11 @@ runtime:
   retry_delay_seconds: 5
 
 training:
-  selfplay_mode: generalist
-  deck_path: null
+  selfplay_mode: asymmetric
+  deck_path: decks/candidates/crustle_team3.csv
   games_per_round: 500
-  rounds: 200
-  learning_rate: 0.0001
+  rounds: 50
+  learning_rate: 0.00003
   minibatch_size: 64
   epochs_per_round: 4
   target_kl: 0.02

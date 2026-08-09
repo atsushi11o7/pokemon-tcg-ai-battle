@@ -106,6 +106,7 @@ def play_ppo_game(
     our_deck: list[int],
     opponent_deck_pool: list[list[int]] | None,
     mode: SelfplayMode = "asymmetric",
+    fixed_deck_seat: int | None = None,
 ) -> tuple[list[list[PPOSample]], int]:
     """1試合分の自己対戦を行い、PPO学習用のサンプルを集める。
 
@@ -122,16 +123,19 @@ def play_ppo_game(
             自己対戦のデッキ選択には使われない。
         opponent_deck_pool: 対戦相手として選ぶ、実在デッキ(60枚)のリスト。
             `mode="mirror"`のときは使われないので`None`でよい。
-        mode: "asymmetric"(相手デッキランダム・自分側のみ学習)、
+        mode: "asymmetric"(固定デッキ対ランダムデッキ・両サイド学習)、
             "mirror"(両者同デッキ・両サイド学習)、
             "generalist"(両者とも実在デッキプールから独立ランダム・両サイド学習)。
+        fixed_deck_seat: asymmetricで固定デッキを置く座席。trainerから0/1を交互に渡す。
 
     Returns:
         tuple[list[list[PPOSample]], int]: (`[player0のPPOSampleのリスト,
-            player1のPPOSampleのリスト]`。学習サンプルを集めなかった側は空リスト。
+            player1のPPOSampleのリスト]`。全モードで両座席分を収集する。
             rewardまで埋め済み, `state.result`(0/1が勝者のplayerIndex、2は引き分け))。
     """
-    decks, collect_seats = pick_decks_and_collect_seats(mode, our_deck, opponent_deck_pool)
+    decks, collect_seats = pick_decks_and_collect_seats(
+        mode, our_deck, opponent_deck_pool, fixed_deck_seat
+    )
 
     obs_dict, start_data = battle_start(decks[0], decks[1])
     try:
@@ -183,3 +187,30 @@ def compute_gae(samples: list[PPOSample], gamma: float, lam: float) -> None:
         last_advantage = delta + gamma * lam * last_advantage
         samples[t].advantage = last_advantage
         samples[t].return_ = last_advantage + samples[t].value
+
+
+def make_ppo_eval_agent(network, our_deck: list[int]):
+    """`network`で、固定matchup評価用のagent()関数を作る(貪欲方策)。
+
+    探索を行わないPPOでは、評価時は方策のargmaxを取る(学習時のサンプリングと違い、
+    最も自信のある行動を決定的に選ぶ)。module levelの関数なので、spawn workerへ
+    そのままpickleして渡せる。
+
+    Args:
+        network: 評価対象の`PolicyValueNet`(eval modeにしておくこと)。
+        our_deck: こちらの60枚のデッキリスト。
+
+    Returns:
+        Callable[[dict], list[int]]: 固定matchup評価に渡せるagent関数。
+    """
+
+    def agent(obs_dict: dict) -> list[int]:
+        obs = to_observation_class(obs_dict)
+        if obs.select is None:
+            return our_deck
+
+        actions, scores, _value, _encoder_sv, _decoder_sv = evaluate_policy(network, obs, our_deck)
+        best_index = int(torch.argmax(scores).item())
+        return actions[best_index]
+
+    return agent
