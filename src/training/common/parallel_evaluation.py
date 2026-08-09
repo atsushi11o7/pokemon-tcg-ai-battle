@@ -16,9 +16,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 
+from . import model_config  # noqa: E402
 from .network import PolicyValueNet, build_policy_value_net  # noqa: E402
 from .opponent_pool import configure_sampling_snapshot, seed_opponent_deck_pool_cache  # noqa: E402
 from .parallel_games import run_parallel_games  # noqa: E402
+from .sparse_features import configure_feature_layout  # noqa: E402
 from .training_utils import seed_game  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "src" / "evaluation"))
@@ -81,6 +83,7 @@ class _EvaluationWorkerContext:
     agent_factory: AgentFactory
     opponent_deck_pool: list[list[int]]
     sampling_snapshot: Path
+    feature_layout: str
     games: list[EvaluationGame]
 
 
@@ -100,6 +103,7 @@ def _init_evaluation_worker(
     import torch
 
     torch.set_num_threads(1)
+    configure_feature_layout(context.feature_layout)
     configure_sampling_snapshot(context.sampling_snapshot)
     seed_opponent_deck_pool_cache(context.opponent_deck_pool)
     _worker_candidate = build_policy_value_net(candidate_state_dict, assign=True)
@@ -165,6 +169,7 @@ def evaluate_networks_parallel(
         agent_factory=agent_factory,
         opponent_deck_pool=opponent_deck_pool,
         sampling_snapshot=sampling_snapshot,
+        feature_layout=model_config.FEATURE_LAYOUT,
         games=games,
     )
 

@@ -2,6 +2,7 @@
 埋め込む特徴量エンコーディング。盤面(エンコーダ)には自分の60枚のデッキの中身も含める。
 """
 
+import bisect
 import sys
 from collections import Counter
 from pathlib import Path
@@ -94,20 +95,16 @@ def energy_type_count() -> int:
     return _energy_type_count
 
 
-def _energy_type_counts(cards: "list[Card] | None") -> dict[int, int]:
-    """エネルギーカードのリストから、タイプ別の枚数を集計する。
+def energy_unit_counts(energies: "list[EnergyType] | None") -> dict[int, int]:
+    """付与済みエネルギーを、タイプ別の個数に集計する。
 
-    Args:
-        cards: エネルギーカードのリスト(`poke.energyCards`等)。
-
-    Returns:
-        dict[int, int]: `EnergyType`の値をキーにした枚数。
+    `Pokemon.energies`はカード枚数ではなく実際のエネルギー個数の並びなので、
+    1枚で複数個を供給する特殊エネルギーも正しく数えられる。
     """
     counts: dict[int, int] = {}
-    if cards is not None:
-        for card in cards:
-            energy_type = int(card_table()[card.id].energyType)
-            counts[energy_type] = counts.get(energy_type, 0) + 1
+    for energy_type in energies or []:
+        key = int(energy_type)
+        counts[key] = counts.get(key, 0) + 1
     return counts
 
 
@@ -293,9 +290,16 @@ def _decoder_context_role_offset() -> int:
 # 生のスカラーと併用する形で離散化した表現も与える。
 HP_RATIO_BUCKETS = 10
 
-# ターン数のバケット数。`turn / 10`は上限が無く、30ターン目には3.0という
-# 他の特徴と桁の違う値が入る。序盤/中盤/終盤の区別は離散表現の方が扱いやすい。
-TURN_BUCKETS = 8
+# ターン数のバケット境界。`state.turn`は半ターン単位で進むため、等間隔で切ると
+# 4巡目以降がすべて最終バケットに入って定数と変わらなくなる(実測で83.5%が最終箱)。
+# 序盤を細かく、終盤を粗く見る非線形な区切りにする。
+TURN_BUCKET_EDGES = (1, 2, 3, 4, 6, 8, 11, 15, 21, 30)
+TURN_BUCKETS = len(TURN_BUCKET_EDGES) + 1
+
+
+def _turn_bucket(turn: int) -> int:
+    """半ターン単位の`state.turn`を非線形なバケットへ量子化する。"""
+    return bisect.bisect_right(TURN_BUCKET_EDGES, turn)
 
 
 def _hp_ratio_bucket(ratio: float) -> int:
@@ -311,8 +315,10 @@ def _pokemon_extra_size() -> int:
     `add_pokemon`の書き込みと1対1で対応している必要がある。ずれるとブロック境界が
     重なって静かに壊れるため、`tests/test_feature_layout.py`で実測値と突き合わせている。
     """
-    scalars = 9  # ex, megaEx, にげるコスト, 最大HP, 残りHP比, 進化段階3種, 逃走可否
-    return scalars + 2 * energy_type_count() + HP_RATIO_BUCKETS + 2 + 1
+    # ex, megaEx, にげるコスト, 最大HP, 残りHP比, 進化段階3種, 逃走可否,
+    # このターン出たばかりか, 進化元の枚数, 技の最大打点
+    scalars = 12
+    return scalars + 2 * energy_type_count() + HP_RATIO_BUCKETS + 2
 
 
 def encoder_size() -> int:
@@ -324,8 +330,9 @@ def encoder_size() -> int:
     Returns:
         int: エンコーダ側の疎ベクトルの総次元数。
     """
-    # 43 = プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠
-    non_card = 43 + TURN_BUCKETS + 1 + 4 * _pokemon_extra_size()
+    # プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠 = 43
+    # ターン資源フラグ4 + turnActionCount 1 + 被KO判定1 + ターンのバケット
+    non_card = 43 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
     if _shared():
         return ENCODER_CARD_BLOCKS * card_count() + non_card
     return non_card + 17 * card_count()
@@ -551,7 +558,9 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
 
         # 現在HPの絶対値だけでは、同じ0.3でもHP70のポケモンが満タンなのか
         # HP340のポケモンが瀕死なのか区別できない。最大HPと残り比率を明示的に渡す。
-        max_hp = float(card.hp or 0)
+        # 最大HPは道具や効果で印刷値から変動するため、盤面側の`maxHp`を使う
+        # (`CardData.hp`は印刷値。実測で約20%のポケモンが両者不一致だった)。
+        max_hp = float(poke.maxHp or card.hp or 0)
         sv.add_single(max_hp / 400)
         ratio = (poke.hp / max_hp) if max_hp > 0 else 0.0
         sv.add_single(ratio)
@@ -567,9 +576,15 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         sv.add_single(card.aceSpec)
         sv.add_single(card.tera)
 
-        # 今すぐ逃げられるか
-        energy_count = len(poke.energyCards) if poke.energyCards else 0
-        sv.add_single(1.0 if energy_count >= card.retreatCost else 0.0)
+        # にげるコストを払えるか。コストはエネルギー「個数」で払うため、カード枚数では
+        # なく`energies`(タイプの並び)の長さで数える(特殊エネルギーは1枚で複数個)。
+        energy_units = len(poke.energies) if poke.energies else 0
+        sv.add_single(1.0 if energy_units >= card.retreatCost else 0.0)
+
+        # このターン場に出たばかりか。進化や特性の使用可否に関わるルール上の状態。
+        sv.add_single(poke.appearThisTurn)
+        # 何段進化しているか(場に積まれた進化元の枚数)。
+        sv.add_single(len(poke.preEvolution) / 2 if poke.preEvolution else 0.0)
 
         # このポケモンの技の最大打点。相手側の枠なら脅威度の指標になる。
         sv.add_single(_max_attack_damage(poke.id) / 400)
@@ -586,7 +601,7 @@ def add_player(sv: SparseVector, ps: PlayerState) -> None:
     sv.add_single(ps.deckCount / 60)
     sv.add_single(len(ps.discard) / 60)
     sv.add_single(ps.handCount / 8)
-    sv.add_single(len(ps.bench) / 5)
+    sv.add_single(len(ps.bench) / max(1, ps.benchMax))
     sv.add(len(ps.prize), 1)
     sv.add_pos(7)
 
@@ -663,8 +678,15 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     sv.add_single(state.turn / 10)
     sv.add_single(state.firstPlayer == your_index)
     # ターン数の離散表現(生のスカラーと併用)
-    sv.add(min(TURN_BUCKETS - 1, max(0, state.turn)), 1)
+    sv.add(_turn_bucket(state.turn), 1)
     sv.add_pos(TURN_BUCKETS)
+    # このターンにまだ何ができるか。サポート・エネルギー付与・にげるは1ターン1回で、
+    # 手順(どの順に使うか)を決める上で欠かせないが、これまで渡していなかった。
+    sv.add_single(state.supporterPlayed)
+    sv.add_single(state.stadiumPlayed)
+    sv.add_single(state.energyAttached)
+    sv.add_single(state.retreated)
+    sv.add_single(min(state.turnActionCount, 20) / 20)
     # 相手アクティブの最大打点で、自分のアクティブが落ちるか。
     # 逃げる/入れ替えるの判断に直結するが、両者の情報は別トークンに散っている。
     me_state = state.players[your_index]
@@ -736,14 +758,29 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
         context: 選択の`SelectContext`。
         card_id: 参照しているカードのID。
     """
+    n_context = int(SelectContext.RECOVER_SPECIAL_CONDITION) + 1
+    if int(context) >= n_context:
+        # エンジン更新でSelectContextが増えると、共有レイアウトでは語彙の外へ書いてしまう。
+        # 黙って壊れるより、原因の分かる例外にする。
+        raise ValueError(f"SelectContext {int(context)} is outside the known range")
     if _shared():
         # contextは1つのselect内で常に同一なので、カード表は1つで足りる。
-        # どのcontextだったかは別の役割インデックスで示す。
+        # どのcontextだったかを示す役割インデックスは、行動トークンごとに1回だけ
+        # `_mark_context`が立てる(ここで立てるとカード枚数ぶん重複加算されてしまう)。
         sv.add(_decoder_card_offset() + DECODER_MAIN_FEATURE * card_count() + card_id, 1)
-        sv.add(_decoder_context_role_offset() + int(context), 1)
         return
     offset = _decoder_card_offset() + (DECODER_MAIN_FEATURE + int(context)) * card_count()
     sv.add(offset + card_id, 1)
+
+
+def _mark_context(sv: SparseVector, context) -> None:
+    """共有レイアウトで、この行動トークンのSelectContextを1回だけ記録する。
+
+    `EmbeddingBag`はsumなので、カード参照のたびに立てると「その行動が何枚選ぶか」が
+    contextの埋め込みに掛かった形で混入し、`per_role`と情報が非等価になる。
+    """
+    if _shared():
+        sv.add(_decoder_context_role_offset() + int(context), 1)
 
 
 def decoder_card(sv: SparseVector, context, card) -> None:
@@ -779,6 +816,7 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
 
     for action in actions:
         sv.word_start()
+        _mark_context(sv, context)
 
         if len(action) == 0:
             sv.add(0, 1)
@@ -823,9 +861,7 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 required_offset = numeric_offset + _decoder_attack_required_energy_offset()
                 _add_energy_counts(sv, required_offset, Counter(int(e) for e in attack.energies))
                 attached_offset = numeric_offset + _decoder_attack_attached_energy_offset()
-                _add_energy_counts(
-                    sv, attached_offset, _energy_type_counts(ps.active[0].energyCards)
-                )
+                _add_energy_counts(sv, attached_offset, energy_unit_counts(ps.active[0].energies))
             elif o.type == OptionType.PLAY:
                 decoder_main(sv, 0, ps.hand[o.index])
             elif o.type == OptionType.ATTACH:
@@ -847,7 +883,7 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                     numeric_offset = _decoder_switch_numeric_offset()
                     sv.add(numeric_offset + _DECODER_SWITCH_HP_INDEX, target.hp / 400)
                     energy_offset = numeric_offset + _decoder_switch_energy_offset()
-                    _add_energy_counts(sv, energy_offset, _energy_type_counts(target.energyCards))
+                    _add_energy_counts(sv, energy_offset, energy_unit_counts(target.energies))
             elif o.type == OptionType.TOOL_CARD:
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.tools[o.toolIndex])

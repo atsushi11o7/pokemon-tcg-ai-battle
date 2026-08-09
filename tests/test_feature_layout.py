@@ -1,3 +1,4 @@
+import random
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,39 +91,95 @@ class FeatureLayoutTest(unittest.TestCase):
 class DeclaredSizeMatchesWritesTest(unittest.TestCase):
     """宣言サイズと実際の書き込み量が一致すること。
 
-    `encoder_size()`は`get_encoder_input`の書き込みと手作業で辻褄を合わせている。
-    ずれるとブロック境界が重なり、無関係な特徴が同じ埋め込み行を共有して静かに壊れる。
-    実盤面で`SparseVector.pos`と突き合わせて、その手作業を検証する。
+    `encoder_size()`は`get_encoder_input`の書き込みと手作業で辻褄を合わせており、
+    ずれるとブロック境界が重なって無関係な特徴が同じ埋め込み行を共有し、静かに壊れる。
+
+    `battle_start()`直後はコイントス選択で場が空なので、`add_pokemon`の非空枝も
+    `effective_damage`も一度も実行されない。実際に手を進めて、場にポケモンが
+    並んだ局面で検証する。
     """
 
-    def _observation(self):
+    def _mid_game_observations(self, count: int = 12):
         from cg.api import to_observation_class
-        from cg.game import battle_finish, battle_start
+        from cg.game import battle_finish, battle_select, battle_start
 
         from training.common.deck import parse_deck_csv
 
         deck = parse_deck_csv(ROOT / "decks" / "candidates" / "crustle_meta.csv")
+        random.seed(0)
+        collected = []
         obs_dict, _start = battle_start(deck, deck)
         try:
-            return to_observation_class(obs_dict), deck
+            obs = to_observation_class(obs_dict)
+            steps = 0
+            while obs.current.result < 0 and len(collected) < count and steps < 400:
+                state = obs.current
+                if any(p.active and p.active[0] is not None for p in state.players):
+                    collected.append(obs_dict)
+                select = obs.select
+                take = min(max(select.minCount, 1), len(select.option))
+                obs_dict = battle_select(list(range(take)))
+                obs = to_observation_class(obs_dict)
+                steps += 1
         finally:
             battle_finish()
+        return collected, deck
 
     def test_encoder_size_matches_written_positions(self) -> None:
+        from cg.api import to_observation_class
+
         original = sf.feature_layout()
-        obs, deck = self._observation()
+        observations, deck = self._mid_game_observations()
+        self.assertGreater(len(observations), 0, "場にポケモンが並んだ局面を取得できなかった")
         try:
             for layout in ("per_role", "shared_card"):
                 sf.configure_feature_layout(layout)
-                written = sf.get_encoder_input(obs, deck)
-                self.assertEqual(
-                    written.pos,
-                    sf.encoder_size(),
-                    f"{layout}: encoder_size()が実際の書き込み量と一致しない",
-                )
-                self.assertLess(max(written.index), sf.encoder_size())
+                for obs_dict in observations:
+                    obs = to_observation_class(obs_dict)
+                    written = sf.get_encoder_input(obs, deck)
+                    self.assertEqual(
+                        written.pos,
+                        sf.encoder_size(),
+                        f"{layout}: encoder_size()が実際の書き込み量と一致しない",
+                    )
+                    self.assertLess(max(written.index), sf.encoder_size())
+                    self.assertGreaterEqual(min(written.index), 0)
         finally:
             sf.configure_feature_layout(original)
+
+    def test_decoder_indices_stay_in_range(self) -> None:
+        from cg.api import to_observation_class
+
+        original = sf.feature_layout()
+        observations, _deck = self._mid_game_observations()
+        try:
+            for layout in ("per_role", "shared_card"):
+                sf.configure_feature_layout(layout)
+                for obs_dict in observations:
+                    obs = to_observation_class(obs_dict)
+                    select = obs.select
+                    actions = [[i] for i in range(len(select.option))] or [[]]
+                    written = sf.get_decoder_input(obs, actions)
+                    if not written.index:
+                        continue
+                    self.assertLess(max(written.index), sf.decoder_size(), layout)
+                    self.assertGreaterEqual(min(written.index), 0)
+        finally:
+            sf.configure_feature_layout(original)
+
+    def test_non_empty_pokemon_branch_is_actually_exercised(self) -> None:
+        """上の2テストが場の空な局面だけを見ていないことを保証する。"""
+        from cg.api import to_observation_class
+
+        observations, _deck = self._mid_game_observations()
+        occupied = 0
+        for obs_dict in observations:
+            state = to_observation_class(obs_dict).current
+            for player in state.players:
+                occupied += sum(
+                    1 for p in (list(player.active or []) + list(player.bench or [])) if p
+                )
+        self.assertGreater(occupied, 0)
 
 
 if __name__ == "__main__":
