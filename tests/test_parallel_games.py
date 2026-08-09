@@ -1,7 +1,9 @@
 import os
 import signal
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from training.common.parallel_games import run_parallel_games
 
@@ -95,3 +97,30 @@ class WorkerStartupFailureTest(unittest.TestCase):
             )
         self.assertIn("before receiving a game", str(caught.exception))
         self.assertLess(time.monotonic() - started, 30)
+
+
+class CompletionRateGateTest(unittest.TestCase):
+    """大半が失敗したラウンドで学習を進めないこと。"""
+
+    def test_low_completion_rate_raises(self) -> None:
+        from training.common.selfplay_round import run_selfplay_round
+
+        with self.assertRaises(RuntimeError) as caught:
+            run_selfplay_round(
+                algorithm="test",
+                round_num=1,
+                mode="generalist",
+                num_games=10,
+                num_workers=2,
+                initializer=initialize,
+                initargs=(),
+                task=always_failing_task,
+                game_timeout_seconds=5,
+                round_timeout_seconds=60,
+                event_log_path=Path(tempfile.mkdtemp()) / "events.jsonl",
+            )
+        self.assertIn("refusing to train", str(caught.exception))
+
+
+def always_failing_task(game_index: int):
+    raise ValueError("boom")

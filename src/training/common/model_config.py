@@ -14,5 +14,8 @@ FEATURE_LAYOUT = "shared_card"
 D_MODEL = 128
 NUM_HEADS = 4
 D_FEEDFORWARD = 512
-NUM_LAYERS_ENCODER = 3
-NUM_LAYERS_DECODER = 3
+# 速度は制約になっていない(5+5でも1試合が持ち時間600秒の2%程度)。一方この重みは
+# 後続の学習の初期値にもなるため、容量不足だと層を増やした時点でチェックポイントが
+# 使えなくなり、ゼロからやり直しになる。足りない場合の損失の方が大きいので余裕を取る。
+NUM_LAYERS_ENCODER = 4
+NUM_LAYERS_DECODER = 4

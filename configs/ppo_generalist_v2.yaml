@@ -12,18 +12,21 @@ data:
 
 runtime:
   seed: 0
-  workers: 4
+  workers: 8
   game_timeout_seconds: 300
   round_timeout_seconds: 1800
   max_restarts: 50
   retry_delay_seconds: 5
+  # 後からround 50/100/150を比較できるよう多めに残す。
+  # 1ラウンドあたり重み16MiB + optimizer、全350ラウンドでも約17GiB(空き298GiB)。
+  keep_last_checkpoints: 350
 
 training:
   selfplay_mode: generalist
   deck_path: null
-  games_per_round: 500
-  rounds: 200
-  learning_rate: 0.0001
+  games_per_round: 300
+  rounds: 350
+  learning_rate: 0.0003
   minibatch_size: 64
   epochs_per_round: 4
   target_kl: 0.02
@@ -31,6 +34,6 @@ training:
   gae_lambda: 0.95
   clip_epsilon: 0.2
   value_loss_coef: 0.5
-  entropy_coef: 0.001
+  entropy_coef: 0.01
   max_grad_norm: 1.0
   eval_games_per_round: 12

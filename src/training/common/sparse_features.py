@@ -214,6 +214,24 @@ def _decoder_main_target_size() -> int:
     return 1 + energy_type_count()
 
 
+AREA_COUNT = 13  # AreaTypeの最大値+1
+
+
+def _decoder_scope_offset() -> int:
+    """選択対象が「誰の」「どの領域」かを表すブロックの先頭。
+
+    カードIDとcontextだけでは、同じカードを自分のベンチから選ぶのか相手のベンチから
+    選ぶのかを区別できない(実測でBENCH/自分102回・BENCH/相手92回)。所有者と領域を
+    渡さないと、異なる合法手が同一のトークンになり方策が学習できない。
+    """
+    return _decoder_main_target_offset() + _decoder_main_target_size()
+
+
+def _decoder_scope_size() -> int:
+    """自分か相手かの1次元 + 領域のone-hot。"""
+    return 1 + AREA_COUNT
+
+
 def _decoder_card_offset() -> int:
     """デコーダの疎ベクトルにおける、カード参照系特徴の先頭インデックス。
 
@@ -222,7 +240,7 @@ def _decoder_card_offset() -> int:
     Returns:
         int: それらのブロックの直後のインデックス。
     """
-    return _decoder_main_target_offset() + _decoder_main_target_size()
+    return _decoder_scope_offset() + _decoder_scope_size()
 
 
 # --- 特徴量レイアウト -------------------------------------------------------
@@ -357,7 +375,7 @@ def encoder_size() -> int:
     """
     # プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠 = 43
     # ターン資源フラグ4 + turnActionCount 1 + 被KO判定1 + ターンのバケット
-    non_card = 43 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
+    non_card = 44 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
     traits = attack_count() + skill_count()
     if _shared():
         # カード表4 + 技 + 特性は、いずれも枠をまたいで共有する
@@ -766,7 +784,11 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     # サーチ効果などで今まさに公開されているカード。選択肢の対象としては見えていたが、
     # 「どの候補の中から選ばされているか」という盤面情報としては渡っていなかった。
     sv.word_start()
-    add_cards(sv, state.looking, 1.0, CARD_ROLE_ZONE)
+    # `looking`は伏せ札の位置がNoneになる(`list[Card | None]`)。中身をそのまま
+    # 渡すと`.id`参照で落ちるため、公開分だけ書き、伏せ枚数は別に持たせる。
+    looking = state.looking or []
+    add_cards(sv, [c for c in looking if c is not None], 1.0, CARD_ROLE_ZONE)
+    sv.add_single(sum(1 for c in looking if c is None) / 8)
 
     sv.word_start()
     sv.add_single(1)
@@ -848,6 +870,15 @@ def decoder_target_state(sv: SparseVector, target) -> None:
     offset = _decoder_main_target_offset()
     sv.add(offset, target.hp / 400)
     _add_energy_counts(sv, offset + 1, energy_unit_counts(target.energies))
+
+
+def decoder_scope(sv: SparseVector, area, player_index: int, your_index: int) -> None:
+    """選択対象の所有者と領域を書き込む。"""
+    offset = _decoder_scope_offset()
+    sv.add(offset, 1.0 if player_index == your_index else -1.0)
+    area_index = int(area)
+    if 0 <= area_index < AREA_COUNT:
+        sv.add(offset + 1 + area_index, 1)
 
 
 def decoder_main(sv: SparseVector, feature_index: int, card) -> None:
@@ -982,10 +1013,10 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 decoder_main(sv, 2, target)
                 decoder_target_state(sv, target)
             elif o.type == OptionType.EVOLVE:
-                target = get_card(obs, o.area, o.index, your_index)
-                decoder_main(sv, 3, target)
-                decoder_target_state(sv, target)
-                decoder_main(sv, 4, get_card(obs, o.inPlayArea, o.inPlayIndex, your_index))
+                decoder_main(sv, 3, get_card(obs, o.area, o.index, your_index))
+                evolving = get_card(obs, o.inPlayArea, o.inPlayIndex, your_index)
+                decoder_main(sv, 4, evolving)
+                decoder_target_state(sv, evolving)
             elif o.type == OptionType.ABILITY:
                 target = get_card(obs, o.area, o.index, your_index)
                 decoder_main(sv, 5, target)
@@ -998,15 +1029,19 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
             elif o.type == OptionType.CARD:
                 target = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, target)
+                decoder_scope(sv, o.area, o.playerIndex, your_index)
+                decoder_target_state(sv, target)
                 if context == SelectContext.SWITCH and isinstance(target, Pokemon):
                     numeric_offset = _decoder_switch_numeric_offset()
                     sv.add(numeric_offset + _DECODER_SWITCH_HP_INDEX, target.hp / 400)
                     energy_offset = numeric_offset + _decoder_switch_energy_offset()
                     _add_energy_counts(sv, energy_offset, energy_unit_counts(target.energies))
             elif o.type == OptionType.TOOL_CARD:
+                decoder_scope(sv, o.area, o.playerIndex, your_index)
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.tools[o.toolIndex])
             elif o.type in (OptionType.ENERGY_CARD, OptionType.ENERGY):
+                decoder_scope(sv, o.area, o.playerIndex, your_index)
                 card = get_card(obs, o.area, o.index, o.playerIndex)
                 decoder_card(sv, context, card.energyCards[o.energyIndex])
             elif o.type == OptionType.SKILL:

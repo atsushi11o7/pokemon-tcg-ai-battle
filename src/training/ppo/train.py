@@ -240,6 +240,11 @@ def _ppo_loss(
     return loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction
 
 
+# 何ミニバッチごとにKLを確認するか。細かすぎるとノイズで止まり、粗すぎると
+# 上限を超えてから止まることになる。
+KL_CHECK_WINDOW = 16
+
+
 def train_one_round(
     network: PolicyValueNet,
     optimizer: torch.optim.Optimizer,
@@ -281,13 +286,20 @@ def train_one_round(
 
     network.train()
     epochs = settings.epochs_per_round
+    # KLはミニバッチ単位で見る。エポック末までまとめて見ていると、1ラウンド数万
+    # サンプルでは1エポックで数百〜千回のstepが走り切ってしまい、上限を大きく
+    # 超えてからしか止められない。
+    stopped = False
     for epoch in range(epochs):
+        if stopped:
+            break
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
         total_approx_kl = 0.0
         total_clip_fraction = 0.0
         n = 0
+        recent_kl: list[float] = []
         for batch in loader:
             loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction = _ppo_loss(
                 network, batch, device, settings
@@ -298,23 +310,33 @@ def train_one_round(
             optimizer.step()
 
             batch_size = batch[6].shape[0]  # mask
+            recent_kl.append(approx_kl.item())
+            if len(recent_kl) >= KL_CHECK_WINDOW:
+                window_kl = sum(recent_kl) / len(recent_kl)
+                recent_kl.clear()
+                if window_kl > settings.target_kl:
+                    print(
+                        f"  early stopping PPO update mid-epoch: "
+                        f"approx_kl={window_kl:.4f} > {settings.target_kl:.4f}"
+                    )
+                    stopped = True
             total_policy_loss += policy_loss.item() * batch_size
             total_value_loss += value_loss.item() * batch_size
             total_entropy += entropy.item() * batch_size
             total_approx_kl += approx_kl.item() * batch_size
             total_clip_fraction += clip_fraction.item() * batch_size
             n += batch_size
+            if stopped:
+                break
 
+        if n == 0:
+            break
         print(
             f"  epoch {epoch + 1}/{epochs}  policy_loss={total_policy_loss / n:.4f}  "
             f"approx_kl={total_approx_kl / n:.4f}  clip_fraction={total_clip_fraction / n:.4f}  "
             f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}"
         )
-        mean_kl = total_approx_kl / n
-        if mean_kl > settings.target_kl:
-            print(
-                f"  early stopping PPO update: approx_kl={mean_kl:.4f} > {settings.target_kl:.4f}"
-            )
+        if total_approx_kl / n > settings.target_kl:
             break
     network.to("cpu")
     network.eval()
