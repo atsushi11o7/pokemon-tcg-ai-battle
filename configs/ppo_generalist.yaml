@@ -17,9 +17,7 @@ runtime:
   round_timeout_seconds: 1800
   max_restarts: 50
   retry_delay_seconds: 5
-  # 後からround 50/100/150を比較できるよう多めに残す。
-  # 1ラウンドあたり重み16MiB + optimizer、全350ラウンドでも約17GiB(空き298GiB)。
-  keep_last_checkpoints: 350
+  keep_last_checkpoints: 10
 
 training:
   selfplay_mode: generalist
