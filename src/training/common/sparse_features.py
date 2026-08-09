@@ -259,7 +259,7 @@ def _decoder_card_offset() -> int:
 
 
 # --- 特徴量レイアウト -------------------------------------------------------
-# "per_role"    : カードIDのone-hotを出現箇所ごとに独立したブロックとして持つ(17ブロック)。
+# "per_role"    : カードIDのone-hotを出現箇所ごとに独立したブロックとして持つ。
 #                 同じカードでも手札とトラッシュで完全に別のベクトルになる。
 # "shared_card" : 出現箇所をまたいでカード表を共有し、パラメータを減らす。
 #
@@ -945,14 +945,10 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
         # エンジン更新でSelectContextが増えると、共有レイアウトでは語彙の外へ書いてしまう。
         # 黙って壊れるより、原因の分かる例外にする。
         raise ValueError(f"SelectContext {int(context)} is outside the known range")
-    if _shared():
-        # contextは1つのselect内で常に同一なので、カード表は1つで足りる。
-        # どのcontextだったかを示す役割インデックスは、行動トークンごとに1回だけ
-        # `_mark_context`が立てる(ここで立てるとカード枚数ぶん重複加算されてしまう)。
-        sv.add(_decoder_card_offset() + DECODER_MAIN_FEATURE * card_count() + card_id, 1)
-        return
-    offset = _decoder_card_offset() + (DECODER_MAIN_FEATURE + int(context)) * card_count()
-    sv.add(offset + card_id, 1)
+    # 共有レイアウトはcontextごとにカード表を分けない(どのcontextかは`_mark_context`が
+    # 行動トークンごとに1回だけ記録する)。`per_role`はcontextごとに独立した表を持つ。
+    block = DECODER_MAIN_FEATURE if _shared() else DECODER_MAIN_FEATURE + int(context)
+    sv.add(_decoder_card_offset() + block * card_count() + card_id, 1)
 
 
 def _mark_context(sv: SparseVector, context) -> None:
