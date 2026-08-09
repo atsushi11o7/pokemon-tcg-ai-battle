@@ -315,9 +315,9 @@ def _pokemon_extra_size() -> int:
     `add_pokemon`の書き込みと1対1で対応している必要がある。ずれるとブロック境界が
     重なって静かに壊れるため、`tests/test_feature_layout.py`で実測値と突き合わせている。
     """
-    # ex, megaEx, にげるコスト, 最大HP, 残りHP比, 進化段階3種, 逃走可否,
-    # このターン出たばかりか, 進化元の枚数, 技の最大打点
-    scalars = 12
+    # ex, megaEx, にげるコスト, 最大HP, 印刷HP, HP強化量, 残りHP比, 進化段階3種,
+    # 逃走可否, このターン出たばかりか, 進化元の枚数, 技の最大打点
+    scalars = 14
     return scalars + 2 * energy_type_count() + HP_RATIO_BUCKETS + 2
 
 
@@ -558,10 +558,15 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
 
         # 現在HPの絶対値だけでは、同じ0.3でもHP70のポケモンが満タンなのか
         # HP340のポケモンが瀕死なのか区別できない。最大HPと残り比率を明示的に渡す。
-        # 最大HPは道具や効果で印刷値から変動するため、盤面側の`maxHp`を使う
-        # (`CardData.hp`は印刷値。実測で約20%のポケモンが両者不一致だった)。
-        max_hp = float(poke.maxHp or card.hp or 0)
+        # 最大HPは道具や効果で印刷値から変動するため、KO判定には盤面側の`maxHp`を使う
+        # (実測で約20%のポケモンが印刷値と不一致)。印刷値も併せて渡す。カードの静的属性は
+        # 出現回数の少ないカードでも他カードと共有された統計として効き、両者の差は
+        # 「HP強化がかかっている」という盤面の状態そのものを表す。
+        printed_hp = float(card.hp or 0)
+        max_hp = float(poke.maxHp or printed_hp)
         sv.add_single(max_hp / 400)
+        sv.add_single(printed_hp / 400)
+        sv.add_single((max_hp - printed_hp) / 400)
         ratio = (poke.hp / max_hp) if max_hp > 0 else 0.0
         sv.add_single(ratio)
         sv.add(_hp_ratio_bucket(ratio), 1)

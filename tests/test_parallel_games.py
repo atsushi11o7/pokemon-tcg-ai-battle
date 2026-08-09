@@ -61,3 +61,37 @@ class ParallelGamesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def failing_initializer() -> None:
+    raise RuntimeError("initializer always fails")
+
+
+def unused_task(game_index: int) -> int:
+    return game_index
+
+
+class WorkerStartupFailureTest(unittest.TestCase):
+    """初期化が必ず失敗する状況で、ワーカーを無限に作り直さないこと。
+
+    以前はラウンド上限まで再生成し続け、8ワーカー・上限2時間の設定では
+    2時間CPUを焼いたうえで0サンプルを返していた(終了コードは0なので
+    CLIの再起動も働かない)。
+    """
+
+    def test_gives_up_instead_of_respawning_forever(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError) as caught:
+            run_parallel_games(
+                num_games=50,
+                num_workers=2,
+                initializer=failing_initializer,
+                initargs=(),
+                task=unused_task,
+                game_timeout_seconds=5,
+                round_timeout_seconds=60,
+                on_result=lambda index, result: None,
+                on_failure=lambda index, reason: None,
+            )
+        self.assertIn("before receiving a game", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 30)

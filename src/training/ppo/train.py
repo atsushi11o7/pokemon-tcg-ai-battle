@@ -110,6 +110,7 @@ class PpoSettings:
             output_dir=config.output_dir,
             event_log_path=config.worker_event_log_path,
             sampling_snapshot=config.sampling_snapshot,
+            feature_layout=model_config.FEATURE_LAYOUT,
             selfplay_mode=config.selfplay_mode,
             games_per_round=config.games_per_round,
             n_rounds=config.n_rounds,
@@ -334,6 +335,7 @@ class _SelfplayWorkerContext:
     gae_lambda: float
     seed: int
     sampling_snapshot: Path
+    feature_layout: str
 
 
 _worker_context: _SelfplayWorkerContext | None = None
@@ -459,7 +461,10 @@ def run_training_loop(
             mode=settings.selfplay_mode,
             gamma=settings.gamma,
             gae_lambda=settings.gae_lambda,
-            seed=settings.seed,
+            # ラウンド番号ぶんずらす。ずらさないと`seed + game_index`が毎ラウンド
+            # 同じ値になり、デッキの組み合わせが全ラウンドで固定される
+            # (generalistは相手デッキの多様性が目的なので致命的)。
+            seed=settings.seed + round_num * settings.games_per_round,
             sampling_snapshot=settings.sampling_snapshot,
             feature_layout=model_config.FEATURE_LAYOUT,
         )
