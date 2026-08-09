@@ -481,10 +481,10 @@ def run_training_loop(
         print(f"=== round {round_num}/{settings.n_rounds}: PPO update ===")
         train_one_round(network, optimizer, all_samples, settings, device)
 
-        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs random ===")
-        vs_random = evaluate_networks_parallel(
+        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs first-index ===")
+        vs_baseline = evaluate_networks_parallel(
             network,
-            [("random", None)],
+            [("first_index", None)],
             opponent_deck_pool,
             matchups,
             agent_factory=make_ppo_eval_agent,
@@ -498,10 +498,10 @@ def run_training_loop(
                 "algorithm": "ppo",
                 "round": round_num,
                 "mode": settings.selfplay_mode,
-                "stage": "random_eval",
+                "stage": "baseline_eval",
             },
-        )["random"]
-        print(f"  vs random: {vs_random}")
+        )["first_index"]
+        print(f"  vs first-index: {vs_baseline}")
 
         saved_path = checkpoint_path(settings.checkpoint_dir, settings.selfplay_mode, round_num)
         torch.save(network.state_dict(), saved_path)

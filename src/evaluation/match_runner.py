@@ -149,8 +149,33 @@ def evaluate_fixed_matchups(
     }
 
 
+def first_index_agent_factory(deck: list[int]):
+    """常に先頭の選択肢を返す`agent()`を作る(学習の進捗を測る基準線)。
+
+    エンジンが提示する選択肢の並びには質の情報が含まれており、先頭を選ぶだけでも
+    ランダムより明確に強い(実測でランダム相手に約64%)。ランダム相手の勝率は
+    早々に100%へ飽和して改善も劣化も検出できなくなるため、こちらを基準線に使う。
+
+    Args:
+        deck: デッキ提出時に返す60枚のデッキリスト。
+
+    Returns:
+        Callable[[dict], list[int]]: `evaluate_fixed_matchups`に渡せるagent関数。
+    """
+
+    def agent(obs_dict: dict) -> list[int]:
+        obs = to_observation_class(obs_dict)
+        if obs.select is None:
+            return deck
+        sel = obs.select
+        count = min(max(sel.minCount, 1), len(sel.option))
+        return list(range(count))
+
+    return agent
+
+
 def random_agent_factory(deck: list[int]):
-    """完全ランダムに選ぶ`agent()`を作る(「vs random」評価の対戦相手・floor-check用)。
+    """完全ランダムに選ぶ`agent()`を作る(下限確認用)。
 
     Args:
         deck: デッキ提出時に返す60枚のデッキリスト。

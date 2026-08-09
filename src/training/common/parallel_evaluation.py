@@ -22,7 +22,7 @@ from .parallel_games import run_parallel_games  # noqa: E402
 from .training_utils import seed_game  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "src" / "evaluation"))
-from match_runner import play_one_match, random_agent_factory  # noqa: E402
+from match_runner import first_index_agent_factory, play_one_match  # noqa: E402
 
 # agentの作り方。(network, deck) -> agent。spawn境界を越えるのでpickle可能であること
 # (module levelの関数か、そのfunctools.partial)。
@@ -118,7 +118,8 @@ def _play_evaluation_game(game_index: int) -> tuple[int, float]:
     candidate_agent = context.agent_factory(_worker_candidate, spec.candidate_deck)
     opponent_network = _worker_opponents[spec.opponent_index]
     if opponent_network is None:
-        opponent_agent = random_agent_factory(spec.opponent_deck)
+        # ネットワークを持たない相手は「常に先頭の選択肢を返す」基準線。
+        opponent_agent = first_index_agent_factory(spec.opponent_deck)
     else:
         opponent_agent = context.agent_factory(opponent_network, spec.opponent_deck)
 

@@ -510,17 +510,17 @@ def run_training_loop(
             best_network = candidate_network
             best_optimizer = candidate_optimizer
 
-        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs random ===")
-        vs_random = _evaluate(
+        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs first-index ===")
+        vs_baseline = _evaluate(
             settings,
             best_network,
-            [("random", None)],
+            [("first_index", None)],
             opponent_deck_pool,
             matchups,
             round_num,
             "random_eval",
-        )["random"]
-        print(f"  vs random: {vs_random}")
+        )["first_index"]
+        print(f"  vs first-index: {vs_baseline}")
 
         saved_path = checkpoint_path(settings.checkpoint_dir, settings.selfplay_mode, round_num)
         torch.save(best_network.state_dict(), saved_path)
