@@ -407,7 +407,7 @@ def encoder_size() -> int:
     if _shared():
         # カード表4 + 技 + 特性は、いずれも枠をまたいで共有する
         return _encoder_block_base() + non_card
-    return non_card + 19 * card_count() + 4 * traits
+    return non_card + 20 * card_count() + 4 * traits
 
 
 def decoder_size() -> int:
@@ -802,6 +802,16 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
 
     sv.word_start()
     add_cards(sv, state.stadium, 1.0, CARD_ROLE_ZONE)
+
+    # この選択の文脈となっているカード。`effect`とは別物で、メタの多様なデッキでの実測では
+    # 2,587局面中42件(1.6%)が`effect`で代替できなかった(値が異なる25件、effectが無い17件)。
+    # `effect`と同じトークンに置くと加算で混ざるため、専用トークンにする。
+    sv.word_start()
+    add_card(
+        sv,
+        obs.select.contextCard if obs.select is not None else None,
+        CARD_ROLE_ZONE,
+    )
 
     # サーチ効果などで今まさに公開されているカード。選択肢の対象としては見えていたが、
     # 「どの候補の中から選ばされているか」という盤面情報としては渡っていなかった。
