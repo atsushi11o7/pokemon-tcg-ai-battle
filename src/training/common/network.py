@@ -134,6 +134,27 @@ class PolicyValueNet(nn.Module):
             nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1)
         )
 
+        self._scale_embedding_init()
+
+    def _scale_embedding_init(self) -> None:
+        """埋め込みの初期値を`1/sqrt(d_model)`倍に縮める。
+
+        `nn.EmbeddingBag`の既定は`N(0, 1)`で、d_model=128だと1行のノルムが約11になる。
+        トークンはその和なので、初期状態で注意のlogitが飽和し、1層目がほぼ乱択の
+        hard attentionになる(実測でエントロピー2.07、一様なら3.26)。
+        あわせて、学習データに出てこないカードの行は初期値のまま残るため、
+        本番で未知のカードが出たときに盤面へ注入されるノイズも小さくなる。
+        """
+        scale = self.d_model**-0.5
+        for embedding in (
+            self.encoder_bag,
+            self.decoder_bag,
+            self.owner_embedding,
+            self.zone_embedding,
+        ):
+            with torch.no_grad():
+                embedding.weight.mul_(scale)
+
     def forward(
         self,
         index_encoder: torch.Tensor,
@@ -148,7 +169,7 @@ class PolicyValueNet(nn.Module):
         Args:
             index_encoder: バッチ全体の盤面疎ベクトルを連結したindex列(`SparseBatch`参照)。
             value_encoder: 同上のvalue列。
-            offset_encoder: 同上のoffset列(`batch_size * 24`個のトークン境界)。
+            offset_encoder: 同上のoffset列(`batch_size * NUM_WORDS_ENCODER`個のトークン境界)。
             index_decoder: バッチ全体の行動疎ベクトルを連結したindex列。
             value_decoder: 同上のvalue列。
             offset_decoder: 同上のoffset列(`batch_size * max_actions`個の行動境界)。
