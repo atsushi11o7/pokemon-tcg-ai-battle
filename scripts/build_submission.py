@@ -1,8 +1,12 @@
 """学習済みチェックポイントから提出用パッケージを生成する。
 
 提出物へ特徴量コードを手でコピーすると、`sparse_features.py`を変えるたびに陳腐化し、
-学習時と推論時で食い違う。ここでは`src/training/`のモジュールをそのまま同梱し、
-`main.py`は薄いシムにすることで複製そのものを無くす。
+学習時と推論時で食い違う。ここでは`src/training/`のモジュールを機械的に連結して
+1つの`main.py`を生成することで、複製を手で書かずに単体完結の提出物を作る。
+
+パッケージとして同梱する形(`training/`ディレクトリ + 薄い`main.py`)は本番で通らない。
+Kaggle側は`main.py`をソースとして読み込んでexecするため、`__file__`が無く、
+importの起点も安定しない。実績のある単体完結型に揃えている。
 
 Usage:
     uv run python scripts/build_submission.py \
@@ -24,42 +28,74 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CG_SOURCE = ROOT / "data" / "sample_submission" / "sample_submission" / "cg"
 
-# 推論に必要なモジュールだけを同梱する(学習専用のモジュールは持ち込まない)。
-BUNDLED_MODULES = (
-    "__init__.py",
-    "common/__init__.py",
-    "common/deck.py",
+# `main.py`へ連結するモジュール(依存順)。探索なしなら前半だけで足りるが、
+# 分岐させると片方だけ壊れるので常に同じ順で全部入れる。
+CONCATENATED_MODULES = (
     "common/model_config.py",
-    "common/network.py",
     "common/sparse_features.py",
+    "common/network.py",
+    "common/deck.py",
     "common/selfplay_modes.py",
-    "inference/__init__.py",
-    "inference/agent.py",
-    "mcts/__init__.py",
-    "mcts/determinize.py",
     "mcts/search.py",
+    "mcts/determinize.py",
     "mcts/selfplay.py",
+    "inference/agent.py",
 )
 
-MAIN_TEMPLATE = '''"""{description}
+# 連結時に落とす行。パッケージ内の相対importは連結後には同じ名前空間に並ぶので不要で、
+# `ROOT`まわりはリポジトリの階層に依存するため提出物では成立しない。
+_DROPPED_PREFIXES = ("from .", "from __future__ import")
+_DROPPED_STATEMENTS = ("ROOT = Path(", "SAMPLE_SUBMISSION_DIR = ", "sys.path.insert(")
 
-学習側と同じ`training/`モジュールをそのまま同梱しているため、特徴量やネットワーク構成が
-提出物側で古くなることはない。生成は`scripts/build_submission.py`。
+# 連結元は構成値を`model_config.X`の形でも参照する。1ファイルになると
+# そのモジュールは存在しないので、同じ名前で見えるようにしておく。
+MODEL_CONFIG_SHIM = """
+import types as _types
+
+model_config = _types.SimpleNamespace(
+    FEATURE_LAYOUT=FEATURE_LAYOUT,
+    D_MODEL=D_MODEL,
+    NUM_HEADS=NUM_HEADS,
+    D_FEEDFORWARD=D_FEEDFORWARD,
+    NUM_LAYERS_ENCODER=NUM_LAYERS_ENCODER,
+    NUM_LAYERS_DECODER=NUM_LAYERS_DECODER,
+)
+"""
+
+HEADER_TEMPLATE = '''"""{description}
+
+`src/training/`のモジュールを機械的に連結して生成している。手で書き写していないので、
+特徴量やネットワーク構成が学習側と食い違うことはない。生成は`scripts/build_submission.py`。
 
 構成: {layout} / D_MODEL={d_model} / {inference}
 """
 
+import os
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
+# Kaggleは`main.py`をソースとして読み込んでexecするため、この名前空間には`__file__`が無い。
+# 参照するとエピソードが即失敗するので、カレントディレクトリと本番の配置先だけで解決する。
+KAGGLE_AGENT_DIR = Path("/kaggle_simulations/agent")
+for _candidate in (".", str(KAGGLE_AGENT_DIR)):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
 
-from cg.api import to_observation_class  # noqa: E402
-from training.inference.agent import SubmissionAgent  # noqa: E402
+
+def resource_path(name: str, base_dir: Path) -> Path:
+    """同梱ファイルを、ローカル実行と本番実行の両方で解決する。"""
+    if os.path.exists(name):
+        return Path(name)
+    return KAGGLE_AGENT_DIR / name
+
+'''
+
+ENTRYPOINT_TEMPLATE = """
+
+# ===== エントリポイント =====================================================
 
 _agent = SubmissionAgent(
-    BASE_DIR,
+    Path("."),
     search_count={search_count},
     num_determinizations={determinizations},
 )
@@ -67,7 +103,49 @@ _agent = SubmissionAgent(
 
 def agent(obs_dict: dict) -> list[int]:
     return _agent.select(to_observation_class(obs_dict))
-'''
+"""
+
+
+def _strip_module(source: str) -> str:
+    """1ファイルへ連結できるよう、パッケージ前提の行を落とす。
+
+    括弧で複数行に跨るimportは閉じ括弧まで落とす。連結後は全てが同じ名前空間に
+    並ぶので、相対importは不要になる。
+    """
+    kept: list[str] = []
+    skipping = False
+    for line in source.splitlines():
+        if skipping:
+            skipping = ")" not in line
+            continue
+        stripped = line.strip()
+        if stripped.startswith(_DROPPED_PREFIXES):
+            skipping = stripped.endswith("(")
+            continue
+        if stripped.startswith(_DROPPED_STATEMENTS):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _generate_main(args: argparse.Namespace, layout: str, d_model: int, inference: str) -> str:
+    """モジュールを連結して、単体で動く`main.py`を組み立てる。"""
+    parts = [
+        HEADER_TEMPLATE.format(
+            description=args.description, layout=layout, d_model=d_model, inference=inference
+        )
+    ]
+    for relative in CONCATENATED_MODULES:
+        body = _strip_module((ROOT / "src" / "training" / relative).read_text(encoding="utf-8"))
+        parts.append(f"\n# ===== {relative} " + "=" * max(4, 58 - len(relative)) + f"\n{body}")
+        if relative == "common/model_config.py":
+            parts.append(MODEL_CONFIG_SHIM)
+    parts.append(
+        ENTRYPOINT_TEMPLATE.format(
+            search_count=args.search_count, determinizations=args.determinizations
+        )
+    )
+    return "\n".join(parts)
 
 
 def _opponent_decks(snapshot: Path) -> list[list[int]]:
@@ -83,16 +161,11 @@ def build(args: argparse.Namespace) -> Path:
     out_dir = ROOT / "submission" / args.name
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    (out_dir / "training").mkdir(parents=True)
+    out_dir.mkdir(parents=True)
 
     shutil.copytree(CG_SOURCE, out_dir / "cg", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy(args.checkpoint, out_dir / "policy.pt")
     shutil.copy(args.deck, out_dir / "deck.csv")
-
-    for relative in BUNDLED_MODULES:
-        destination = out_dir / "training" / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(ROOT / "src" / "training" / relative, destination)
 
     if args.search_count > 0:
         decks = _opponent_decks(args.snapshot)
@@ -104,20 +177,15 @@ def build(args: argparse.Namespace) -> Path:
         else "貪欲方策(argmax、探索なし)"
     )
     (out_dir / "main.py").write_text(
-        MAIN_TEMPLATE.format(
-            description=args.description,
-            layout=model_config.FEATURE_LAYOUT,
-            d_model=model_config.D_MODEL,
-            inference=inference,
-            search_count=args.search_count,
-            determinizations=args.determinizations,
-        ),
+        _generate_main(args, model_config.FEATURE_LAYOUT, model_config.D_MODEL, inference),
         encoding="utf-8",
     )
 
     archive = ROOT / "submission" / f"{args.name}.tar.gz"
     archive.unlink(missing_ok=True)
-    subprocess.run(["tar", "-czf", str(archive), "-C", str(out_dir), "."], check=True)
+    # `-C dir .`だと全エントリが"./"始まりになる。中身を名前で明示する。
+    entries = sorted(path.name for path in out_dir.iterdir())
+    subprocess.run(["tar", "-czf", str(archive), "-C", str(out_dir), *entries], check=True)
     return archive
 
 

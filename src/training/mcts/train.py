@@ -129,6 +129,10 @@ class MctsSettings:
         )
 
 
+# ゲート判定に必要な完走率。全試合の完走を求めると、数試合の失敗だけで強い候補も捨ててしまう。
+GATING_MIN_COMPLETION = 0.8
+
+
 def should_accept_candidate(
     current_best_win_rate: float,
     pooled_win_rate: float,
@@ -496,11 +500,11 @@ def run_training_loop(
             total_wins += int(result["wins"])
             total_games += int(result["games"])
             gating_complete &= (
-                result["failed"] == 0 and result["games"] == settings.eval_games_per_round
+                result["games"] >= settings.eval_games_per_round * GATING_MIN_COMPLETION
             )
         current_best_win_rate = float(gating_results["current_best"]["win_rate"])
         pooled_win_rate = total_wins / total_games if total_games else 0.0
-        # 失敗した試合があると勝率が偏った部分集合の平均になるため、完走したときだけ採用判定する。
+        # 大半が失敗すると勝率が偏った部分集合の平均になるため、一定以上完走したときだけ判定する。
         accepted = gating_complete and should_accept_candidate(
             current_best_win_rate, pooled_win_rate, settings.gating_win_rate
         )

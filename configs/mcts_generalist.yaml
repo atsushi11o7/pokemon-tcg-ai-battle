@@ -12,7 +12,7 @@ data:
 
 runtime:
   seed: 0
-  workers: 8
+  workers: 6
   game_timeout_seconds: 300
   round_timeout_seconds: 7200
   max_restarts: 50

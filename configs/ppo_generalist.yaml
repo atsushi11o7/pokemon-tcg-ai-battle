@@ -23,7 +23,7 @@ training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 300
-  rounds: 350
+  rounds: 300
   learning_rate: 0.0001
   minibatch_size: 64
   epochs_per_round: 4
