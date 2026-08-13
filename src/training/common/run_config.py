@@ -249,6 +249,9 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         if pool_sample > pool_size:
             raise ValueError("training.gating_pool_sample cannot exceed checkpoint_pool_size")
         _positive_int(training["replay_buffer_rounds"], "training.replay_buffer_rounds")
+        if "freeze_policy" in training and not isinstance(training["freeze_policy"], bool):
+            # bool()で受けると、YAMLに引用符付きで"false"と書いた場合にTrueになる。
+            raise ValueError("training.freeze_policy must be a boolean")
     return mode
 
 

@@ -19,7 +19,7 @@ from training.common.network import NUM_WORDS_ENCODER, build_policy_value_net  #
 from training.common.sparse_features import SparseVector, decoder_size, encoder_size  # noqa: E402
 from training.common.training_utils import collate_samples  # noqa: E402
 from training.mcts.selfplay import Sample  # noqa: E402
-from training.mcts.train import train_one_round, trainable_parameters  # noqa: E402
+from training.mcts.train import configure_trainable_parameters, train_one_round  # noqa: E402
 
 
 def _sample(n_actions: int, seed: int, label: float) -> Sample:
@@ -40,13 +40,13 @@ def _sample(n_actions: int, seed: int, label: float) -> Sample:
 class TrainableParametersTest(unittest.TestCase):
     def test_freeze_selects_only_the_value_head(self):
         network = build_policy_value_net()
-        frozen = trainable_parameters(network, freeze_policy=True)
+        frozen = configure_trainable_parameters(network, freeze_policy=True)
         self.assertEqual([id(p) for p in frozen], [id(p) for p in network.encoder_fc.parameters()])
 
     def test_unfrozen_selects_everything(self):
         network = build_policy_value_net()
         self.assertEqual(
-            len(trainable_parameters(network, freeze_policy=False)),
+            len(configure_trainable_parameters(network, freeze_policy=False)),
             len(list(network.parameters())),
         )
 
@@ -67,7 +67,9 @@ class FrozenPolicyIsUnchangedTest(unittest.TestCase):
         probe = collate_samples(samples[:4])
 
         before_scores, before_values = self._scores_and_value(network, probe)
-        optimizer = torch.optim.Adam(trainable_parameters(network, freeze_policy=True), lr=1e-2)
+        optimizer = torch.optim.Adam(
+            configure_trainable_parameters(network, freeze_policy=True), lr=1e-2
+        )
         train_one_round(
             network,
             optimizer,
@@ -88,6 +90,36 @@ class FrozenPolicyIsUnchangedTest(unittest.TestCase):
             1e-6,
             "価値ヘッドが更新されていない",
         )
+
+    def test_frozen_parameters_accumulate_no_gradient(self):
+        """optimizer対象を絞るだけだと`.grad`がバッチをまたいで溜まる。
+
+        `optimizer.zero_grad()`は対象外のパラメータを触らないため、`requires_grad`を
+        落としていないと逆伝播のたびにencoder/decoderへ勾配が積まれる。更新はされず
+        出力も変わらないので、この検査が無いと計算とメモリの浪費に気付けない。
+        """
+        torch.manual_seed(0)
+        network = build_policy_value_net()
+        samples = [_sample(3 + i % 5, seed=i, label=1.0 if i % 2 else -1.0) for i in range(16)]
+        optimizer = torch.optim.Adam(
+            configure_trainable_parameters(network, freeze_policy=True), lr=1e-2
+        )
+        train_one_round(
+            network,
+            optimizer,
+            samples,
+            epochs=2,
+            batch_size=4,
+            device=torch.device("cpu"),
+            freeze_policy=True,
+        )
+        head = {id(p) for p in network.encoder_fc.parameters()}
+        leaked = [
+            name
+            for name, parameter in network.named_parameters()
+            if id(parameter) not in head and parameter.grad is not None
+        ]
+        self.assertEqual(leaked, [], f"凍結側に勾配が溜まっている: {leaked[:5]}")
 
     def test_unfrozen_training_does_move_the_policy(self):
         """対照。凍結しなければ方策は動く(テスト自体が空振りしていないことの確認)。"""
