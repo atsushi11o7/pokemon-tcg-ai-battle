@@ -41,7 +41,7 @@ from ..common.training_utils import (
     move_optimizer_state_to,
     training_device,
 )
-from .dataset import load_shard_paths
+from .dataset import load_shard_paths, shard_sample_counts
 
 # 統一CLIは`<selfplay_mode>_roundN.pt`を探して進捗表示と再開判定を行う。BCは自己対戦を
 # しないがモードは"generalist"を返すので、それに合わせないと再開もstatusも効かない。
@@ -186,8 +186,8 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
     # 終盤に学習率を絞らないと最適解の周りを跳ね回って収束しきらない。
     # post-normのTransformerは初期の勾配が不安定なのでwarmupも入れる。
     steps_per_epoch = sum(
-        (len(torch.load(path, weights_only=False)) + settings.batch_size - 1) // settings.batch_size
-        for path in train_paths
+        (count + settings.batch_size - 1) // settings.batch_size
+        for count in shard_sample_counts(train_paths, settings.shard_dir)
     )
     total_steps = max(1, steps_per_epoch * settings.n_rounds)
     warmup = min(settings.warmup_steps, total_steps // 10)

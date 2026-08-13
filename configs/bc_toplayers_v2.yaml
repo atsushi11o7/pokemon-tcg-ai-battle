@@ -12,9 +12,9 @@ data:
 
 runtime:
   seed: 0
+  # DataLoaderのワーカー数。BCは自己対戦をしないので、対局まわりの
+  # game_timeout_seconds / round_timeout_seconds は読まれない(既定値のまま)。
   workers: 4
-  game_timeout_seconds: 60
-  round_timeout_seconds: 86400
   max_restarts: 20
   retry_delay_seconds: 5
   keep_last_checkpoints: 3

@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import torch
@@ -16,6 +17,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from training.bc.dataset import SHARD_COUNT_CACHE, shard_sample_counts
 from training.bc.train import BcSettings, run_training_loop  # noqa: E402
 from training.common.network import NUM_WORDS_ENCODER  # noqa: E402
 from training.common.sparse_features import (  # noqa: E402
@@ -83,7 +85,6 @@ class BcTrainingLoopTest(unittest.TestCase):
         self.assertEqual(before, after, "再開時に完了済みエポックを上書きしている")
 
 
-
 class ShardSplitTest(unittest.TestCase):
     """時系列の分割が意図どおりか。
 
@@ -144,6 +145,48 @@ class ShardSplitTest(unittest.TestCase):
         self.assertEqual(
             [p.name for p in val], ["shard_20260812_0002.pt", "shard_20260812_0003.pt"]
         )
+
+
+class ShardCountCacheTest(unittest.TestCase):
+    """件数キャッシュが、シャードを読み直さずに同じ答えを返すこと。
+
+    学習率スケジュールの総ステップ数のためだけに全シャードを`torch.load`すると、
+    実測で387シャード(68GB)に11分かかる。再起動のたびに払う固定費なので
+    キャッシュするが、シャードが差し替わったのに古い件数を使うと
+    スケジュールがずれる。どちらも例外にならないのでテストで固定する。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.paths = []
+        for index, size in enumerate((5, 3)):
+            path = self.tmp / f"shard_2026081{index}_0000.pt"
+            torch.save([_sample(3) for _ in range(size)], path)
+            self.paths.append(path)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_counts_are_correct_and_cached(self) -> None:
+        self.assertEqual(shard_sample_counts(self.paths, self.tmp), [5, 3])
+        self.assertTrue((self.tmp / SHARD_COUNT_CACHE).exists())
+
+        # 2回目はシャードを開かないこと。開いたら落ちるようにして確かめる。
+        def explode(*args, **kwargs):
+            raise AssertionError("キャッシュがあるのにシャードを読み直している")
+
+        with unittest.mock.patch("training.bc.dataset.torch.load", explode):
+            self.assertEqual(shard_sample_counts(self.paths, self.tmp), [5, 3])
+
+    def test_resized_shard_is_recounted(self) -> None:
+        shard_sample_counts(self.paths, self.tmp)
+        torch.save([_sample(3) for _ in range(9)], self.paths[0])
+        self.assertEqual(shard_sample_counts(self.paths, self.tmp), [9, 3])
+
+    def test_corrupt_cache_falls_back_to_counting(self) -> None:
+        (self.tmp / SHARD_COUNT_CACHE).write_text("{not json", encoding="utf-8")
+        self.assertEqual(shard_sample_counts(self.paths, self.tmp), [5, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

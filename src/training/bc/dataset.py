@@ -184,6 +184,49 @@ def load_shard_paths(paths: Iterable[Path]) -> list[Sample]:
     return samples
 
 
+SHARD_COUNT_CACHE = "shard_counts.json"
+
+
+def shard_sample_counts(paths: list[Path], cache_dir: Path) -> list[int]:
+    """各シャードのサンプル件数を返す。結果は`cache_dir`へ残して再利用する。
+
+    学習率スケジュールの総ステップ数を出すために件数が要るが、数えるためだけに
+    `torch.load`で全シャードを展開すると、実測で387シャード(68GB)に11分かかる。
+    しかもこれは学習開始前の固定費で、ネイティブクラッシュから再起動するたびに
+    払い直すことになる(`max_restarts`は20)。
+
+    キャッシュはファイル名とバイト数で照合する。抽出し直してシャードが差し替われば
+    サイズが変わるので、古い件数を使い続けることはない。
+    """
+    cache_path = cache_dir / SHARD_COUNT_CACHE
+    cached: dict[str, list[int]] = {}
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = {}  # 壊れていたら数え直す。ここで失敗させる価値はない
+
+    counts: list[int] = []
+    updated = False
+    for path in paths:
+        size = path.stat().st_size
+        entry = cached.get(path.name)
+        if entry is not None and entry[0] == size:
+            counts.append(entry[1])
+            continue
+        count = len(torch.load(path, weights_only=False))
+        cached[path.name] = [size, count]
+        counts.append(count)
+        updated = True
+
+    if updated:
+        try:
+            cache_path.write_text(json.dumps(cached), encoding="utf-8")
+        except OSError:
+            pass  # 読み取り専用でも学習は続けられる
+    return counts
+
+
 def load_shards(shard_dir: Path, limit: int = 0) -> list[Sample]:
     """`shard_*.pt`をまとめて読む。limitが正ならそのシャード数で打ち切る。"""
     paths = sorted(shard_dir.glob("shard_*.pt"))
