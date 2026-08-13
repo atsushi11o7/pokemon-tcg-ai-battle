@@ -14,7 +14,7 @@ from .deck import parse_deck_csv
 from .selfplay_modes import SelfplayMode
 
 ROOT = Path(__file__).resolve().parents[3]
-Algorithm = Literal["ppo", "mcts"]
+Algorithm = Literal["ppo", "mcts", "bc"]
 
 
 @dataclass(frozen=True)
@@ -127,7 +127,12 @@ def _resolve(path: str | None) -> Path | None:
 
 
 def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> SelfplayMode:
-    common_fields = {"selfplay_mode", "deck_path", "games_per_round", "rounds"}
+    # BCはリプレイからの教師あり学習で自己対戦を行わないため、対局まわりの項目を持たない。
+    common_fields = (
+        {"rounds"}
+        if algorithm == "bc"
+        else {"selfplay_mode", "deck_path", "games_per_round", "rounds"}
+    )
     algorithm_fields = {
         "ppo": {
             "learning_rate",
@@ -149,17 +154,49 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
             "batch_size",
             "epochs_per_round",
             "eval_games_per_round",
+            "baseline_eval_games",
             "gating_win_rate",
             "checkpoint_pool_size",
             "gating_pool_sample",
             "replay_buffer_rounds",
+            "freeze_policy",
+        },
+        "bc": {
+            "shard_dir",
+            "val_shards",
+            "learning_rate",
+            "batch_size",
+            "value_loss_coef",
+            "warmup_steps",
         },
     }[algorithm]
     _reject_unknown(training, common_fields | algorithm_fields, "training")
-    required = (common_fields - {"deck_path"}) | algorithm_fields
+    # 省略可能な項目。既定はeval_games_per_roundと同数(従来どおりの挙動)。
+    optional_fields = {
+        "deck_path",
+        "baseline_eval_games",
+        "value_loss_coef",
+        "warmup_steps",
+        "freeze_policy",
+    }
+    required = (common_fields | algorithm_fields) - optional_fields
     missing = required - set(training)
     if missing:
         raise ValueError(f"missing training field(s): {', '.join(sorted(missing))}")
+
+    _positive_int(training["rounds"], "training.rounds")
+    _positive(training["learning_rate"], "training.learning_rate")
+
+    if algorithm == "bc":
+        _positive_int(training["batch_size"], "training.batch_size")
+        # 検証シャードが0だと汎化の指標が取れない。学習は進むが判断材料が無くなる。
+        _positive_int(training["val_shards"], "training.val_shards")
+        _required_text(training["shard_dir"], "training.shard_dir")
+        if "value_loss_coef" in training:
+            _non_negative(training["value_loss_coef"], "training.value_loss_coef")
+        if "warmup_steps" in training:
+            _non_negative_int(training["warmup_steps"], "training.warmup_steps")
+        return "generalist"
 
     mode = training["selfplay_mode"]
     if mode not in ("generalist", "asymmetric", "mirror"):
@@ -170,12 +207,19 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
     games_per_round = _positive_int(training["games_per_round"], "training.games_per_round")
     if mode == "asymmetric" and games_per_round % 2 != 0:
         raise ValueError("training.games_per_round must be even for selfplay_mode='asymmetric'")
-    _positive_int(training["rounds"], "training.rounds")
-    _positive(training["learning_rate"], "training.learning_rate")
     _positive_int(training["epochs_per_round"], "training.epochs_per_round")
     eval_games = _positive_int(training["eval_games_per_round"], "training.eval_games_per_round")
     if eval_games % 4 != 0:
         raise ValueError("training.eval_games_per_round must be a multiple of 4")
+
+    if algorithm == "mcts" and "baseline_eval_games" in training:
+        baseline_games = training["baseline_eval_games"]
+        if not isinstance(baseline_games, int) or baseline_games < 0 or baseline_games % 4 != 0:
+            raise ValueError("training.baseline_eval_games must be 0 (disabled) or a multiple of 4")
+        if baseline_games > eval_games:
+            raise ValueError(
+                "training.baseline_eval_games must not exceed training.eval_games_per_round"
+            )
 
     if algorithm == "ppo":
         _positive_int(training["minibatch_size"], "training.minibatch_size")
@@ -237,8 +281,8 @@ def load_run_config(path: Path) -> RunConfig:
     )
 
     algorithm = raw.get("algorithm")
-    if algorithm not in ("ppo", "mcts"):
-        raise ValueError("algorithm must be either 'ppo' or 'mcts'")
+    if algorithm not in ("ppo", "mcts", "bc"):
+        raise ValueError("algorithm must be one of: ppo, mcts, bc")
     mode = _validate_training(training, algorithm)
 
     # 入力仕様やD_MODELを変えると既存チェックポイントは形状不一致で読めなくなる。
@@ -310,12 +354,14 @@ def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
     architecture = {
         name: getattr(model_config, name)
         for name in (
-            "FEATURE_LAYOUT",
             "D_MODEL",
             "NUM_HEADS",
             "D_FEEDFORWARD",
             "NUM_LAYERS_ENCODER",
             "NUM_LAYERS_DECODER",
+            "HAND_TOKENS",
+            "DECODER_SELF_ATTENTION",
+            "DROPOUT",
         )
     }
     (output_dir / "architecture.yaml").write_text(
