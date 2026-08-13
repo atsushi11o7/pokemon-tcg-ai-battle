@@ -190,3 +190,55 @@ class ShardCountCacheTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HoldoutGuardTest(unittest.TestCase):
+    """holdoutが全シャードを飲み込んだら止まること。
+
+    素通りさせると`train_paths`が空になり、steps_per_epoch=0のまま
+    1ステップも学習せずに「完了」する。例外にならないので気付けない。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.shard_dir = self.tmp / "shards"
+        self.shard_dir.mkdir()
+        for index in range(3):
+            torch.save(
+                [_sample(3) for _ in range(2)], self.shard_dir / f"shard_2026081{index}_0000.pt"
+            )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _settings(self, holdout: int) -> BcSettings:
+        return BcSettings(
+            run_name="guard",
+            checkpoint_dir=self.tmp / "checkpoints",
+            output_dir=self.tmp,
+            shard_dir=self.shard_dir,
+            val_shards=1,
+            holdout_shards=holdout,
+            n_rounds=1,
+            batch_size=2,
+            learning_rate=1e-4,
+            value_loss_coef=0.1,
+            warmup_steps=1,
+            seed=0,
+            loader_workers=0,
+            keep_last_checkpoints=1,
+        )
+
+    def test_holdout_covering_every_shard_is_rejected(self) -> None:
+        (self.tmp / "checkpoints").mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "no training shards"):
+            run_training_loop(self._settings(holdout=3), None)
+
+    def test_holdout_leaving_one_shard_is_accepted(self) -> None:
+        (self.tmp / "checkpoints").mkdir(parents=True)
+        run_training_loop(self._settings(holdout=2), None)
+        self.assertTrue((self.tmp / "checkpoints" / "generalist_round1.pt").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

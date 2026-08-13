@@ -14,10 +14,15 @@ runtime:
   seed: 0
   # DataLoaderのワーカー数。BCは自己対戦をしないので、対局まわりの
   # game_timeout_seconds / round_timeout_seconds は読まれない(既定値のまま)。
-  workers: 4
-  max_restarts: 20
+  # 4だとシャードごとのローダ生成が積み上がってOOM(exit -9)した。
+  workers: 2
+  # OOMは何度やり直しても同じ場所で落ちるので、再起動で粘る価値が薄い。
+  # 進捗はエポック単位で保存されるため、少なめでも失うのは最大1エポック。
+  max_restarts: 5
   retry_delay_seconds: 5
-  keep_last_checkpoints: 3
+  # 全エポックを残す。後から検証精度のピークを選べるようにするため。
+  # 1エポックあたり重み22MB + optimizer 44MBで、12エポックでも約800MB。
+  keep_last_checkpoints: 0
 
 training:
   shard_dir: data/bc/shards_dated
@@ -28,8 +33,8 @@ training:
   # 「これから当たる相手にどれだけ通じるか」に近い指標になる。
   val_shards: 4
   holdout_shards: 14
-  # 1エポック約75分(前回30分×データ2.5倍)。8エポックで約10時間。
-  rounds: 8
+  # 実測5秒/シャード、387シャードで1エポック約32分。12エポックで約6時間30分。
+  rounds: 12
   batch_size: 256
   learning_rate: 0.0003
   value_loss_coef: 0.1

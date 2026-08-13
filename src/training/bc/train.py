@@ -153,12 +153,19 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
     # 測ることになる(先頭を検証にしていた頃と同じ形の時間リーク)。
     # 全部読まないのはメモリの都合(1日ぶん約70万サンプルは載り切らない)。
     holdout = max(settings.holdout_shards, settings.val_shards)
+    if holdout >= len(shards):
+        # 素通りさせると`train_paths`が空になり、1ステップも学習しないまま
+        # 「完了」してしまう。例外にならないので、ここで止める。
+        raise RuntimeError(
+            f"holdout_shards={holdout} leaves no training shards ({len(shards)} available)"
+        )
     val_paths = shards[-holdout:][: settings.val_shards]
     train_paths = shards[:-holdout]
-    validation = load_shard_paths(val_paths)
+    # 検証データは常駐させず、エポック末の評価時だけ読む。20万サンプルを親プロセスに
+    # 抱えたままだと、fork したDataLoaderワーカーがコピーオンライトで複製してしまう。
     print(
         f"shards: train={len(train_paths)} val={settings.val_shards} "
-        f"({len(validation)} samples, {val_paths[0].name}..{val_paths[-1].name})"
+        f"({val_paths[0].name}..{val_paths[-1].name})"
     )
 
     # 保存済みエポックがあればそこから、無ければ設定の初期重みから始める。
@@ -224,8 +231,10 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
                 batch_sampler=LengthBucketSampler(lengths, settings.batch_size),
                 collate_fn=collate_samples,
                 # collateはPythonループなので、GPU処理と直列にすると待ちが乗る。
+                # `persistent_workers`は使わない。ローダはシャードごとに作り直して
+                # 1回しか回さないので常駐化の利点が無く、破棄が遅れたワーカーが
+                # 積み上がる。387シャード×8エポックでは、これが原因でOOM(exit -9)した。
                 num_workers=settings.loader_workers,
-                persistent_workers=settings.loader_workers > 0,
             )
             for batch in loader:
                 tensors = [tensor.to(device) for tensor in batch]
@@ -246,6 +255,9 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
                 policy_sum += policy_loss.item() * supervised
                 value_seen += labels.shape[0]
                 value_sum += value_loss.item() * labels.shape[0]
+            # `del samples`だけでは`loader.dataset`が参照を握ったままになる。
+            # 最後のシャードではepoch末の評価まで生き残り、検証20万件と同居する。
+            del loader
             del samples
             if shard_index % 10 == 0:
                 print(
@@ -255,7 +267,9 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
                     flush=True,
                 )
 
+        validation = load_shard_paths(val_paths)
         metrics = evaluate(network, validation, settings.batch_size, device)
+        del validation
         if not metrics:
             metrics = {"accuracy": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "samples": 0}
         print(
