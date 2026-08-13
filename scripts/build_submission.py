@@ -106,6 +106,7 @@ _agent = SubmissionAgent(
     Path("."),
     search_count={search_count},
     num_determinizations={determinizations},
+    time_budget_seconds={time_budget},
 )
 
 
@@ -165,7 +166,9 @@ def _generate_main(args: argparse.Namespace, d_model: int, inference: str) -> st
             parts.append(MODEL_CONFIG_SHIM)
     parts.append(
         ENTRYPOINT_TEMPLATE.format(
-            search_count=args.search_count, determinizations=args.determinizations
+            search_count=args.search_count,
+            determinizations=args.determinizations,
+            time_budget=args.time_budget,
         )
     )
     return "\n".join(parts)
@@ -218,6 +221,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deck", type=Path, required=True)
     parser.add_argument("--search-count", type=int, default=0, help="0なら探索せず貪欲方策のみ")
     parser.add_argument("--determinizations", type=int, default=4)
+    parser.add_argument(
+        "--time-budget",
+        type=float,
+        default=540.0,
+        help="1エージェントの持ち時間(秒)。本番の上限600秒に対し、読み込みや例外処理の余地を残す",
+    )
     parser.add_argument(
         "--snapshot", type=Path, default=ROOT / "data/meta/derived/sampling_snapshot.json"
     )
