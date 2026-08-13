@@ -19,11 +19,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Kaggle本番のPythonバージョン。提出#19のログ(episode 91943786)で確認した。
+# ローカルは3.12なので、3.12以降の構文を書いてもビルドまでは通ってしまう。
+TARGET_PYTHON = (3, 11)
 
 ROOT = Path(__file__).resolve().parents[1]
 CG_SOURCE = ROOT / "data" / "sample_submission" / "sample_submission" / "cg"
@@ -53,12 +58,15 @@ MODEL_CONFIG_SHIM = """
 import types as _types
 
 model_config = _types.SimpleNamespace(
-    FEATURE_LAYOUT=FEATURE_LAYOUT,
     D_MODEL=D_MODEL,
     NUM_HEADS=NUM_HEADS,
     D_FEEDFORWARD=D_FEEDFORWARD,
     NUM_LAYERS_ENCODER=NUM_LAYERS_ENCODER,
     NUM_LAYERS_DECODER=NUM_LAYERS_DECODER,
+    HAND_TOKENS=HAND_TOKENS,
+    BENCH_SLOTS=BENCH_SLOTS,
+    DECODER_SELF_ATTENTION=DECODER_SELF_ATTENTION,
+    DROPOUT=DROPOUT,
 )
 """
 
@@ -67,7 +75,7 @@ HEADER_TEMPLATE = '''"""{description}
 `src/training/`のモジュールを機械的に連結して生成している。手で書き写していないので、
 特徴量やネットワーク構成が学習側と食い違うことはない。生成は`scripts/build_submission.py`。
 
-構成: {layout} / D_MODEL={d_model} / {inference}
+構成: D_MODEL={d_model} / {inference}
 """
 
 import os
@@ -128,12 +136,27 @@ def _strip_module(source: str) -> str:
     return "\n".join(kept)
 
 
-def _generate_main(args: argparse.Namespace, layout: str, d_model: int, inference: str) -> str:
+def _check_target_python_syntax(source: str) -> None:
+    """本番のPythonで構文解析できることを確かめる。
+
+    Kaggleは`main.py`をソースとして読み込んでexecするため、構文エラーがあると
+    エピソードが即失敗する。ローカルの方が新しいPythonだと、この差は実行するまで出ない。
+    """
+    try:
+        ast.parse(source, feature_version=TARGET_PYTHON)
+    except SyntaxError as error:
+        version = ".".join(map(str, TARGET_PYTHON))
+        raise SystemExit(
+            f"generated main.py does not parse on Python {version}: "
+            f"line {error.lineno}: {error.msg}\n"
+            f"  {(error.text or '').strip()}"
+        ) from error
+
+
+def _generate_main(args: argparse.Namespace, d_model: int, inference: str) -> str:
     """モジュールを連結して、単体で動く`main.py`を組み立てる。"""
     parts = [
-        HEADER_TEMPLATE.format(
-            description=args.description, layout=layout, d_model=d_model, inference=inference
-        )
+        HEADER_TEMPLATE.format(description=args.description, d_model=d_model, inference=inference)
     ]
     for relative in CONCATENATED_MODULES:
         body = _strip_module((ROOT / "src" / "training" / relative).read_text(encoding="utf-8"))
@@ -176,10 +199,9 @@ def build(args: argparse.Namespace) -> Path:
         if args.search_count > 0
         else "貪欲方策(argmax、探索なし)"
     )
-    (out_dir / "main.py").write_text(
-        _generate_main(args, model_config.FEATURE_LAYOUT, model_config.D_MODEL, inference),
-        encoding="utf-8",
-    )
+    source = _generate_main(args, model_config.D_MODEL, inference)
+    _check_target_python_syntax(source)
+    (out_dir / "main.py").write_text(source, encoding="utf-8")
 
     archive = ROOT / "submission" / f"{args.name}.tar.gz"
     archive.unlink(missing_ok=True)

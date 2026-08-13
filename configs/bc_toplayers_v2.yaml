@@ -1,0 +1,36 @@
+run:
+  name: bc_toplayers_v2
+  output_dir: outputs/runs/bc_toplayers_v2
+
+algorithm: bc
+
+model:
+  initial_checkpoint: null
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 4
+  game_timeout_seconds: 60
+  round_timeout_seconds: 86400
+  max_restarts: 20
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 3
+
+training:
+  shard_dir: data/bc/shards_dated
+  # シャード名に日付が入っており`sorted`が時系列順になるので、末尾＝最新日になる。
+  # 最新日(2026-08-12)の14枚を丸ごと学習から外し(holdout)、うち先頭4枚を検証に読む。
+  # 全部読まないのはメモリの都合(1日ぶん約70万サンプルは載り切らずOOMする)。
+  # 古い27日で学習して最新日で測る形にすると、メタが動くこのコンペで
+  # 「これから当たる相手にどれだけ通じるか」に近い指標になる。
+  val_shards: 4
+  holdout_shards: 14
+  # 1エポック約75分(前回30分×データ2.5倍)。8エポックで約10時間。
+  rounds: 8
+  batch_size: 256
+  learning_rate: 0.0003
+  value_loss_coef: 0.1
+  warmup_steps: 500

@@ -31,7 +31,6 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
-from ..common import model_config
 from ..common.checkpoints import (
     checkpoint_path,
     optimizer_path,
@@ -57,7 +56,6 @@ from ..common.run_config import (
 )
 from ..common.selfplay_modes import SelfplayMode, fixed_deck_seat_for_game
 from ..common.selfplay_round import run_selfplay_round
-from ..common.sparse_features import configure_feature_layout
 from ..common.training_utils import (
     ListDataset,
     move_optimizer_state_to,
@@ -81,7 +79,6 @@ class PpoSettings:
     output_dir: Path
     event_log_path: Path
     sampling_snapshot: Path
-    feature_layout: str
     selfplay_mode: SelfplayMode
     games_per_round: int
     n_rounds: int
@@ -111,7 +108,6 @@ class PpoSettings:
             output_dir=config.output_dir,
             event_log_path=config.worker_event_log_path,
             sampling_snapshot=config.sampling_snapshot,
-            feature_layout=model_config.FEATURE_LAYOUT,
             selfplay_mode=config.selfplay_mode,
             games_per_round=config.games_per_round,
             n_rounds=config.n_rounds,
@@ -210,7 +206,9 @@ def _ppo_loss(
         returns,
     ) = (t.to(device) for t in batch)
 
-    values, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
+    values, scores = network(
+        index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask
+    )
 
     masked_scores = scores.masked_fill(~mask, float("-inf"))
     log_probs = functional.log_softmax(masked_scores, dim=-1)
@@ -334,7 +332,8 @@ def train_one_round(
         print(
             f"  epoch {epoch + 1}/{epochs}  policy_loss={total_policy_loss / n:.4f}  "
             f"approx_kl={total_approx_kl / n:.4f}  clip_fraction={total_clip_fraction / n:.4f}  "
-            f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}"
+            f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}  "
+            f"samples_used={n}/{len(dataset)}"
         )
         if total_approx_kl / n > settings.target_kl:
             break
@@ -358,7 +357,6 @@ class _SelfplayWorkerContext:
     gae_lambda: float
     seed: int
     sampling_snapshot: Path
-    feature_layout: str
 
 
 _worker_context: _SelfplayWorkerContext | None = None
@@ -380,7 +378,6 @@ def _init_selfplay_worker(state_dict: dict, context: _SelfplayWorkerContext) -> 
     torch.set_num_threads(1)
     # spawnワーカーはこのmoduleを再importするため、親の設定は引き継がれない。
     # レイアウトが食い違うと埋め込み行列の形状が変わり、意味の違う重みを読むことになる。
-    configure_feature_layout(context.feature_layout)
     configure_sampling_snapshot(context.sampling_snapshot)
     _worker_network = build_policy_value_net(state_dict, assign=True)
     _worker_context = context
@@ -489,7 +486,6 @@ def run_training_loop(
             # (generalistは相手デッキの多様性が目的なので致命的)。
             seed=settings.seed + round_num * settings.games_per_round,
             sampling_snapshot=settings.sampling_snapshot,
-            feature_layout=model_config.FEATURE_LAYOUT,
         )
         all_samples, results = run_selfplay_round(
             algorithm="ppo",

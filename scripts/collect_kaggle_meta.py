@@ -42,7 +42,7 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def _retry[T](label: str, operation: Callable[[], T], attempts: int = 4) -> T:
+def _retry(label: str, operation: Callable[[], T], attempts: int = 4) -> T:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -57,7 +57,7 @@ def _retry[T](label: str, operation: Callable[[], T], attempts: int = 4) -> T:
     raise RuntimeError(f"{label} failed after {attempts} attempts") from last_error
 
 
-def _with_timeout[T](seconds: int, operation: Callable[[], T]) -> T:
+def _with_timeout(seconds: int, operation: Callable[[], T]) -> T:
     """Kaggle SDKのread待ちが無期限にならないようSIGALRMで打ち切る。"""
 
     def handle_timeout(_signum, _frame):
@@ -209,6 +209,8 @@ def collect(args: argparse.Namespace) -> None:
         print(f"episodes {index}/{len(submission_records)}; unique={len(episodes)}")
 
     failures: list[dict[str, Any]] = []
+    throttle = 0.0
+    streak = 0
     for index, episode in enumerate(
         sorted(episodes.values(), key=lambda item: item["id"]), start=1
     ):
@@ -218,23 +220,45 @@ def collect(args: argparse.Namespace) -> None:
             continue
         if args.dry_run:
             continue
-        try:
-            _retry(
-                f"replay {episode_id}",
-                lambda episode_id=episode_id: _with_timeout(
+        for attempt in range(1, args.replay_attempts + 1):
+            try:
+                _with_timeout(
                     args.replay_timeout_seconds,
-                    lambda: api.competition_episode_replay(
+                    lambda episode_id=episode_id: api.competition_episode_replay(
                         episode_id, path=str(replay_dir), quiet=True
                     ),
-                ),
-                attempts=2,
-            )
-            if not _valid_replay(path):
-                raise RuntimeError("downloaded replay is absent or invalid")
-        except Exception as error:
-            failures.append({"episodeId": episode_id, "error": str(error)})
+                )
+                if not _valid_replay(path):
+                    raise RuntimeError("downloaded replay is absent or invalid")
+                streak += 1
+                if throttle and streak >= 100:
+                    throttle = max(throttle / 2, 0.0 if throttle < 0.2 else 0.1)
+                    streak = 0
+                break
+            except Exception as error:
+                streak = 0
+                if attempt == args.replay_attempts:
+                    failures.append({"episodeId": episode_id, "error": str(error)})
+                    break
+                if "429" in str(error):
+                    # レート制限は同じエピソードを待って取り直す。失敗扱いにすると
+                    # 残り全件を消化しきってしまう。
+                    throttle = min(max(throttle * 2, args.replay_throttle_seconds), 5.0)
+                    cooldown = min(args.replay_cooldown_seconds * attempt, 600)
+                    print(
+                        f"replay {episode_id}: rate limited (attempt {attempt}/"
+                        f"{args.replay_attempts}); sleeping {cooldown}s, throttle={throttle:.2f}s"
+                    )
+                    time.sleep(cooldown)
+                else:
+                    time.sleep(min(2**attempt, 30))
+        if throttle:
+            time.sleep(throttle)
         if index % 20 == 0 or index == len(episodes):
-            print(f"replays {index}/{len(episodes)}; failures={len(failures)}")
+            print(
+                f"replays {index}/{len(episodes)}; failures={len(failures)}; "
+                f"throttle={throttle:.2f}s"
+            )
             _atomic_json(output / "failures.json", failures)
 
     collection = {
@@ -270,6 +294,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes-per-submission", type=int, default=20)
     parser.add_argument("--recent-days", type=int, default=14)
     parser.add_argument("--replay-timeout-seconds", type=int, default=45)
+    parser.add_argument("--replay-attempts", type=int, default=8)
+    parser.add_argument("--replay-cooldown-seconds", type=int, default=60)
+    parser.add_argument("--replay-throttle-seconds", type=float, default=0.5)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 

@@ -258,10 +258,13 @@ def _decoder_card_offset() -> int:
     return _decoder_scope_offset() + _decoder_scope_size()
 
 
-# --- 特徴量レイアウト -------------------------------------------------------
-# "per_role"    : カードIDのone-hotを出現箇所ごとに独立したブロックとして持つ。
-#                 同じカードでも手札とトラッシュで完全に別のベクトルになる。
-# "shared_card" : 出現箇所をまたいでカード表を共有し、パラメータを減らす。
+# --- カード表のレイアウト ---------------------------------------------------
+# 出現箇所をまたいでカード表を共有する。同じカードは手札でもトラッシュでも同じ
+# 埋め込みを引く(役割はトークン単位のowner/zone埋め込みが区別する)。
+#
+# 以前は出現箇所ごとに独立した表を持つ`per_role`も選べたが、同条件のA/Bで
+# 62.5%対69.3%と明確に劣ったため削除した。カード表が5倍(2.6M→13.9M)に膨らみ、
+# 1エントリあたりの学習機会が減るのが原因と見られる。
 #
 # 共有してよいのは「同一トークン内で同時に出現しない」役割だけ。`EmbeddingBag`はsumなので、
 # 1トークンに複数のカードが入ると全部足され、どのカードがどの役割だったかの対応は失われる
@@ -288,32 +291,6 @@ def _decoder_card_offset() -> int:
 ) = range(4)
 ENCODER_CARD_BLOCKS = 4
 
-_layout: str = model_config.FEATURE_LAYOUT
-
-
-def configure_feature_layout(layout: str) -> None:
-    """特徴量レイアウトを切り替える。
-
-    spawnワーカーはこのmoduleを再importするため、親で設定しても引き継がれない。
-    ワーカー初期化でも必ず呼ぶこと。
-
-    Args:
-        layout: "per_role" または "shared_card"。
-    """
-    global _layout
-    if layout not in ("per_role", "shared_card"):
-        raise ValueError(f"unknown feature layout: {layout!r}")
-    _layout = layout
-
-
-def feature_layout() -> str:
-    """現在の特徴量レイアウト。"""
-    return _layout
-
-
-def _shared() -> bool:
-    return _layout == "shared_card"
-
 
 def _encoder_attack_offset() -> int:
     """共有レイアウトで、ポケモンが持つ技のブロックの先頭。"""
@@ -337,19 +314,16 @@ def _encoder_block_base() -> int:
 def _decoder_card_block_count() -> int:
     """デコーダのカード参照ブロック数。
 
-    共有レイアウトはMAINの8種 + context共通の1つ。`per_role`はcontextごとに
-    独立したブロックを持つ。
+    MAINの8種 + context共通の1つ。
     """
-    if _shared():
-        return DECODER_MAIN_FEATURE + 1
-    return 1 + DECODER_MAIN_FEATURE + N_SELECT_CONTEXT
+    return DECODER_MAIN_FEATURE + 1
 
 
 def _decoder_context_role_offset() -> int:
     """SelectContextを表す役割インデックスの先頭。
 
     1つの選択(select)の中でcontextは常に同一なので、カード表とは別に、
-    行動トークンごとに1つの添字で表せる。`per_role`はcontextごとのカード表を
+    行動トークンごとに1つの添字で表せる。かつてのper_roleはcontextごとのカード表を
     持つが、カードを伴わない選択(YES/NO/NUMBER)ではcontextが落ちるため、
     両レイアウトでここに書く。
     """
@@ -402,12 +376,10 @@ def encoder_size() -> int:
     """
     # プレイヤー情報16 x 2人 + ターン情報3 + ポケモン枠の存在/HP 2 x 4枠 = 43
     # ターン資源フラグ4 + turnActionCount 1 + 被KO判定1 + ターンのバケット
-    non_card = 44 + 6 + TURN_BUCKETS + 4 * _pokemon_extra_size()
-    traits = attack_count() + skill_count()
-    if _shared():
-        # カード表4 + 技 + 特性は、いずれも枠をまたいで共有する
-        return _encoder_block_base() + non_card
-    return non_card + 20 * card_count() + 4 * traits
+    # + トラッシュ枚数1 + 手札スロットの枚数1 + 未確認カードの枚数1
+    non_card = 44 + 6 + 3 + TURN_BUCKETS + 4 * _pokemon_extra_size()
+    # カード表4 + 技 + 特性は、いずれも枠をまたいで共有する
+    return _encoder_block_base() + non_card
 
 
 def decoder_size() -> int:
@@ -505,15 +477,9 @@ def add_card(sv: SparseVector, card: "Card | Pokemon | None", role: int) -> None
         sv: 書き込み先の`SparseVector`。
         card: 対象のカード。存在しない場合はNone。
         role: `CARD_ROLE_*`。共有レイアウトでどのカード表へ書くかを決める。
-            per_roleレイアウトでは使用しない。
     """
-    if _shared():
-        if card is not None:
-            sv.add_absolute(role * card_count() + card.id, 1)
-        return
     if card is not None:
-        sv.add(card.id, 1)
-    sv.add_pos(card_count())
+        sv.add_absolute(role * card_count() + card.id, 1)
 
 
 def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float, role: int) -> None:
@@ -525,16 +491,10 @@ def add_cards(sv: SparseVector, cards: "list[Card] | None", value: float, role: 
         value: 1枚あたりの重み。
         role: `CARD_ROLE_*`。共有レイアウトでどのカード表へ書くかを決める。
     """
-    if _shared():
-        if cards is not None:
-            base = role * card_count()
-            for card in cards:
-                sv.add_absolute(base + card.id, value)
-        return
     if cards is not None:
+        base = role * card_count()
         for card in cards:
-            sv.add(card.id, value)
-    sv.add_pos(card_count())
+            sv.add_absolute(base + card.id, value)
 
 
 _max_damage_cache: dict[int, float] = {}
@@ -638,9 +598,7 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
     """
     if poke is None:
         sv.add_single(1)
-        skipped_cards = 0 if _shared() else 3 * card_count()
-        skipped_traits = 0 if _shared() else attack_count() + skill_count()
-        sv.add_pos(1 + skipped_cards + skipped_traits + _pokemon_extra_size())
+        sv.add_pos(1 + _pokemon_extra_size())
     else:
         sv.add_single(0)
         sv.add_single(poke.hp / 400)
@@ -700,28 +658,21 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         # 持っている技そのもの。選択肢として提示された技はデコーダ側で識別できるが、
         # 盤面としては最大打点しか渡っておらず、相手が何をしてくるかが分からなかった。
         # 1体の技は同じ役割なので、1ブロックにまとめて書ける。
-        if _shared():
-            for attack_id in card.attacks or []:
-                sv.add_absolute(_encoder_attack_offset() + attack_id, 1)
-        else:
-            for attack_id in card.attacks or []:
-                sv.add(attack_id, 1)
-            sv.add_pos(attack_count())
+        for attack_id in card.attacks or []:
+            sv.add_absolute(_encoder_attack_offset() + attack_id, 1)
 
         # 持っている特性。ポケモンの21%が特性持ちで、使える瞬間はABILITY選択肢として
         # 現れるが、「相手のベンチに特性持ちがいる」という盤面の把握ができていなかった。
-        if _shared():
-            for skill_id in card_skill_ids(poke.id):
-                sv.add_absolute(_encoder_skill_offset() + skill_id, 1)
-        else:
-            for skill_id in card_skill_ids(poke.id):
-                sv.add(skill_id, 1)
-            sv.add_pos(skill_count())
+        for skill_id in card_skill_ids(poke.id):
+            sv.add_absolute(_encoder_skill_offset() + skill_id, 1)
 
 
 def add_player(sv: SparseVector, ps: PlayerState) -> None:
     """片方のプレイヤーの盤面全体の数値情報(山札/手札/トラッシュ/ベンチ/サイド枚数、
-    状態異常、トラッシュの中身)をエンコーダに書き込む。
+    状態異常)をエンコーダに書き込む。
+
+    トラッシュの中身は`add_discard`が別トークンとして書く。ここに同居させると、
+    枚数や状態異常と同じトークンに数十枚分のカードIDが足し込まれ、埋もれる。
 
     Args:
         sv: 書き込み先の`SparseVector`。
@@ -740,7 +691,54 @@ def add_player(sv: SparseVector, ps: PlayerState) -> None:
     sv.add_single(ps.paralyzed)
     sv.add_single(ps.confused)
 
+
+def _visible_own_cards(ps: PlayerState) -> Counter:
+    """自分側で中身が判明しているカードを数える(手札・トラッシュ・場の全て)。
+
+    場のポケモンは進化元(`preEvolution`)を辿り、付いている道具とエネルギーも数える。
+    """
+    seen: Counter = Counter()
+    for card in (ps.hand or []) + (ps.discard or []):
+        if card is not None:
+            seen[card.id] += 1
+    for poke in (ps.active or []) + (ps.bench or []):
+        if poke is None:
+            continue
+        seen[poke.id] += 1
+        # 進化しているポケモンは、下に進化元のカードが重なっている。
+        for card in (poke.preEvolution or []) + (poke.tools or []) + (poke.energyCards or []):
+            if card is not None:
+                seen[card.id] += 1
+    return seen
+
+
+def add_unseen(sv: SparseVector, ps: PlayerState, your_deck: list[int]) -> None:
+    """まだ見えていない自分のカード(山札 + サイド)の推定構成を書き込む。
+
+    サイドは中身が完全に伏せられているため、「デッキ - 手札 - 場 - トラッシュ」の
+    引き算だけが、ドロー確率とサイド落ちを推定する手段になる。
+    デッキ・手札・場・トラッシュは別トークンとして既に入っているが、
+    `EmbeddingBag`の和として表現されたもの同士の差分をnetworkに学ばせるのは遠回りなので、
+    計算済みの値を明示的に渡す。
+    """
+    unseen = Counter(your_deck)
+    unseen.subtract(_visible_own_cards(ps))
+    total = 0
+    base = CARD_ROLE_ZONE * card_count()
+    for card_id, count in unseen.items():
+        if count > 0:
+            sv.add_absolute(base + card_id, 0.25 * count)
+            total += count
+    sv.add_single(total / 60)
+
+
+def add_discard(sv: SparseVector, ps: PlayerState) -> None:
+    """トラッシュの中身を1トークンとして書き込む。
+
+    何が落ちたかは、相手の残り札の推定にも回収カードの対象判断にも効く。
+    """
     add_cards(sv, ps.discard, 0.25, CARD_ROLE_ZONE)
+    sv.add_single(len(ps.discard) / 60)
 
 
 def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
@@ -762,18 +760,15 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     state = obs.current
 
     sv = SparseVector()
-    if _shared():
-        sv.add_pos(_encoder_block_base())
+    # 先頭は共有のカード表・技・特性ブロック。以降の非カード特徴はその後ろに置く。
+    sv.add_pos(_encoder_block_base())
     for i in range(2):
         ps = state.players[i ^ your_index]
-        for j in range(8):  # ベンチ最大8枠
+        for j in range(model_config.BENCH_SLOTS):
             sv.word_start()
             pos = sv.pos
-            if j < len(ps.bench):
-                add_pokemon(sv, ps.bench[j])
-            else:
-                add_pokemon(sv, None)
-            if j != 7:
+            add_pokemon(sv, ps.bench[j] if j < len(ps.bench) else None)
+            if j != model_config.BENCH_SLOTS - 1:
                 sv.pos = pos
 
     for i in range(2):
@@ -786,18 +781,39 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
         sv.word_start()
         add_player(sv, ps)
 
-    sv.word_start()
-    add_cards(sv, state.players[your_index].hand, 0.25, CARD_ROLE_ZONE)
+    for i in range(2):
+        ps = state.players[i ^ your_index]
+        sv.word_start()
+        pos = sv.pos
+        add_discard(sv, ps)
+        if i == 0:
+            sv.pos = pos  # 自分と相手のトラッシュは同じ役割なので同じ添字を使う
 
     sv.word_start()
-    if _shared():
-        base = CARD_ROLE_ZONE * card_count()
-        for card_id in your_deck:
-            sv.add_absolute(base + card_id, 0.25)
-    else:
-        for card_id in your_deck:
-            sv.add(card_id, 0.25)
-        sv.add_pos(card_count())
+    add_unseen(sv, state.players[your_index], your_deck)
+
+    # 手札の並び順はルール上意味を持たないので、カードIDでソートして決定的にする。
+    # 最後のスロットは溢れた分の合算。LayerNormが各トークンを正規化するため、
+    # 「和である」ことは大きさからは読み取れない。何枚分かを明示的に書く。
+    # HAND_TOKENS=1のときは、この経路がそのまま「全札を1トークンに合算」になる。
+    ordered = sorted(state.players[your_index].hand or [], key=lambda card: card.id)
+    last = model_config.HAND_TOKENS - 1
+    for slot in range(model_config.HAND_TOKENS):
+        sv.word_start()
+        pos = sv.pos
+        if slot < last:
+            add_cards(sv, ordered[slot : slot + 1], 0.25, CARD_ROLE_ZONE)
+            sv.add_single(1.0 / 8 if slot < len(ordered) else 0.0)
+        else:
+            add_cards(sv, ordered[last:], 0.25, CARD_ROLE_ZONE)
+            sv.add_single(len(ordered[last:]) / 8)
+        if slot != last:
+            sv.pos = pos  # 手札スロットは同じ役割なので同じ添字を使う
+
+    sv.word_start()
+    base = CARD_ROLE_ZONE * card_count()
+    for card_id in your_deck:
+        sv.add_absolute(base + card_id, 0.25)
 
     sv.word_start()
     add_cards(sv, state.stadium, 1.0, CARD_ROLE_ZONE)
@@ -945,18 +961,15 @@ def decoder_card_id(sv: SparseVector, context, card_id: int) -> None:
         # エンジン更新でSelectContextが増えると、共有レイアウトでは語彙の外へ書いてしまう。
         # 黙って壊れるより、原因の分かる例外にする。
         raise ValueError(f"SelectContext {int(context)} is outside the known range")
-    # 共有レイアウトはcontextごとにカード表を分けない(どのcontextかは`_mark_context`が
-    # 行動トークンごとに1回だけ記録する)。`per_role`はcontextごとに独立した表を持つ。
-    block = DECODER_MAIN_FEATURE if _shared() else DECODER_MAIN_FEATURE + int(context)
-    sv.add(_decoder_card_offset() + block * card_count() + card_id, 1)
+    # contextごとにカード表を分けない(どのcontextかは`_mark_context`が
+    # 行動トークンごとに1回だけ記録する)。
+    sv.add(_decoder_card_offset() + DECODER_MAIN_FEATURE * card_count() + card_id, 1)
 
 
 def _mark_context(sv: SparseVector, context) -> None:
     """この行動トークンのSelectContextを1回だけ記録する。
 
-    共有レイアウトではcontextごとのカード表を持たないため必須。`per_role`でも、
-    YES/NO/NUMBERのようにカードを伴わない選択ではcontextがどこにも入らないため、
-    両レイアウトで書く。
+    contextごとのカード表を持たないため、ここで書かないとどの文脈の選択か分からない。
 
     カード参照のたびに立てると「その行動が何枚選ぶか」がcontextの埋め込みに
     掛かった形で混入するので、行動トークンごとに1回だけにする。

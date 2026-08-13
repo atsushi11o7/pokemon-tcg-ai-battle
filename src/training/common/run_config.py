@@ -164,6 +164,7 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         "bc": {
             "shard_dir",
             "val_shards",
+            "holdout_shards",
             "learning_rate",
             "batch_size",
             "value_loss_coef",
@@ -178,6 +179,7 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         "value_loss_coef",
         "warmup_steps",
         "freeze_policy",
+        "holdout_shards",
     }
     required = (common_fields | algorithm_fields) - optional_fields
     missing = required - set(training)

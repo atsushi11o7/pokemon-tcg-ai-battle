@@ -65,25 +65,6 @@ class HpRatioBucketTest(unittest.TestCase):
             self.assertIn(sf._hp_ratio_bucket(ratio), range(sf.HP_RATIO_BUCKETS))
 
 
-class FeatureLayoutTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._original = sf.feature_layout()
-
-    def tearDown(self) -> None:
-        sf.configure_feature_layout(self._original)
-
-    def test_shared_layout_is_much_smaller(self) -> None:
-        sf.configure_feature_layout("per_role")
-        per_role = sf.encoder_size() + sf.decoder_size()
-        sf.configure_feature_layout("shared_card")
-        shared = sf.encoder_size() + sf.decoder_size()
-        self.assertLess(shared * 4, per_role)
-
-    def test_unknown_layout_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            sf.configure_feature_layout("nonexistent")
-
-
 class DeclaredSizeMatchesWritesTest(unittest.TestCase):
     """宣言サイズと実際の書き込み量が一致すること。
 
@@ -121,77 +102,32 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
             battle_finish()
         return collected, deck
 
-    def test_layouts_carry_the_same_information(self) -> None:
-        """2つのレイアウトが同じ情報を運んでいること。
-
-        共有レイアウトは添字の付け方を変えるだけなので、トークンごとに書き込む値の
-        多重集合はencoder/decoderとも`per_role`と一致するはず。ずれていれば、
-        片方のレイアウトだけ情報が欠けているか重複している
-        (以前、共有側でcontextマーカーがカード枚数ぶん重複加算されており、
-        さらに`per_role`ではカードを伴わない選択でcontextが落ちていた)。
-        """
-        from cg.api import to_observation_class
-
-        original = sf.feature_layout()
-        observations, deck = self._mid_game_observations()
-        try:
-            for obs_dict in observations:
-                obs = to_observation_class(obs_dict)
-                actions = [[i] for i in range(len(obs.select.option))] or [[]]
-
-                sf.configure_feature_layout("per_role")
-                per_enc = _token_values(sf.get_encoder_input(obs, deck))
-                per_dec = _token_values(sf.get_decoder_input(obs, actions))
-                sf.configure_feature_layout("shared_card")
-                shared_enc = _token_values(sf.get_encoder_input(obs, deck))
-                shared_dec = _token_values(sf.get_decoder_input(obs, actions))
-
-                self.assertEqual(per_enc, shared_enc, "encoderの情報量がレイアウト間でずれた")
-                self.assertEqual(per_dec, shared_dec, "decoderの情報量がレイアウト間でずれた")
-        finally:
-            sf.configure_feature_layout(original)
-
     def test_encoder_size_matches_written_positions(self) -> None:
         from cg.api import to_observation_class
 
-        original = sf.feature_layout()
         observations, deck = self._mid_game_observations()
         self.assertGreater(len(observations), 0, "場にポケモンが並んだ局面を取得できなかった")
-        try:
-            for layout in ("per_role", "shared_card"):
-                sf.configure_feature_layout(layout)
-                for obs_dict in observations:
-                    obs = to_observation_class(obs_dict)
-                    written = sf.get_encoder_input(obs, deck)
-                    self.assertEqual(
-                        written.pos,
-                        sf.encoder_size(),
-                        f"{layout}: encoder_size()が実際の書き込み量と一致しない",
-                    )
-                    self.assertLess(max(written.index), sf.encoder_size())
-                    self.assertGreaterEqual(min(written.index), 0)
-        finally:
-            sf.configure_feature_layout(original)
+        for obs_dict in observations:
+            obs = to_observation_class(obs_dict)
+            written = sf.get_encoder_input(obs, deck)
+            self.assertEqual(
+                written.pos, sf.encoder_size(), "encoder_size()が実際の書き込み量と一致しない"
+            )
+            self.assertLess(max(written.index), sf.encoder_size())
+            self.assertGreaterEqual(min(written.index), 0)
 
     def test_decoder_indices_stay_in_range(self) -> None:
         from cg.api import to_observation_class
 
-        original = sf.feature_layout()
         observations, _deck = self._mid_game_observations()
-        try:
-            for layout in ("per_role", "shared_card"):
-                sf.configure_feature_layout(layout)
-                for obs_dict in observations:
-                    obs = to_observation_class(obs_dict)
-                    select = obs.select
-                    actions = [[i] for i in range(len(select.option))] or [[]]
-                    written = sf.get_decoder_input(obs, actions)
-                    if not written.index:
-                        continue
-                    self.assertLess(max(written.index), sf.decoder_size(), layout)
-                    self.assertGreaterEqual(min(written.index), 0)
-        finally:
-            sf.configure_feature_layout(original)
+        for obs_dict in observations:
+            obs = to_observation_class(obs_dict)
+            actions = [[i] for i in range(len(obs.select.option))] or [[]]
+            written = sf.get_decoder_input(obs, actions)
+            if not written.index:
+                continue
+            self.assertLess(max(written.index), sf.decoder_size())
+            self.assertGreaterEqual(min(written.index), 0)
 
     def test_token_count_matches_network_definition(self) -> None:
         """書き込むトークン数と`network.py`のowner/zone定義が一致すること。
@@ -202,16 +138,10 @@ class DeclaredSizeMatchesWritesTest(unittest.TestCase):
 
         from training.common import network
 
-        original = sf.feature_layout()
         observations, deck = self._mid_game_observations()
-        try:
-            for layout in ("per_role", "shared_card"):
-                sf.configure_feature_layout(layout)
-                for obs_dict in observations:
-                    written = sf.get_encoder_input(to_observation_class(obs_dict), deck)
-                    self.assertEqual(len(written.offset), network.NUM_WORDS_ENCODER, layout)
-        finally:
-            sf.configure_feature_layout(original)
+        for obs_dict in observations:
+            written = sf.get_encoder_input(to_observation_class(obs_dict), deck)
+            self.assertEqual(len(written.offset), network.NUM_WORDS_ENCODER)
         self.assertEqual(len(network._TOKEN_OWNER_ZONE), network.NUM_WORDS_ENCODER + 1)
 
     def test_non_empty_pokemon_branch_is_actually_exercised(self) -> None:
