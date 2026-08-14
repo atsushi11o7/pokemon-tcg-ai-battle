@@ -5,10 +5,9 @@ run:
 algorithm: bc
 
 model:
-  # ラダーで実証済みの v2 から始める(Dragapult 1012.7 / Grimmsnarl 1005.2)。
-  # v3も候補だが収束待ちで未検証。141シャードなら1エポック約20分なので、
-  # 朝にv3が勝っていれば作り直せばよい。
-  initial_checkpoint: outputs/runs/bc_toplayers_v2/checkpoints/final.pt
+  # v3(39日・質でフィルタ)から始める。ラダーで上昇中(Grimmsnarl 894.5、提出1.5時間)で、
+  # v2より多くのデータを見ている。収束前だが、より情報量の多い重みを土台にする。
+  initial_checkpoint: outputs/runs/bc_v3_quality_days/checkpoints/final.pt
 
 data:
   sampling_snapshot: data/meta/derived/sampling_snapshot.json
