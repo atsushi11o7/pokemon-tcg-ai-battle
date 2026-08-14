@@ -58,6 +58,7 @@ class BcTrainingLoopTest(unittest.TestCase):
             shard_dir=shard_dir,
             val_shards=1,
             holdout_shards=1,
+            min_shard_day=None,
             n_rounds=1,
             batch_size=4,
             learning_rate=1e-4,
@@ -117,6 +118,7 @@ class ShardSplitTest(unittest.TestCase):
             shard_dir=self.shard_dir,
             val_shards=val_shards,
             holdout_shards=holdout_shards,
+            min_shard_day=None,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -188,9 +190,6 @@ class ShardCountCacheTest(unittest.TestCase):
         self.assertEqual(shard_sample_counts(self.paths, self.tmp), [5, 3])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class HoldoutGuardTest(unittest.TestCase):
     """holdoutが全シャードを飲み込んだら止まること。
@@ -219,6 +218,7 @@ class HoldoutGuardTest(unittest.TestCase):
             shard_dir=self.shard_dir,
             val_shards=1,
             holdout_shards=holdout,
+            min_shard_day=None,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -239,6 +239,9 @@ class HoldoutGuardTest(unittest.TestCase):
         run_training_loop(self._settings(holdout=2), None)
         self.assertTrue((self.tmp / "checkpoints" / "generalist_round1.pt").exists())
 
+
+if __name__ == "__main__":
+    unittest.main()
 
 if __name__ == "__main__":
     unittest.main()

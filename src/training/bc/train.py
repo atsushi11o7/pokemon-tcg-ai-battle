@@ -56,6 +56,7 @@ class BcSettings:
     shard_dir: Path
     val_shards: int
     holdout_shards: int
+    min_shard_day: str | None
     n_rounds: int
     batch_size: int
     learning_rate: float
@@ -75,6 +76,7 @@ class BcSettings:
             shard_dir=Path(settings["shard_dir"]),
             val_shards=int(settings["val_shards"]),
             holdout_shards=int(settings.get("holdout_shards", settings["val_shards"])),
+            min_shard_day=settings.get("min_shard_day"),
             n_rounds=config.n_rounds,
             batch_size=int(settings["batch_size"]),
             learning_rate=float(settings["learning_rate"]),
@@ -140,6 +142,10 @@ def evaluate(network: PolicyValueNet, samples: list, batch_size: int, device) ->
 def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> PolicyValueNet:
     device = training_device()
     shards = sorted(settings.shard_dir.glob("shard_*.pt"))
+    if settings.min_shard_day:
+        # シャード名は`shard_YYYYMMDD_NNNN.pt`。日付は固定幅なので文字列比較でよい。
+        # 直近だけで仕上げるとき、古い期間を丸ごと落とすために使う。
+        shards = [p for p in shards if p.name.split("_")[1] >= settings.min_shard_day]
     if len(shards) <= settings.val_shards:
         raise RuntimeError(f"not enough shards in {settings.shard_dir}: {len(shards)}")
 
