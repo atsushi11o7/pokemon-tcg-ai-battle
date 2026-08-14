@@ -10,6 +10,7 @@ zipは展開しない(11日分で236GBになる)。メンバーを1つずつ読�
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -176,11 +177,42 @@ def iter_replays(zip_paths: list[Path], stats: Counter) -> Iterator[dict]:
                     stats["skip_unreadable"] += 1
 
 
+def drop_from_page_cache(path: Path) -> None:
+    """読み終えたシャードをページキャッシュから追い出す。
+
+    WSL2のゲスト内ページキャッシュは、Windows側の`vmmem`のメモリとして実体化する。
+    1エポックは401シャード(68GB)を読み流すので、放っておくとキャッシュが空きメモリを
+    埋め尽くし、ホストのメモリを占有し続ける。一方エポックごとにシャード順を
+    シャッフルするため、13GBのキャッシュに68GBの作業集合が載るはずもなく、
+    再利用はほぼ起きない。効果の無いキャッシュのために圧迫するのは損でしかない。
+
+    `/proc/sys/vm/drop_caches`はコンテナから書けない(read-only)ので、ファイル単位で
+    指示するこの経路を使う。失敗しても学習は続けられるので握り潰す。
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except (OSError, AttributeError):
+        pass  # 対応していない環境では何もしない
+    finally:
+        os.close(fd)
+
+
+def load_shard(path: Path) -> list[Sample]:
+    """シャードを1枚読み、読み終えたらページキャッシュから外す。"""
+    samples = torch.load(path, weights_only=False)
+    drop_from_page_cache(path)
+    return samples
+
+
 def load_shard_paths(paths: Iterable[Path]) -> list[Sample]:
     """指定したシャードだけを読む。"""
     samples: list[Sample] = []
     for path in paths:
-        samples.extend(torch.load(path, weights_only=False))
+        samples.extend(load_shard(path))
     return samples
 
 
@@ -214,7 +246,7 @@ def shard_sample_counts(paths: list[Path], cache_dir: Path) -> list[int]:
         if entry is not None and entry[0] == size:
             counts.append(entry[1])
             continue
-        count = len(torch.load(path, weights_only=False))
+        count = len(load_shard(path))
         cached[path.name] = [size, count]
         counts.append(count)
         updated = True

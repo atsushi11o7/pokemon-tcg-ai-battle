@@ -17,7 +17,12 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from training.bc.dataset import SHARD_COUNT_CACHE, shard_sample_counts
+from training.bc.dataset import (
+    SHARD_COUNT_CACHE,
+    drop_from_page_cache,
+    load_shard,
+    shard_sample_counts,
+)
 from training.bc.train import BcSettings, run_training_loop  # noqa: E402
 from training.common.network import NUM_WORDS_ENCODER  # noqa: E402
 from training.common.sparse_features import (  # noqa: E402
@@ -190,7 +195,6 @@ class ShardCountCacheTest(unittest.TestCase):
         self.assertEqual(shard_sample_counts(self.paths, self.tmp), [5, 3])
 
 
-
 class HoldoutGuardTest(unittest.TestCase):
     """holdoutが全シャードを飲み込んだら止まること。
 
@@ -242,6 +246,55 @@ class HoldoutGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageCacheTest(unittest.TestCase):
+    """シャードを読んだ後、ページキャッシュに残さないこと。
+
+    WSL2のゲスト内ページキャッシュはWindows側の`vmmem`のメモリとして実体化する。
+    1エポックで68GBを読み流すため、放置するとホストのメモリを占有し続ける。
+    エポックごとにシャード順をシャッフルする以上キャッシュの再利用はほぼ無く、
+    効果の無い占有でしかない。効かなくなっても例外は出ないのでテストで固定する。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "shard_20260812_0000.pt"
+        torch.save([_sample(3) for _ in range(200)], self.path)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _cached_kb() -> int:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("Cached:"):
+                return int(line.split()[1])
+        return 0
+
+    def test_load_shard_returns_the_samples(self) -> None:
+        self.assertEqual(len(load_shard(self.path)), 200)
+
+    def test_shard_is_evicted_after_loading(self) -> None:
+        if not Path("/proc/meminfo").exists():
+            self.skipTest("/proc/meminfo が無い環境")
+        size_kb = self.path.stat().st_size // 1024
+        if size_kb < 1024:
+            self.skipTest("差分がノイズに埋もれる大きさ")
+        load_shard(self.path)
+        after_evict = self._cached_kb()
+        with self.path.open("rb") as handle:
+            handle.read()
+        after_read = self._cached_kb()
+        self.assertGreater(
+            after_read - after_evict,
+            size_kb // 2,
+            "読み直してもCachedが増えない=そもそも計測できていない",
+        )
+
+    def test_missing_file_is_ignored(self) -> None:
+        drop_from_page_cache(self.tmp / "does_not_exist.pt")  # 例外を出さない
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,7 +41,7 @@ from ..common.training_utils import (
     move_optimizer_state_to,
     training_device,
 )
-from .dataset import load_shard_paths, shard_sample_counts
+from .dataset import load_shard, load_shard_paths, shard_sample_counts
 
 # 統一CLIは`<selfplay_mode>_roundN.pt`を探して進捗表示と再開判定を行う。BCは自己対戦を
 # しないがモードは"generalist"を返すので、それに合わせないと再開もstatusも効かない。
@@ -230,7 +230,7 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
         random.Random(settings.seed + round_num).shuffle(epoch_paths)
         # シャードを1つずつ載せる。全部同時に持つと数十GBになる。
         for shard_index, path in enumerate(epoch_paths, start=1):
-            samples = torch.load(path, weights_only=False)
+            samples = load_shard(path)
             lengths = [len(sample.policy_target) for sample in samples]
             loader = DataLoader(
                 ListDataset(samples),
