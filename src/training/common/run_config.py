@@ -167,6 +167,7 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
             "holdout_shards",
             "min_shard_day",
             "loser_policy_weight",
+            "freeze_policy",
             "learning_rate",
             "batch_size",
             "value_loss_coef",

@@ -37,6 +37,7 @@ from ..common.training_utils import (
     LengthBucketSampler,
     ListDataset,
     collate_samples,
+    configure_trainable_parameters,
     masked_policy_loss,
     move_optimizer_state_to,
     training_device,
@@ -58,6 +59,7 @@ class BcSettings:
     holdout_shards: int
     min_shard_day: str | None
     loser_policy_weight: float
+    freeze_policy: bool
     n_rounds: int
     batch_size: int
     learning_rate: float
@@ -79,6 +81,7 @@ class BcSettings:
             holdout_shards=int(settings.get("holdout_shards", settings["val_shards"])),
             min_shard_day=settings.get("min_shard_day"),
             loser_policy_weight=float(settings.get("loser_policy_weight", 1.0)),
+            freeze_policy=bool(settings.get("freeze_policy", False)),
             n_rounds=config.n_rounds,
             batch_size=int(settings["batch_size"]),
             learning_rate=float(settings["learning_rate"]),
@@ -207,7 +210,11 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
         network = load_policy_value_net(resume.initial_checkpoint)
     else:
         network = build_policy_value_net()
-    optimizer = torch.optim.Adam(network.parameters(), lr=settings.learning_rate)
+    # `freeze_policy`のときは`encoder_fc`だけを更新する。方策側はエンコーダ出力全体へ
+    # 交差注意し、`encoder_fc`はCLSトークンから価値を読むだけなので、方策の出力は
+    # ビット単位で不変になる。ラダーで実績のある方策を壊さずに価値だけ鍛えられる。
+    trainable = configure_trainable_parameters(network, settings.freeze_policy)
+    optimizer = torch.optim.Adam(trainable, lr=settings.learning_rate)
     if resume.optimizer_checkpoint is not None:
         restore_optimizer_state(
             optimizer,
@@ -240,7 +247,11 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
         print(f"=== epoch {round_num}/{settings.n_rounds} ===", flush=True)
         network.to(device)
         move_optimizer_state_to(optimizer, device)
-        network.train()
+        if settings.freeze_policy:
+            # dropoutを切る。エンコーダの出力が揺れると価値ヘッドが見る特徴が安定しない。
+            network.eval()
+        else:
+            network.train()
         policy_seen = value_seen = 0
         policy_sum = value_sum = 0.0
         # シャードは抽出順(=日付順)に並んでいる。固定順で回すとエポックの終端が常に
@@ -267,13 +278,17 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
                 (idx_e, val_e, off_e, idx_d, val_d, off_d, mask, targets, labels) = tensors
                 targets = mask_loser_targets(targets, labels, settings.loser_policy_weight)
                 values, scores = network(idx_e, val_e, off_e, idx_d, val_d, off_d, mask)
-                policy_loss = masked_policy_loss(scores, mask, targets)
                 value_loss = functional.mse_loss(values.squeeze(-1), labels)
-                loss = policy_loss + settings.value_loss_coef * value_loss
+                if settings.freeze_policy:
+                    policy_loss = masked_policy_loss(scores, mask, targets).detach()
+                    loss = settings.value_loss_coef * value_loss
+                else:
+                    policy_loss = masked_policy_loss(scores, mask, targets)
+                    loss = policy_loss + settings.value_loss_coef * value_loss
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
 

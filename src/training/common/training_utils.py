@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import Dataset, Sampler
 
-from .network import collate_encoder_decoder
+from .network import PolicyValueNet, collate_encoder_decoder
 
 
 def training_device() -> torch.device:
@@ -153,3 +153,27 @@ class LengthBucketSampler(Sampler):
 
     def __len__(self) -> int:
         return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+
+def configure_trainable_parameters(
+    network: PolicyValueNet, freeze_policy: bool
+) -> list[torch.nn.Parameter]:
+    """`requires_grad`を設定し、更新対象のパラメータを返す。
+
+    `freeze_policy`のとき`encoder_fc`だけを更新する。方策側は`encoder`の出力全体へ交差注意し、
+    `encoder_fc`はCLSトークンから価値を読むだけなので、ここだけ動かせば方策の出力は
+    ビット単位で不変になる。模倣学習で得た方策を保ったまま、価値の精度だけ上げたいときに使う。
+
+    optimizerへ渡す集合を絞るだけでは足りない。`requires_grad`が立ったままだと autograd が
+    encoder/decoder の計算グラフを保持して逆伝播し、`optimizer.zero_grad()`の対象外である
+    それらの`.grad`がバッチをまたいで溜まり続ける。更新はされないので出力は変わらず、
+    計算とメモリだけを捨てることになる。設定と選択を1つの関数に閉じ込めて、
+    optimizerを作るたびに必ず両方が揃うようにしている。
+    """
+    for parameter in network.parameters():
+        parameter.requires_grad_(not freeze_policy)
+    if not freeze_policy:
+        return list(network.parameters())
+    for parameter in network.encoder_fc.parameters():
+        parameter.requires_grad_(True)
+    return list(network.encoder_fc.parameters())

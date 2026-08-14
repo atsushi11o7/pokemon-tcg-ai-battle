@@ -17,7 +17,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from training.bc.dataset import (
+from training.bc.dataset import (  # noqa: E402
     SHARD_COUNT_CACHE,
     drop_from_page_cache,
     load_shard,
@@ -28,12 +28,16 @@ from training.bc.train import (  # noqa: E402
     mask_loser_targets,
     run_training_loop,
 )
-from training.common.network import NUM_WORDS_ENCODER  # noqa: E402
+from training.common.network import (  # noqa: E402
+    NUM_WORDS_ENCODER,
+    build_policy_value_net,
+)
 from training.common.sparse_features import (  # noqa: E402
     SparseVector,
     decoder_size,
     encoder_size,
 )
+from training.common.training_utils import collate_samples  # noqa: E402
 from training.mcts.selfplay import Sample  # noqa: E402
 
 
@@ -69,6 +73,7 @@ class BcTrainingLoopTest(unittest.TestCase):
             holdout_shards=1,
             min_shard_day=None,
             loser_policy_weight=1.0,
+            freeze_policy=False,
             n_rounds=1,
             batch_size=4,
             learning_rate=1e-4,
@@ -130,6 +135,7 @@ class ShardSplitTest(unittest.TestCase):
             holdout_shards=holdout_shards,
             min_shard_day=None,
             loser_policy_weight=1.0,
+            freeze_policy=False,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -230,6 +236,7 @@ class HoldoutGuardTest(unittest.TestCase):
             holdout_shards=holdout,
             min_shard_day=None,
             loser_policy_weight=1.0,
+            freeze_policy=False,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -299,10 +306,6 @@ class PageCacheTest(unittest.TestCase):
         drop_from_page_cache(self.tmp / "does_not_exist.pt")  # 例外を出さない
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LoserPolicyWeightTest(unittest.TestCase):
     """敗者の局面の方策教師に、設定した重みだけが掛かること。
 
@@ -341,6 +344,95 @@ class LoserPolicyWeightTest(unittest.TestCase):
         ).backward()
         self.assertGreater(scores.grad[0].abs().sum().item(), 0.0)
         self.assertEqual(scores.grad[1].abs().sum().item(), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class BcFreezePolicyTest(unittest.TestCase):
+    """`freeze_policy`のBC学習が、方策を1ビットも動かさずに価値だけ更新すること。
+
+    ラダーで実績のある方策(1000点超)を保ったまま価値ヘッドだけ鍛えるための仕掛け。
+    エンコーダごと凍結するので、方策と価値が共有する表現が価値側へ引っ張られる
+    問題自体が起きない。壊れても例外にならず静かに劣化するので、テストで固定する。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.shard_dir = self.tmp / "shards"
+        self.shard_dir.mkdir()
+        for day in ("20260810", "20260811", "20260812"):
+            for index in range(2):
+                samples = [_sample(3) for _ in range(6)]
+                for i, s in enumerate(samples):
+                    s.label = 1.0 if i % 2 else -1.0
+                torch.save(samples, self.shard_dir / f"shard_{day}_{index:04d}.pt")
+        torch.manual_seed(123)
+        self.probe = collate_samples([_sample(4), _sample(3)])
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _settings(self, freeze: bool) -> BcSettings:
+        return BcSettings(
+            run_name="freeze",
+            checkpoint_dir=self.tmp / ("ck_f" if freeze else "ck_n"),
+            output_dir=self.tmp,
+            shard_dir=self.shard_dir,
+            val_shards=1,
+            holdout_shards=2,
+            min_shard_day=None,
+            loser_policy_weight=0.0,
+            freeze_policy=freeze,
+            n_rounds=1,
+            batch_size=3,
+            learning_rate=1e-2,
+            value_loss_coef=1.0,
+            warmup_steps=1,
+            seed=0,
+            loader_workers=0,
+            keep_last_checkpoints=1,
+        )
+
+    def _probe(self, network):
+        # プローブ入力は固定する。毎回作り直すと、比べているのが重みの差なのか
+        # 入力の差なのか分からなくなる。
+        network.eval()
+        with torch.no_grad():
+            values, scores = network(*self.probe[:6], self.probe[6])
+        return scores.clone(), values.clone()
+
+    def test_policy_is_bit_identical_after_frozen_training(self) -> None:
+        settings = self._settings(freeze=True)
+        settings.checkpoint_dir.mkdir(parents=True)
+        torch.manual_seed(0)
+        before_net = build_policy_value_net()
+        torch.save(before_net.state_dict(), self.tmp / "init.pt")
+        before_scores, before_values = self._probe(before_net)
+
+        after_net = run_training_loop(settings, self.tmp / "init.pt")
+        after_scores, after_values = self._probe(after_net)
+
+        # 厳密一致ではなくfloat32の丸め幅で見る。学習はGPUで行われ、凍結した重みでも
+        # デバイス間の移動と演算順序の違いで最下位ビットが揺れる(実測1.2e-07)。
+        drift = (before_scores - after_scores).abs().max().item()
+        self.assertLess(drift, 1e-5, f"方策が動いた: 最大差 {drift}")
+        self.assertGreater(
+            (before_values - after_values).abs().max().item(), 1e-7, "価値が更新されていない"
+        )
+
+    def test_unfrozen_training_moves_the_policy(self) -> None:
+        """対照。凍結しなければ方策も動く(テストが空振りしていないことの確認)。"""
+        settings = self._settings(freeze=False)
+        settings.checkpoint_dir.mkdir(parents=True)
+        torch.manual_seed(0)
+        net = build_policy_value_net()
+        torch.save(net.state_dict(), self.tmp / "init2.pt")
+        before_scores, _ = self._probe(net)
+        after = run_training_loop(settings, self.tmp / "init2.pt")
+        after_scores, _ = self._probe(after)
+        self.assertFalse(torch.equal(before_scores, after_scores))
 
 
 if __name__ == "__main__":
