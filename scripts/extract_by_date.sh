@@ -5,9 +5,13 @@
 set -u
 OUT=${1:-data/bc/shards_dated}
 JOBS=${2:-4}
+# 3番目以降は extract_bc_samples.py へそのまま渡す(例: --imitate-loser)。
+shift 2 2>/dev/null || true
+EXTRA=("$@")
 mkdir -p "$OUT"
 run_one() {
   local zip="$1" out="$2"
+  shift 2
   local date; date=$(basename "$zip" | sed 's|.*episodes-||;s|\.zip$||')
   local stamp=${date//-/}
   local tmp="$out/.tmp_$stamp"
@@ -17,7 +21,7 @@ run_one() {
   fi
   rm -rf "$tmp"; mkdir -p "$tmp"
   echo "$(date +%T) start $date"
-  if uv run python -u scripts/extract_bc_samples.py --zips "$zip" --output "$tmp" --shard-size 50000 \
+  if uv run python -u scripts/extract_bc_samples.py --zips "$zip" --output "$tmp" --shard-size 50000 "$@" \
       > "$out/.log_$stamp" 2>&1; then
     local i=0
     for f in "$tmp"/shard_*.pt; do
@@ -31,5 +35,5 @@ run_one() {
   fi
 }
 export -f run_one
-ls data/bc/raw/*.zip | sort | xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} "$OUT"
+ls data/bc/raw/*.zip | sort | xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} "$OUT" "${EXTRA[@]}"
 echo "ALL DONE $(date +%T)  shards=$(ls "$OUT"/shard_*.pt 2>/dev/null | wc -l)"

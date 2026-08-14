@@ -23,7 +23,11 @@ from training.bc.dataset import (
     load_shard,
     shard_sample_counts,
 )
-from training.bc.train import BcSettings, run_training_loop  # noqa: E402
+from training.bc.train import (  # noqa: E402
+    BcSettings,
+    mask_loser_targets,
+    run_training_loop,
+)
 from training.common.network import NUM_WORDS_ENCODER  # noqa: E402
 from training.common.sparse_features import (  # noqa: E402
     SparseVector,
@@ -64,6 +68,7 @@ class BcTrainingLoopTest(unittest.TestCase):
             val_shards=1,
             holdout_shards=1,
             min_shard_day=None,
+            loser_policy_weight=1.0,
             n_rounds=1,
             batch_size=4,
             learning_rate=1e-4,
@@ -124,6 +129,7 @@ class ShardSplitTest(unittest.TestCase):
             val_shards=val_shards,
             holdout_shards=holdout_shards,
             min_shard_day=None,
+            loser_policy_weight=1.0,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -223,6 +229,7 @@ class HoldoutGuardTest(unittest.TestCase):
             val_shards=1,
             holdout_shards=holdout,
             min_shard_day=None,
+            loser_policy_weight=1.0,
             n_rounds=1,
             batch_size=2,
             learning_rate=1e-4,
@@ -242,10 +249,6 @@ class HoldoutGuardTest(unittest.TestCase):
         (self.tmp / "checkpoints").mkdir(parents=True)
         run_training_loop(self._settings(holdout=2), None)
         self.assertTrue((self.tmp / "checkpoints" / "generalist_round1.pt").exists())
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PageCacheTest(unittest.TestCase):
@@ -294,6 +297,50 @@ class PageCacheTest(unittest.TestCase):
 
     def test_missing_file_is_ignored(self) -> None:
         drop_from_page_cache(self.tmp / "does_not_exist.pt")  # 例外を出さない
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class LoserPolicyWeightTest(unittest.TestCase):
+    """敗者の局面の方策教師に、設定した重みだけが掛かること。
+
+    シャードには敗者の手もone-hotで入っている。何倍で使うかを学習時に決めることで、
+    抽出をやり直さずに 0.0(勝者のみ)〜1.0(同等)を比較できる。ここがずれると
+    「勝者だけのはずが敗者も混ざる」といった取り違えが静かに起きる。
+    """
+
+    def setUp(self) -> None:
+        # 1件目が勝者(label +1)、2件目が敗者(label -1)
+        self.targets = torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+        self.labels = torch.tensor([1.0, -1.0])
+
+    def test_weight_one_keeps_everything(self) -> None:
+        out = mask_loser_targets(self.targets, self.labels, 1.0)
+        self.assertTrue(torch.equal(out, self.targets))
+
+    def test_weight_zero_silences_the_loser_only(self) -> None:
+        out = mask_loser_targets(self.targets, self.labels, 0.0)
+        self.assertTrue(torch.equal(out[0], self.targets[0]), "勝者側まで消している")
+        self.assertEqual(out[1].sum().item(), 0.0)
+
+    def test_partial_weight_scales_the_loser_only(self) -> None:
+        out = mask_loser_targets(self.targets, self.labels, 0.3)
+        self.assertTrue(torch.equal(out[0], self.targets[0]))
+        self.assertAlmostEqual(out[1].max().item(), 0.3, places=6)
+
+    def test_zeroed_loser_rows_produce_no_policy_gradient(self) -> None:
+        """重み0の敗者行が、実際に勾配を出さないこと。"""
+        from training.common.training_utils import masked_policy_loss
+
+        scores = torch.randn(2, 3, requires_grad=True)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        masked_policy_loss(
+            scores, mask, mask_loser_targets(self.targets, self.labels, 0.0)
+        ).backward()
+        self.assertGreater(scores.grad[0].abs().sum().item(), 0.0)
+        self.assertEqual(scores.grad[1].abs().sum().item(), 0.0)
 
 
 if __name__ == "__main__":

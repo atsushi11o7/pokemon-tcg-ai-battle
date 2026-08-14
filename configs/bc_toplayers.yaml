@@ -1,0 +1,32 @@
+run:
+  name: bc_toplayers
+  output_dir: outputs/runs/bc_toplayers
+
+algorithm: bc
+
+model:
+  initial_checkpoint: null
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 4
+  game_timeout_seconds: 60
+  round_timeout_seconds: 1800
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 5
+
+training:
+  shard_dir: data/bc/shards
+  # 敗者の手を模倣する強さ(0.0=勝者のみ / 1.0=勝者と同等)。
+  # このrunは敗者の教師を持たないシャードを使っており、勝者のみを模倣している。
+  loser_policy_weight: 0.0
+  val_shards: 4
+  rounds: 6
+  batch_size: 256
+  learning_rate: 0.0003
+  value_loss_coef: 0.1
+  warmup_steps: 500

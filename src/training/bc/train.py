@@ -57,6 +57,7 @@ class BcSettings:
     val_shards: int
     holdout_shards: int
     min_shard_day: str | None
+    loser_policy_weight: float
     n_rounds: int
     batch_size: int
     learning_rate: float
@@ -77,6 +78,7 @@ class BcSettings:
             val_shards=int(settings["val_shards"]),
             holdout_shards=int(settings.get("holdout_shards", settings["val_shards"])),
             min_shard_day=settings.get("min_shard_day"),
+            loser_policy_weight=float(settings.get("loser_policy_weight", 1.0)),
             n_rounds=config.n_rounds,
             batch_size=int(settings["batch_size"]),
             learning_rate=float(settings["learning_rate"]),
@@ -106,8 +108,25 @@ def policy_accuracy(scores: torch.Tensor, mask: torch.Tensor, targets: torch.Ten
     return int((predicted == expected).sum().item()), int(predicted.shape[0])
 
 
+def mask_loser_targets(targets: torch.Tensor, labels: torch.Tensor, weight: float) -> torch.Tensor:
+    """敗者の局面の方策教師を`weight`倍する。
+
+    シャードには敗者の手もone-hotで入っている(`--imitate-loser`で抽出)。何倍で使うかを
+    学習時に決められるようにして、抽出をやり直さずに 0.0(勝者のみ)〜1.0(同等)を比較する。
+    敗者かどうかは価値の教師で判別する(`label`は勝ち+1・負け-1で、引き分けは抽出時に除外)。
+    """
+    if weight == 1.0:
+        return targets
+    scale = torch.where(labels < 0, torch.full_like(labels, weight), torch.ones_like(labels))
+    return targets * scale.unsqueeze(1)
+
+
 def evaluate(network: PolicyValueNet, samples: list, batch_size: int, device) -> dict:
-    """検証シャードで方策精度と損失を測る。"""
+    """検証シャードで方策精度と損失を測る。
+
+    方策の指標は常に勝者の手だけで測る。`loser_policy_weight`を動かしても指標の定義が
+    変わらないようにするため(定義が動くと、良くなったのか測り方が変わったのか分からない)。
+    """
     if not samples:
         return {}
     loader = DataLoader(
@@ -123,6 +142,7 @@ def evaluate(network: PolicyValueNet, samples: list, batch_size: int, device) ->
         for batch in loader:
             tensors = [tensor.to(device) for tensor in batch]
             (idx_e, val_e, off_e, idx_d, val_d, off_d, mask, targets, labels) = tensors
+            targets = mask_loser_targets(targets, labels, 0.0)
             values, scores = network(idx_e, val_e, off_e, idx_d, val_d, off_d, mask)
             hit, count = policy_accuracy(scores, mask, targets)
             correct += hit
@@ -245,6 +265,7 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
             for batch in loader:
                 tensors = [tensor.to(device) for tensor in batch]
                 (idx_e, val_e, off_e, idx_d, val_d, off_d, mask, targets, labels) = tensors
+                targets = mask_loser_targets(targets, labels, settings.loser_policy_weight)
                 values, scores = network(idx_e, val_e, off_e, idx_d, val_d, off_d, mask)
                 policy_loss = masked_policy_loss(scores, mask, targets)
                 value_loss = functional.mse_loss(values.squeeze(-1), labels)

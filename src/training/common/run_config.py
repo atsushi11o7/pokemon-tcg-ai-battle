@@ -166,6 +166,7 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
             "val_shards",
             "holdout_shards",
             "min_shard_day",
+            "loser_policy_weight",
             "learning_rate",
             "batch_size",
             "value_loss_coef",
@@ -200,6 +201,10 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
             _non_negative(training["value_loss_coef"], "training.value_loss_coef")
         if "warmup_steps" in training:
             _non_negative_int(training["warmup_steps"], "training.warmup_steps")
+        # 敗者の手を模倣する強さ。必須にしているのは、敗者のone-hotを含むシャードへ
+        # 設定を向けたまま書き忘れると、黙って全面模倣に変わってしまうため。
+        # 何を学ばせているかは設定ファイルだけで読み取れる必要がある。
+        _probability(training["loser_policy_weight"], "training.loser_policy_weight")
         return "generalist"
 
     mode = training["selfplay_mode"]

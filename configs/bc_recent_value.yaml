@@ -1,6 +1,6 @@
 run:
-  name: bc_recent_finetune
-  output_dir: outputs/runs/bc_recent_finetune
+  name: bc_recent_value
+  output_dir: outputs/runs/bc_recent_value
 
 algorithm: bc
 
@@ -34,5 +34,8 @@ training:
   rounds: 3
   batch_size: 256
   learning_rate: 0.00005
-  value_loss_coef: 0.1
+  # bc_recent_finetune との唯一の違い。探索の質は価値関数に依存し、探索は実測で
+  # +73.6点(#25 872.1 → #27 945.7)を稼ぐ最大のレバーだが、現在の価値ヘッドは
+  # 真の勝敗に対する符号一致が78.3%に留まる。価値を重く見た版と対で比較する。
+  value_loss_coef: 0.5
   warmup_steps: 200
