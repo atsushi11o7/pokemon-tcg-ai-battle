@@ -45,11 +45,19 @@ def main() -> int:
     parser.add_argument("--num-heads", type=int, default=model_config.NUM_HEADS)
     parser.add_argument("--d-feedforward", type=int, default=model_config.D_FEEDFORWARD)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--day",
+        default=None,
+        help="YYYYMMDD。指定するとその日の先頭シャードを検証に使う(holdout指定は無視)",
+    )
     args = parser.parse_args()
 
     shards = sorted(args.shard_dir.glob("shard_*.pt"))
-    holdout = max(args.holdout_shards, args.val_shards)
-    val_paths = shards[-holdout:][: args.val_shards]
+    if args.day:
+        val_paths = sorted(args.shard_dir.glob(f"shard_{args.day}_*.pt"))[: args.val_shards]
+    else:
+        holdout = max(args.holdout_shards, args.val_shards)
+        val_paths = shards[-holdout:][: args.val_shards]
     samples = load_shard_paths(val_paths)
     print(f"検証: {len(samples)}サンプル  {val_paths[0].name} .. {val_paths[-1].name}")
 
