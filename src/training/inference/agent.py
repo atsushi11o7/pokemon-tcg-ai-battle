@@ -67,7 +67,11 @@ class SubmissionAgent:
     # 差1.5以上の手番は全体の58%を占めるが、着手変更の5%しか生んでいない。
     # そこを切って迷っている局面へ回せば、同じ予算で深く読める。
     # 進行度でも測ったが 9.5%〜18.2% と差が小さく、配分の基準にならなかった。
-    MARGIN_SCHEDULE = ((0.5, 2.0), (1.5, 0.5), (3.0, 0.15))
+    # ラダーで否定された。#34(配分なし)1041.2 に対し #35(配分あり)984.9 と56点低い。
+    # ローカルでは「探索が着手を変えた割合」で測ったが、着手が変わることと勝率が上がる
+    # ことは別だった。迷う局面はそもそも互角で、どちらを選んでも大差ないと考えられる。
+    # 空のスケジュールにすると倍率は常に1.0になり、従来どおり一律の探索回数に戻る。
+    MARGIN_SCHEDULE: tuple = ()
 
     def __init__(
         self,
@@ -110,7 +114,7 @@ class SubmissionAgent:
         for threshold, scale in self.MARGIN_SCHEDULE:
             if margin < threshold:
                 return scale
-        return 0.0
+        return 1.0 if not self.MARGIN_SCHEDULE else 0.0
 
     def budgeted_search_count(self, spent_seconds: float) -> int:
         """これまでの消費時間から、この手番に使う探索回数を決める。

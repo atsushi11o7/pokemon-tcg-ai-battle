@@ -68,6 +68,8 @@ class WorstCaseGameTest(unittest.TestCase):
 
 
 class MarginScaleTest(unittest.TestCase):
+    SCHEDULE = ((0.5, 2.0), (1.5, 0.5), (3.0, 0.15))
+
     """方策の迷い(top1-top2)で探索予算を配分すること。
 
     24試合2,035手の実測では、探索が着手を変えた割合は
@@ -78,6 +80,14 @@ class MarginScaleTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.agent = _Agent(search_count=150, budget=540.0)
+        self.agent.MARGIN_SCHEDULE = self.SCHEDULE
+
+    def test_disabled_schedule_keeps_the_search_count(self) -> None:
+        """空のスケジュールなら倍率は常に1.0(従来どおり一律)。"""
+        plain = _Agent(search_count=150, budget=540.0)
+        plain.MARGIN_SCHEDULE = ()
+        self.assertEqual(plain.margin_scale(0.0), 1.0)
+        self.assertEqual(plain.margin_scale(99.0), 1.0)
 
     def test_uncertain_positions_get_more_search(self) -> None:
         self.assertEqual(self.agent.margin_scale(0.0), 2.0)
