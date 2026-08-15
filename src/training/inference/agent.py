@@ -29,8 +29,12 @@ def resource_path(name: str, base_dir: Path) -> Path:
     return KAGGLE_AGENT_DIR / name
 
 
-def choose_greedy(network: PolicyValueNet, obs, deck: list[int]) -> list[int]:
-    """探索せず、盤面を1回評価して方策スコア最大の選択肢を返す。"""
+def rank_actions(network: PolicyValueNet, obs, deck: list[int]) -> tuple[list, list[int], float]:
+    """盤面を1回評価し、(選択肢, 方策スコア最大の手, top1とtop2の差)を返す。
+
+    差は「方策がどれだけ迷っているか」の指標で、探索予算の配分に使う。ここで得た
+    結果を使い回すことで、貪欲な着手と迷いの判定で二重に評価せずに済む。
+    """
     actions = enumerate_actions(obs.select)
     encoder_sv = get_encoder_input(obs, deck)
     decoder_sv = get_decoder_input(obs, actions)
@@ -38,7 +42,17 @@ def choose_greedy(network: PolicyValueNet, obs, deck: list[int]) -> list[int]:
     index_dec, value_dec, offset_dec = decoder_sv.to_tensors()
     with torch.inference_mode():
         _value, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
-    return actions[int(torch.argmax(scores[0]).item())]
+    row = scores[0]
+    if row.shape[0] < 2:
+        return actions, actions[int(torch.argmax(row).item())], float("inf")
+    top = torch.topk(row, 2)
+    return actions, actions[int(top.indices[0])], float(top.values[0] - top.values[1])
+
+
+def choose_greedy(network: PolicyValueNet, obs, deck: list[int]) -> list[int]:
+    """探索せず、盤面を1回評価して方策スコア最大の選択肢を返す。"""
+    _actions, best, _margin = rank_actions(network, obs, deck)
+    return best
 
 
 class SubmissionAgent:
@@ -46,6 +60,14 @@ class SubmissionAgent:
 
     # 持ち時間の消費率 → 探索回数の倍率。使うほど浅くし、最後は貪欲方策だけにする。
     BUDGET_SCHEDULE = ((0.45, 1.0), (0.65, 0.5), (0.80, 0.25), (0.90, 0.1))
+
+    # 方策のtop1とtop2のスコア差 → 探索回数の倍率。
+    # 24試合2,035手の実測で、探索が着手を変えた割合は差ごとに次のとおりだった。
+    #   差<0.5 で 40.2%(600手) / 0.5-1.5 で 5.2% / 1.5-3.0 で 1.9% / 3.0以上 で 0.6%
+    # 差1.5以上の手番は全体の58%を占めるが、着手変更の5%しか生んでいない。
+    # そこを切って迷っている局面へ回せば、同じ予算で深く読める。
+    # 進行度でも測ったが 9.5%〜18.2% と差が小さく、配分の基準にならなかった。
+    MARGIN_SCHEDULE = ((0.5, 2.0), (1.5, 0.5), (3.0, 0.15))
 
     def __init__(
         self,
@@ -79,6 +101,17 @@ class SubmissionAgent:
             path = resource_path(opponent_decks_name, base_dir)
             self.opponent_decks = json.loads(path.read_text(encoding="utf-8"))
 
+    def margin_scale(self, margin: float) -> float:
+        """方策の迷い(top1とtop2の差)から、探索回数の倍率を返す。
+
+        差が大きい局面は探索しても着手が変わらない(実測で3.0以上なら0.6%)。
+        そこを切って、迷っている局面(差<0.5で40.2%が変わる)へ予算を寄せる。
+        """
+        for threshold, scale in self.MARGIN_SCHEDULE:
+            if margin < threshold:
+                return scale
+        return 0.0
+
     def budgeted_search_count(self, spent_seconds: float) -> int:
         """これまでの消費時間から、この手番に使う探索回数を決める。
 
@@ -103,17 +136,19 @@ class SubmissionAgent:
             return self.deck
         started = time.monotonic()
         try:
-            if self.budgeted_search_count(self.spent_seconds) > 0:
+            actions, greedy, margin = rank_actions(self.network, obs, self.deck)
+            count = int(self.budgeted_search_count(self.spent_seconds) * self.margin_scale(margin))
+            if count > 0 and len(actions) >= 2:
                 try:
-                    return self._select_with_search(obs)
+                    return self._select_with_search(obs, count)
                 except Exception:
                     # 1手も返せないと即敗北になるため、探索の失敗は必ず吸収する。
                     pass
-            return choose_greedy(self.network, obs, self.deck)
+            return greedy
         finally:
             self.spent_seconds += time.monotonic() - started
 
-    def _select_with_search(self, obs) -> list[int]:
+    def _select_with_search(self, obs, count: int) -> list[int]:
         from ..mcts.selfplay import run_determinized_mcts
 
         select, _policy, _value, _actions = run_determinized_mcts(
@@ -121,7 +156,7 @@ class SubmissionAgent:
             obs,
             self.deck,
             self.opponent_decks,
-            self.budgeted_search_count(self.spent_seconds),
+            count,
             num_determinizations=self.num_determinizations,
         )
         return select
