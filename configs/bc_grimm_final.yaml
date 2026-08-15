@@ -1,0 +1,39 @@
+run:
+  name: bc_grimm_final
+  output_dir: outputs/runs/bc_grimm_final
+
+algorithm: bc
+
+model:
+  # #34(ラダー実績1046.1、3デッキ中で最高)の重み。ここから最新2日を足すだけに留める。
+  initial_checkpoint: outputs/runs/bc_grimmsnarl/checkpoints/generalist_round11.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  # #34と同じデータ。ただし#34はholdout_shards:3で8/13を外しており、その後に
+  # 追加された8/14と合わせて5枚(約25万サンプル)が未学習のまま残っている。
+  # Grimmsnarlは金帯(1100以上)の勝者が8/14で0人なので、金帯での仕上げは行えない。
+  shard_dir: data/bc/decks/grimmsnarl
+  # 検証は8/13の1枚。最新日(8/14)まで学習に使いたいので、末尾ではなく日付で指定する。
+  # 検証日より後のデータで学習する形になるため、これは「壊れていないか」の確認であって
+  # 汎化性能の指標ではない。
+  val_day: "20260813"
+  val_shards: 3
+  holdout_shards: 1
+  loser_policy_weight: 0.0
+  # 仕上げなので第1段階(1e-4)の1/5。既に得た方策を壊さず、金帯の構築へ寄せるに留める。
+  learning_rate: 0.00002
+  # 17シャード(約85万サンプル)と少ない。第1段階で16エポック回した後なので短く。
+  rounds: 4
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 200
