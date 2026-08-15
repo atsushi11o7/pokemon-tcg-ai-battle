@@ -5,6 +5,7 @@
 最小データで実際に1エポック回して、初回起動と再開の両方を通す。
 """
 
+import json
 import shutil
 import sys
 import tempfile
@@ -72,6 +73,7 @@ class BcTrainingLoopTest(unittest.TestCase):
             val_shards=1,
             holdout_shards=1,
             min_shard_day=None,
+            val_day=None,
             loser_policy_weight=1.0,
             freeze_policy=False,
             n_rounds=1,
@@ -134,6 +136,7 @@ class ShardSplitTest(unittest.TestCase):
             val_shards=val_shards,
             holdout_shards=holdout_shards,
             min_shard_day=None,
+            val_day=None,
             loser_policy_weight=1.0,
             freeze_policy=False,
             n_rounds=1,
@@ -235,6 +238,7 @@ class HoldoutGuardTest(unittest.TestCase):
             val_shards=1,
             holdout_shards=holdout,
             min_shard_day=None,
+            val_day=None,
             loser_policy_weight=1.0,
             freeze_policy=False,
             n_rounds=1,
@@ -346,10 +350,6 @@ class LoserPolicyWeightTest(unittest.TestCase):
         self.assertEqual(scores.grad[1].abs().sum().item(), 0.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BcFreezePolicyTest(unittest.TestCase):
     """`freeze_policy`のBC学習が、方策を1ビットも動かさずに価値だけ更新すること。
 
@@ -383,6 +383,7 @@ class BcFreezePolicyTest(unittest.TestCase):
             val_shards=1,
             holdout_shards=2,
             min_shard_day=None,
+            val_day=None,
             loser_policy_weight=0.0,
             freeze_policy=freeze,
             n_rounds=1,
@@ -433,6 +434,69 @@ class BcFreezePolicyTest(unittest.TestCase):
         after = run_training_loop(settings, self.tmp / "init2.pt")
         after_scores, _ = self._probe(after)
         self.assertFalse(torch.equal(before_scores, after_scores))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ValDayTest(unittest.TestCase):
+    """検証日を明示したとき、その日だけが学習から外れること。
+
+    仕上げ工程では最新日まで学習に使いたいので、末尾ではなく日付で検証を選ぶ。
+    ここがずれると、検証に使ったはずの日で学習してしまい指標が無意味になる。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.shard_dir = self.tmp / "shards"
+        self.shard_dir.mkdir()
+        for day, count in (("20260812", 2), ("20260813", 1), ("20260814", 2)):
+            for index in range(count):
+                torch.save(
+                    [_sample(3) for _ in range(4)],
+                    self.shard_dir / f"shard_{day}_{index:04d}.pt",
+                )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _settings(self, val_day):
+        return BcSettings(
+            run_name="valday",
+            checkpoint_dir=self.tmp / "checkpoints",
+            output_dir=self.tmp,
+            shard_dir=self.shard_dir,
+            val_shards=1,
+            holdout_shards=1,
+            min_shard_day=None,
+            val_day=val_day,
+            loser_policy_weight=0.0,
+            freeze_policy=False,
+            n_rounds=1,
+            batch_size=2,
+            learning_rate=1e-4,
+            value_loss_coef=0.1,
+            warmup_steps=1,
+            seed=0,
+            loader_workers=0,
+            keep_last_checkpoints=1,
+        )
+
+    def test_the_named_day_is_held_out_and_the_newest_is_trained_on(self) -> None:
+        settings = self._settings("20260813")
+        settings.checkpoint_dir.mkdir(parents=True)
+        run_training_loop(settings, None)
+        counts = json.loads((self.tmp / "metrics.jsonl").read_text().splitlines()[0])
+        # 8/13の1枚(4件)だけが検証に回り、残り4枚(16件)が学習に使われる
+        self.assertEqual(counts["val_samples"], 4)
+        self.assertEqual(counts["train_samples"], 16)
+
+    def test_unknown_day_is_rejected(self) -> None:
+        settings = self._settings("20990101")
+        settings.checkpoint_dir.mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "val_day"):
+            run_training_loop(settings, None)
 
 
 if __name__ == "__main__":

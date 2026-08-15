@@ -58,6 +58,7 @@ class BcSettings:
     val_shards: int
     holdout_shards: int
     min_shard_day: str | None
+    val_day: str | None
     loser_policy_weight: float
     freeze_policy: bool
     n_rounds: int
@@ -80,6 +81,7 @@ class BcSettings:
             val_shards=int(settings["val_shards"]),
             holdout_shards=int(settings.get("holdout_shards", settings["val_shards"])),
             min_shard_day=settings.get("min_shard_day"),
+            val_day=settings.get("val_day"),
             loser_policy_weight=float(settings.get("loser_policy_weight", 1.0)),
             freeze_policy=bool(settings.get("freeze_policy", False)),
             n_rounds=config.n_rounds,
@@ -181,19 +183,34 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
     # 同じにすると最新日の残りが学習に入り、同日の別エピソードを見た状態で
     # 測ることになる(先頭を検証にしていた頃と同じ形の時間リーク)。
     # 全部読まないのはメモリの都合(1日ぶん約70万サンプルは載り切らない)。
-    holdout = max(settings.holdout_shards, settings.val_shards)
-    if holdout >= len(shards):
-        # 素通りさせると`train_paths`が空になり、1ステップも学習しないまま
-        # 「完了」してしまう。例外にならないので、ここで止める。
-        raise RuntimeError(
-            f"holdout_shards={holdout} leaves no training shards ({len(shards)} available)"
-        )
-    val_paths = shards[-holdout:][: settings.val_shards]
-    train_paths = shards[:-holdout]
+    if settings.val_day:
+        # 検証日を明示する。既定は「末尾＝最新日」だが、最新日まで学習に使いたい
+        # 仕上げ工程では、少し前の日を検証に回して残りを全部学習へ入れる。
+        # 検証日より後のデータで学習することになるので、時系列としては逆転する。
+        # 「壊れていないか」を見る用途に限り、汎化性能の指標としては読まない。
+        val_paths = [p for p in shards if p.name.split("_")[1] == settings.val_day][
+            : settings.val_shards
+        ]
+        if not val_paths:
+            raise RuntimeError(f"val_day={settings.val_day} に該当するシャードが無い")
+        chosen = set(val_paths)
+        train_paths = [p for p in shards if p not in chosen]
+    else:
+        holdout = max(settings.holdout_shards, settings.val_shards)
+        if holdout >= len(shards):
+            # 素通りさせると`train_paths`が空になり、1ステップも学習しないまま
+            # 「完了」してしまう。例外にならないので、ここで止める。
+            raise RuntimeError(
+                f"holdout_shards={holdout} leaves no training shards ({len(shards)} available)"
+            )
+        val_paths = shards[-holdout:][: settings.val_shards]
+        train_paths = shards[:-holdout]
+    if not train_paths:
+        raise RuntimeError("no training shards left after the split")
     # 検証データは常駐させず、エポック末の評価時だけ読む。20万サンプルを親プロセスに
     # 抱えたままだと、fork したDataLoaderワーカーがコピーオンライトで複製してしまう。
     print(
-        f"shards: train={len(train_paths)} val={settings.val_shards} "
+        f"shards: train={len(train_paths)} val={len(val_paths)} "
         f"({val_paths[0].name}..{val_paths[-1].name})"
     )
 
