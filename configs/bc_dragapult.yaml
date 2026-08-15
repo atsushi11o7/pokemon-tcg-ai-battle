@@ -1,0 +1,39 @@
+run:
+  name: bc_dragapult
+  output_dir: outputs/runs/bc_dragapult
+
+algorithm: bc
+
+model:
+  # v2から始める。同時提出した対照で v2ep9=969.7 に対し v3=876〜910 と、v2が上と確定した。
+  initial_checkpoint: outputs/runs/bc_toplayers_v2/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  # 全エポックを残す。データが少なく途中でピークを打つ可能性があるため、
+  # 後から検証精度の最良点を選べるようにしておく。
+  keep_last_checkpoints: 0
+
+training:
+  # 金帯の最頻構築(8/14で380席・勝率62.6%)にJaccard 0.5で似た構築、勝者は900以上。
+  # 0.5にしているのは量の確保。派生は相方が数枚替わるだけで骨格は共通なので、
+  # 実測でも別アーキタイプは0.22以下に留まり、混入しない。
+  shard_dir: data/bc/gold/dragapult_wide
+  val_shards: 4
+  # 最新日(2026-08-14)は4シャード。丸ごと学習から外して検証に使う。
+  holdout_shards: 4
+  loser_policy_weight: 0.0
+  # v2はDragapultをほとんど知らない(当時の使用率2〜6%)。検証精度72.1%はGrimmsnarlの
+  # 80.5%より8.4ポイント低く、学び直す余地が大きい。Grimmsnarl特化と同じ1e-4で動かす。
+  learning_rate: 0.0001
+  # 41シャード(約205万サンプル)。Grimmsnarl特化の1/3なので、エポックを増やして補う。
+  rounds: 16
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 500

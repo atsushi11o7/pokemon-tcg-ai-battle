@@ -117,24 +117,29 @@ def main() -> int:
 
     # 候補デッキごとに振り分ける。1エピソードのJSON解析は重いので、デッキの数だけ
     # 走査を繰り返すと候補6件で8時間かかる。1回の走査で全バケツへ配る。
-    buckets: list[tuple[str, Counter | None, Path]] = []
+    buckets: list[tuple[str, Counter | None, Path, float, float]] = []
     if args.deck_spec:
         for spec in args.deck_spec:
-            name, _, path = spec.partition("=")
-            deck = Counter(int(x) for x in Path(path).read_text().split() if x.strip())
-            buckets.append((name, deck, args.output / name))
+            # NAME=CSV[:jaccard[:rating]]。バケツごとに条件を変えられるようにして、
+            # 量を稼ぐ広い集合と仕上げ用の狭い集合を1回の走査で同時に作る。
+            name, _, rest = spec.partition("=")
+            parts = rest.split(":")
+            jaccard = float(parts[1]) if len(parts) > 1 and parts[1] else args.min_jaccard
+            rating = float(parts[2]) if len(parts) > 2 and parts[2] else args.min_winner_rating
+            deck = Counter(int(x) for x in Path(parts[0]).read_text().split() if x.strip())
+            buckets.append((name, deck, args.output / name, jaccard, rating))
     else:
         reference = None
         if args.deck_like is not None:
             reference = Counter(int(x) for x in args.deck_like.read_text().split() if x.strip())
-        buckets.append(("", reference, args.output))
+        buckets.append(("", reference, args.output, args.min_jaccard, args.min_winner_rating))
 
-    for _name, _deck, out in buckets:
+    for _name, _deck, out, _j, _r in buckets:
         out.mkdir(parents=True, exist_ok=True)
     stats: Counter = Counter()
-    per: dict[str, Counter] = {name: Counter() for name, _, _ in buckets}
-    buffers: dict[str, list] = {name: [] for name, _, _ in buckets}
-    indices: dict[str, int] = {name: 0 for name, _, _ in buckets}
+    per: dict[str, Counter] = {b[0]: Counter() for b in buckets}
+    buffers: dict[str, list] = {b[0]: [] for b in buckets}
+    indices: dict[str, int] = {b[0]: 0 for b in buckets}
 
     def shard_name(index: int) -> str:
         if args.shard_prefix:
@@ -145,10 +150,8 @@ def main() -> int:
         if args.max_episodes and stats["episodes"] >= args.max_episodes:
             break
         samples = None
-        for name, deck, out in buckets:
-            if not accept_episode(
-                replay, deck, args.min_jaccard, ratings, args.min_winner_rating, per[name]
-            ):
+        for name, deck, out, jaccard, rating in buckets:
+            if not accept_episode(replay, deck, jaccard, ratings, rating, per[name]):
                 continue
             # 採用されたバケツが1つでもあれば局面を作る。複数に入る場合も作り直さない。
             if samples is None:
@@ -166,7 +169,7 @@ def main() -> int:
                     flush=True,
                 )
 
-    for name, _deck, out in buckets:
+    for name, _deck, out, _j, _r in buckets:
         if buffers[name]:
             torch.save(buffers[name], out / shard_name(indices[name]))
             indices[name] += 1
