@@ -40,7 +40,6 @@ CONCATENATED_MODULES = (
     "common/sparse_features.py",
     "common/network.py",
     "common/deck.py",
-    "common/selfplay_modes.py",
     "mcts/search.py",
     "mcts/determinize.py",
     "mcts/selfplay.py",

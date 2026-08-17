@@ -4,11 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from training.common.deck_pool import WeightedDeckPool, load_weighted_deck_pool
-from training.common.selfplay_modes import (
+from training.common.deck import (
     fixed_deck_seat_for_game,
     pick_decks_and_collect_seats,
 )
+from training.common.deck_pool import WeightedDeckPool, load_weighted_deck_pool
 
 
 def snapshot() -> dict:
@@ -35,7 +35,7 @@ class DeckSamplingTest(unittest.TestCase):
     def test_generalist_uses_separate_learner_and_opponent_distributions(self) -> None:
         pool = WeightedDeckPool(snapshot())
 
-        with patch("training.common.selfplay_modes.random.randrange", return_value=0):
+        with patch("training.common.deck.random.randrange", return_value=0):
             decks, collect_seats = pick_decks_and_collect_seats("generalist", [9] * 60, pool)
 
         self.assertEqual(decks, [[1] * 60, [2] * 60])
@@ -44,7 +44,7 @@ class DeckSamplingTest(unittest.TestCase):
     def test_generalist_randomly_swaps_sampling_roles_between_seats(self) -> None:
         pool = WeightedDeckPool(snapshot())
 
-        with patch("training.common.selfplay_modes.random.randrange", return_value=1):
+        with patch("training.common.deck.random.randrange", return_value=1):
             decks, collect_seats = pick_decks_and_collect_seats("generalist", [9] * 60, pool)
 
         self.assertEqual(decks, [[2] * 60, [1] * 60])

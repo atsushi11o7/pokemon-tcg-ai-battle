@@ -19,7 +19,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 
-from ..common.selfplay_modes import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
+from ..common.deck import SelfplayMode, pick_decks_and_collect_seats  # noqa: E402
 from ..common.sparse_features import get_decoder_input, get_encoder_input  # noqa: E402
 from .determinize import determinize_for_search  # noqa: E402
 from .search import run_mcts  # noqa: E402
