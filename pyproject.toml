@@ -36,7 +36,7 @@ dev = [
 ]
 # RL 学習用
 rl = [
-    # PyTorch (CUDA 12.6 対応 wheel)
+    # PyTorch (CUDA 12.9 対応 wheel。sm_120 は cu126 ビルドに含まれない)
     "torch>=2.7",
     # 強化学習フレームワーク
     "gymnasium>=1.0",
@@ -54,12 +54,12 @@ environments = [
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu126" },
+    { index = "pytorch-cu129" },
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.ruff]
