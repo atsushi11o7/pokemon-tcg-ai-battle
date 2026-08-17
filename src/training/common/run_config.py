@@ -376,7 +376,6 @@ def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
             "NUM_LAYERS_ENCODER",
             "NUM_LAYERS_DECODER",
             "HAND_TOKENS",
-            "DECODER_SELF_ATTENTION",
             "DROPOUT",
         )
     }

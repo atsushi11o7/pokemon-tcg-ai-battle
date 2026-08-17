@@ -12,7 +12,7 @@ from typing import TypeVar
 import torch
 import torch.nn as nn
 
-from .model_config import BENCH_SLOTS, DECODER_SELF_ATTENTION, DROPOUT, HAND_TOKENS
+from .model_config import BENCH_SLOTS, DROPOUT, HAND_TOKENS
 from .sparse_features import SparseVector, decoder_size, encoder_size
 
 # 提出物はKaggle本番のPython 3.11で実行される。PEP 695の`def f[T]()`は3.12以降の構文で、
@@ -72,12 +72,8 @@ class DecoderLayer(nn.Module):
             d_feedforward: フィードフォワード層の隠れ次元数。
         """
         super().__init__()
-        self.self_attention = (
-            nn.MultiheadAttention(d_model, num_heads, dropout=DROPOUT)
-            if DECODER_SELF_ATTENTION
-            else None
-        )
-        self.norm0 = nn.LayerNorm(d_model) if DECODER_SELF_ATTENTION else None
+        self.self_attention = nn.MultiheadAttention(d_model, num_heads, dropout=DROPOUT)
+        self.norm0 = nn.LayerNorm(d_model)
         self.attention = nn.MultiheadAttention(d_model, num_heads, dropout=DROPOUT)
         self.fc1 = nn.Linear(d_model, d_feedforward)
         self.fc2 = nn.Linear(d_feedforward, d_model)
@@ -105,16 +101,13 @@ class DecoderLayer(nn.Module):
         Returns:
             torch.Tensor: 形状`(n_actions, batch, d_model)`の更新後のデコーダ側の系列。
         """
-        if self.self_attention is not None:
-            # 行動どうしの相対比較。位置埋め込みを持たないので列挙順には依存しない。
-            y, _ = self.self_attention(
-                x, x, x, need_weights=False, key_padding_mask=key_padding_mask
-            )
-            x = self.norm0(x + self.dropout(y))
-            if key_padding_mask is not None:
-                # パディング位置は後続層・スコアへ影響させない(全keyがマスクされた行が
-                # nanになるのも防ぐ)。
-                x = x.masked_fill(key_padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
+        # 行動どうしの自己注意。
+        y, _ = self.self_attention(x, x, x, need_weights=False, key_padding_mask=key_padding_mask)
+        x = self.norm0(x + self.dropout(y))
+        if key_padding_mask is not None:
+            # パディング位置を0で埋め、後続層とスコアへ影響させない。
+            x = x.masked_fill(key_padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
+        # エンコーダ出力への交差注意。
         y, _ = self.attention(x, encoder_out, encoder_out, need_weights=False)
         res = self.norm1(x + self.dropout(y))
         y = self.fc2(self.dropout(torch.relu(self.fc1(res))))
