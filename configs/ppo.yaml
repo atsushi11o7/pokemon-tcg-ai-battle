@@ -1,6 +1,6 @@
 run:
-  name: ppo_per_role
-  output_dir: outputs/runs/ppo_per_role
+  name: ppo
+  output_dir: outputs/runs/ppo
 
 algorithm: ppo
 
@@ -23,7 +23,7 @@ training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 100
-  rounds: 300
+  rounds: 600
   learning_rate: 0.0001
   minibatch_size: 64
   epochs_per_round: 4

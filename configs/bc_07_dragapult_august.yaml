@@ -1,0 +1,35 @@
+run:
+  name: bc_07_dragapult_august
+  output_dir: outputs/runs/bc_07_dragapult_august
+
+algorithm: bc
+
+model:
+  initial_checkpoint: outputs/runs/bc_06_dragapult/checkpoints/generalist_round11.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  # 勝敗を問わずDragapultが出場した試合(`--side any --policy-on-deck`で抽出)。
+  shard_dir: data/bc/decks/drag_any
+  # 8月のみ。メタが動くので直近ほど手本として近い。
+  min_shard_day: "20260801"
+  # 勝ち試合だけを方策の教師にする。負けた局面は価値の教師としてのみ残る。
+  loser_policy_weight: 0.0
+  freeze_policy: false
+  # 検証せず全シャードを学習に入れる。
+  val_shards: 0
+  holdout_shards: 0
+  learning_rate: 0.00005
+  rounds: 8
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 300

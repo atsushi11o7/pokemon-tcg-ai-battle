@@ -1,0 +1,31 @@
+run:
+  name: bc_05_grimmsnarl_topup2
+  output_dir: outputs/runs/bc_05_grimmsnarl_topup2
+
+algorithm: bc
+
+model:
+  initial_checkpoint: outputs/runs/bc_04_grimmsnarl_topup/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  # bc_04と同じ条件で、さらに新しい1日分を抽出して足したもの。
+  shard_dir: data/bc/decks/grimmsnarl
+  val_day: "20260812"
+  val_shards: 3
+  holdout_shards: 1
+  loser_policy_weight: 0.0
+  learning_rate: 0.00002
+  rounds: 3
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 200
