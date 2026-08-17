@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from build_deck_registry import build_snapshot  # noqa: E402
+from meta_build_registry import build_snapshot  # noqa: E402
 
 
 def replay(episode_id: int, left: int, right: int) -> dict:

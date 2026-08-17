@@ -50,8 +50,8 @@ class WeightedDeckPool(list[list[int]]):
 def load_weighted_deck_pool(snapshot_path: Path = SAMPLING_SNAPSHOT_PATH) -> WeightedDeckPool:
     if not snapshot_path.exists():
         raise RuntimeError(
-            f"sampling snapshot not found: {snapshot_path}; run collect_kaggle_meta.py and "
-            "build_deck_registry.py first"
+            f"sampling snapshot not found: {snapshot_path}; run meta_collect.py and "
+            "meta_build_registry.py first"
         )
     with snapshot_path.open(encoding="utf-8") as file:
         snapshot = json.load(file)

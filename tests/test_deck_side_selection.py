@@ -15,14 +15,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-_spec = importlib.util.spec_from_file_location(
-    "extract_bc_samples", ROOT / "scripts" / "extract_bc_samples.py"
-)
-extract_bc_samples = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(extract_bc_samples)
+_spec = importlib.util.spec_from_file_location("data_extract", ROOT / "scripts" / "data_extract.py")
+data_extract = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(data_extract)
 
-accept_episode = extract_bc_samples.accept_episode
-deck_seats = extract_bc_samples.deck_seats
+accept_episode = data_extract.accept_episode
+deck_seats = data_extract.deck_seats
 
 GRIMM = list(range(1, 61))
 OTHER = list(range(61, 121))
