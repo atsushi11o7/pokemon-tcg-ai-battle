@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from training.common.meta_deck_pool import WeightedDeckPool, load_weighted_deck_pool
+from training.common.deck_pool import WeightedDeckPool, load_weighted_deck_pool
 from training.common.selfplay_modes import (
     fixed_deck_seat_for_game,
     pick_decks_and_collect_seats,

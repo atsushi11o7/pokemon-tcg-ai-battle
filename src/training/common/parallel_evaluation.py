@@ -16,8 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 
+from .deck_pool import configure_sampling_snapshot, seed_opponent_deck_pool_cache  # noqa: E402
 from .network import PolicyValueNet, build_policy_value_net  # noqa: E402
-from .opponent_pool import configure_sampling_snapshot, seed_opponent_deck_pool_cache  # noqa: E402
 from .parallel_games import run_parallel_games  # noqa: E402
 from .training_utils import seed_game  # noqa: E402
 

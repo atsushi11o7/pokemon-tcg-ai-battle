@@ -38,6 +38,7 @@ from ..common.checkpoints import (
     resolve_resume_point,
     restore_optimizer_state,
 )
+from ..common.deck_pool import configure_sampling_snapshot, load_opponent_deck_pool
 from ..common.evaluation_plan import build_fixed_matchups
 from ..common.metrics import append_round_metrics
 from ..common.network import (
@@ -46,7 +47,6 @@ from ..common.network import (
     collate_encoder_decoder,
     load_policy_value_net,
 )
-from ..common.opponent_pool import configure_sampling_snapshot, load_opponent_deck_pool
 from ..common.parallel_evaluation import evaluate_networks_parallel
 from ..common.run_config import (
     RunConfig,

@@ -31,17 +31,17 @@ from ..common.checkpoints import (
     resolve_resume_point,
     restore_optimizer_state,
 )
+from ..common.deck_pool import (
+    configure_sampling_snapshot,
+    load_opponent_deck_pool,
+    seed_opponent_deck_pool_cache,
+)
 from ..common.evaluation_plan import build_fixed_matchups
 from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
     load_policy_value_net,
-)
-from ..common.opponent_pool import (
-    configure_sampling_snapshot,
-    load_opponent_deck_pool,
-    seed_opponent_deck_pool_cache,
 )
 from ..common.run_config import (
     RunConfig,
