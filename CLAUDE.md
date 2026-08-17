@@ -10,7 +10,9 @@ Kaggle コンペ **The Pokémon Company - PTCG AI Battle Challenge Simulation** 
 - 最終提出締切: 2026-08-16
 
 ## 実行環境
-- devcontainer（`nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04` ベース、GPU 有効）
+- devcontainer（`nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04` ベース、GPU 有効）
+- GPU は RTX 5070 Ti（Blackwell / sm_120）。torch は CUDA 12.9 以降のビルドが必須で、
+  cu126 ビルドは sm_120 のカーネルを含まない（`torch.cuda.is_available()` は True を返すが実行時に落ちる）
 - Python 3.12 / パッケージ管理は **uv**（venv は `/opt/venv`、`PATH` に登録済み）
 - 依存を追加するときは `uv add`（RL 用は `uv add --group rl`）。`pip install` は使わない。
 - 依存を変更したら `uv lock` を実行し、`uv.lock` をコミットする。

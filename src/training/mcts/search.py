@@ -78,7 +78,7 @@ def _unrank_combination(n: int, count: int, rank: int) -> list[int]:
     return result
 
 
-def _enumerate_actions(select) -> list[list[int]]:
+def enumerate_actions(select) -> list[list[int]]:
     """合法な複数選択を列挙し、多すぎる場合はrank空間から均等に採る。"""
     n = len(select.option)
     counts = list(range(select.minCount, select.maxCount + 1))
@@ -137,7 +137,7 @@ def create_node(parent: "Node | None", search_state, your_index: int, eval_fn) -
         node.backprop(value)
         return node
 
-    actions = _enumerate_actions(obs.select)
+    actions = enumerate_actions(obs.select)
     probs, value = eval_fn(obs, actions)
     if probs is None or len(probs) != len(actions):
         probs = [1.0 / len(actions)] * len(actions)
@@ -167,7 +167,7 @@ def _select_child(node: "Node", your_index: int) -> "Child":
         Child: 選ばれた子。
     """
     if not node.children:
-        # `_enumerate_actions`が空を返した(例: minCount/maxCountに対して選択肢数が
+        # `enumerate_actions`が空を返した(例: minCount/maxCountに対して選択肢数が
         # 足りない、といった不整合なSelectData)場合にここへ来る。Noneを黙って返すと
         # 呼び出し側が`child.node`で意味不明なAttributeErrorになるため、ここで
         # 原因が分かる形の例外にしておく(呼び出し側の1試合単位の例外キャッチで

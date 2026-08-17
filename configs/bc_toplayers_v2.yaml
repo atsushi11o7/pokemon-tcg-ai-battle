@@ -1,0 +1,44 @@
+run:
+  name: bc_toplayers_v2
+  output_dir: outputs/runs/bc_toplayers_v2
+
+algorithm: bc
+
+model:
+  initial_checkpoint: null
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  # DataLoaderのワーカー数。BCは自己対戦をしないので、対局まわりの
+  # game_timeout_seconds / round_timeout_seconds は読まれない(既定値のまま)。
+  # 4だとシャードごとのローダ生成が積み上がってOOM(exit -9)した。
+  workers: 2
+  # OOMは何度やり直しても同じ場所で落ちるので、再起動で粘る価値が薄い。
+  # 進捗はエポック単位で保存されるため、少なめでも失うのは最大1エポック。
+  max_restarts: 5
+  retry_delay_seconds: 5
+  # 全エポックを残す。後から検証精度のピークを選べるようにするため。
+  # 1エポックあたり重み22MB + optimizer 44MBで、12エポックでも約800MB。
+  keep_last_checkpoints: 0
+
+training:
+  shard_dir: data/bc/shards_dated
+  # シャード名に日付が入っており`sorted`が時系列順になるので、末尾＝最新日になる。
+  # 最新日(2026-08-12)の14枚を丸ごと学習から外し(holdout)、うち先頭4枚を検証に読む。
+  # 全部読まないのはメモリの都合(1日ぶん約70万サンプルは載り切らずOOMする)。
+  # 古い27日で学習して最新日で測る形にすると、メタが動くこのコンペで
+  # 「これから当たる相手にどれだけ通じるか」に近い指標になる。
+  # 敗者の手を模倣する強さ(0.0=勝者のみ / 1.0=勝者と同等)。
+  # このrunは敗者の教師を持たないシャードを使っており、勝者のみを模倣している。
+  loser_policy_weight: 0.0
+  val_shards: 4
+  holdout_shards: 14
+  # 実測5秒/シャード、387シャードで1エポック約32分。12エポックで約6時間30分。
+  rounds: 12
+  batch_size: 256
+  learning_rate: 0.0003
+  value_loss_coef: 0.1
+  warmup_steps: 500

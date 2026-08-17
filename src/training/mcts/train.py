@@ -32,10 +32,10 @@ from ..common.checkpoints import (
     restore_optimizer_state,
 )
 from ..common.evaluation_plan import build_fixed_matchups
+from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
-    collate_encoder_decoder,
     load_policy_value_net,
 )
 from ..common.opponent_pool import (
@@ -53,6 +53,9 @@ from ..common.selfplay_modes import SelfplayMode, fixed_deck_seat_for_game
 from ..common.selfplay_round import run_selfplay_round
 from ..common.training_utils import (
     ListDataset,
+    collate_samples,
+    configure_trainable_parameters,
+    masked_policy_loss,
     move_optimizer_state_to,
     seed_game,
     training_device,
@@ -89,10 +92,12 @@ class MctsSettings:
     round_timeout_seconds: float
     keep_last_checkpoints: int
     eval_games_per_round: int
+    baseline_eval_games: int
     gating_win_rate: float
     checkpoint_pool_size: int
     gating_pool_sample: int
     replay_buffer_rounds: int
+    freeze_policy: bool
 
     @classmethod
     def from_run_config(cls, config: RunConfig) -> "MctsSettings":
@@ -117,11 +122,21 @@ class MctsSettings:
             round_timeout_seconds=config.runtime.round_timeout_seconds,
             keep_last_checkpoints=config.runtime.keep_last_checkpoints,
             eval_games_per_round=int(settings["eval_games_per_round"]),
+            # first-index評価は勝率が飽和して判別力が無い一方、1ラウンドあたりの
+            # 実行時間の3割を占める。0で無効化できるようにする。
+            baseline_eval_games=int(
+                settings.get("baseline_eval_games", settings["eval_games_per_round"])
+            ),
             gating_win_rate=float(settings["gating_win_rate"]),
             checkpoint_pool_size=int(settings["checkpoint_pool_size"]),
             gating_pool_sample=int(settings["gating_pool_sample"]),
             replay_buffer_rounds=int(settings["replay_buffer_rounds"]),
+            freeze_policy=bool(settings.get("freeze_policy", False)),
         )
+
+
+# ゲート判定に必要な完走率。全試合の完走を求めると、数試合の失敗だけで強い候補も捨ててしまう。
+GATING_MIN_COMPLETION = 0.8
 
 
 def should_accept_candidate(
@@ -133,66 +148,6 @@ def should_accept_candidate(
     return current_best_win_rate > gating_win_rate and pooled_win_rate > gating_win_rate
 
 
-def _collate(batch: list[Sample]):
-    """`Sample`のリストを、`collate_encoder_decoder`にMCTS固有の教師信号を加えてバッチ化する。
-
-    Args:
-        batch: `Sample`のリスト。
-
-    Returns:
-        tuple: (index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec,
-            mask, policy_targets, value_labels)。
-            policy_targets: 形状`(batch, max_actions)`の教師分布(パディング部分は0)。
-            value_labels: 形状`(batch,)`の価値の教師信号。
-    """
-    index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask = (
-        collate_encoder_decoder(
-            batch,
-            lambda s: s.encoder_sv,
-            lambda s: s.decoder_sv,
-            lambda s: len(s.policy_target),
-        )
-    )
-
-    max_actions = mask.shape[1]
-    policy_targets = torch.zeros(len(batch), max_actions, dtype=torch.float32)
-    for i, sample in enumerate(batch):
-        n = len(sample.policy_target)
-        policy_targets[i, :n] = torch.tensor(sample.policy_target, dtype=torch.float32)
-    value_labels = torch.tensor([s.label for s in batch], dtype=torch.float32)
-
-    return (
-        index_enc,
-        value_enc,
-        offset_enc,
-        index_dec,
-        value_dec,
-        offset_dec,
-        mask,
-        policy_targets,
-        value_labels,
-    )
-
-
-def _masked_policy_loss(
-    scores: torch.Tensor, mask: torch.Tensor, policy_targets: torch.Tensor
-) -> torch.Tensor:
-    """パディング部分を除外した上で、方策の教師分布(訪問回数の正規化)に対する交差エントロピーを計算する。
-
-    Args:
-        scores: 形状`(batch, max_actions)`の生スコア(`PolicyValueNet.forward`の出力)。
-        mask: 形状`(batch, max_actions)`のbool。パディングした位置はFalse。
-        policy_targets: 形状`(batch, max_actions)`の教師分布(パディング部分は0)。
-
-    Returns:
-        torch.Tensor: バッチ平均の交差エントロピー損失(スカラー)。
-    """
-    masked_scores = scores.masked_fill(~mask, float("-inf"))
-    log_probs = functional.log_softmax(masked_scores, dim=-1)
-    log_probs = log_probs.masked_fill(~mask, 0.0)  # -inf*0のnan化を防ぐ(教師も0なので影響なし)
-    return -(policy_targets * log_probs).sum(dim=-1).mean()
-
-
 def train_one_round(
     network: PolicyValueNet,
     optimizer: torch.optim.Optimizer,
@@ -201,6 +156,7 @@ def train_one_round(
     epochs: int,
     batch_size: int,
     device: torch.device,
+    freeze_policy: bool = False,
 ) -> None:
     """1ラウンド分の自己対戦データで、`network`を数エポック学習する。
 
@@ -217,11 +173,18 @@ def train_one_round(
         return
 
     dataset = ListDataset(samples)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_samples)
 
     network.to(device)
     move_optimizer_state_to(optimizer, device)
-    network.train()
+    updated = configure_trainable_parameters(network, freeze_policy)
+    if freeze_policy:
+        # 凍結側はdropoutも切りたい。train()のままだと`encoder`の出力がラウンドごとに
+        # ばらつき、価値ヘッドが見る特徴が安定しない。
+        network.eval()
+        print(f"  freeze_policy: updating {sum(p.numel() for p in updated)} params (encoder_fc)")
+    else:
+        network.train()
     for epoch in range(epochs):
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -239,15 +202,19 @@ def train_one_round(
             ) = (tensor.to(device) for tensor in batch)
 
             values, scores = network(
-                index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec
+                index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask
             )
-            policy_loss = _masked_policy_loss(scores, mask, policy_targets)
             value_loss = functional.mse_loss(values.squeeze(-1), value_labels)
-            loss = policy_loss + value_loss
+            if freeze_policy:
+                policy_loss = masked_policy_loss(scores, mask, policy_targets).detach()
+                loss = value_loss
+            else:
+                policy_loss = masked_policy_loss(scores, mask, policy_targets)
+                loss = policy_loss + value_loss
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(updated, max_norm=1.0)
             optimizer.step()
 
             batch_size_actual = value_labels.shape[0]
@@ -300,6 +267,8 @@ def _init_selfplay_worker(state_dict: dict, context: _SelfplayWorkerContext) -> 
     """
     global _worker_context, _worker_network
     torch.set_num_threads(1)
+    # spawnワーカーはこのmoduleを再importするため、親の設定は引き継がれない。
+    # レイアウトが食い違うと埋め込み行列の形状が変わり、意味の違う重みを読むことになる。
     configure_sampling_snapshot(context.sampling_snapshot)
     seed_opponent_deck_pool_cache(context.opponent_deck_pool)
     _worker_network = build_policy_value_net(state_dict, assign=True)
@@ -390,7 +359,10 @@ def run_training_loop(
         print(f"loaded initial best_network weights from {initial_checkpoint}")
     else:
         best_network = build_policy_value_net()
-    best_optimizer = torch.optim.Adam(best_network.parameters(), lr=settings.learning_rate)
+    best_optimizer = torch.optim.Adam(
+        configure_trainable_parameters(best_network, settings.freeze_policy),
+        lr=settings.learning_rate,
+    )
     if optimizer_checkpoint is not None:
         restore_optimizer_state(
             best_optimizer, optimizer_checkpoint, learning_rate=settings.learning_rate
@@ -419,7 +391,10 @@ def run_training_loop(
             search_count=settings.search_count,
             num_determinizations=settings.num_determinizations,
             mode=settings.selfplay_mode,
-            seed=settings.seed,
+            # ラウンド番号ぶんずらす。ずらさないと`seed + game_index`が毎ラウンド
+            # 同じ値になり、デッキの組み合わせが全ラウンドで固定される
+            # (generalistは相手デッキの多様性が目的なので致命的)。
+            seed=settings.seed + round_num * settings.games_per_round,
             sampling_snapshot=settings.sampling_snapshot,
         )
         all_samples, results = run_selfplay_round(
@@ -446,7 +421,8 @@ def run_training_loop(
         print(f"  training on {len(train_samples)} samples from last {len(replay_buffer)} round(s)")
         candidate_network = copy.deepcopy(best_network)
         candidate_optimizer = torch.optim.Adam(
-            candidate_network.parameters(), lr=settings.learning_rate
+            configure_trainable_parameters(candidate_network, settings.freeze_policy),
+            lr=settings.learning_rate,
         )
         candidate_optimizer.load_state_dict(best_optimizer.state_dict())
         train_one_round(
@@ -456,6 +432,7 @@ def run_training_loop(
             epochs=settings.epochs_per_round,
             batch_size=settings.batch_size,
             device=device,
+            freeze_policy=settings.freeze_policy,
         )
 
         print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup arena ===")
@@ -483,11 +460,11 @@ def run_training_loop(
             total_wins += int(result["wins"])
             total_games += int(result["games"])
             gating_complete &= (
-                result["failed"] == 0 and result["games"] == settings.eval_games_per_round
+                result["games"] >= settings.eval_games_per_round * GATING_MIN_COMPLETION
             )
         current_best_win_rate = float(gating_results["current_best"]["win_rate"])
         pooled_win_rate = total_wins / total_games if total_games else 0.0
-        # 失敗した試合があると勝率が偏った部分集合の平均になるため、完走したときだけ採用判定する。
+        # 大半が失敗すると勝率が偏った部分集合の平均になるため、一定以上完走したときだけ判定する。
         accepted = gating_complete and should_accept_candidate(
             current_best_win_rate, pooled_win_rate, settings.gating_win_rate
         )
@@ -503,17 +480,23 @@ def run_training_loop(
             best_network = candidate_network
             best_optimizer = candidate_optimizer
 
-        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs random ===")
-        vs_random = _evaluate(
-            settings,
-            best_network,
-            [("random", None)],
-            opponent_deck_pool,
-            matchups,
-            round_num,
-            "random_eval",
-        )["random"]
-        print(f"  vs random: {vs_random}")
+        vs_baseline = None
+        if settings.baseline_eval_games > 0:
+            print(
+                f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs first-index ==="
+            )
+            # 1 matchupあたり4試合(席交換 x デッキ交換)。
+            baseline_matchups = matchups[: settings.baseline_eval_games // 4]
+            vs_baseline = _evaluate(
+                settings,
+                best_network,
+                [("first_index", None)],
+                opponent_deck_pool,
+                baseline_matchups,
+                round_num,
+                "random_eval",
+            )["first_index"]
+            print(f"  vs first-index: {vs_baseline}")
 
         saved_path = checkpoint_path(settings.checkpoint_dir, settings.selfplay_mode, round_num)
         torch.save(best_network.state_dict(), saved_path)
@@ -534,6 +517,19 @@ def run_training_loop(
             settings.checkpoint_dir, settings.selfplay_mode, settings.keep_last_checkpoints
         )
         print(f"  saved checkpoint and MCTS training state to {saved_path}")
+        append_round_metrics(
+            settings.output_dir / "metrics.jsonl",
+            round_num,
+            algorithm="mcts",
+            selfplay_results=results,
+            samples=len(all_samples),
+            train_samples=len(train_samples),
+            gating={name: gating_results[name] for name, _net in gating_opponents},
+            pooled_win_rate=pooled_win_rate,
+            gating_complete=gating_complete,
+            accepted=accepted,
+            vs_baseline=vs_baseline,
+        )
 
     return best_network
 

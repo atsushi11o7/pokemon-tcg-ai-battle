@@ -1,7 +1,7 @@
 """PPO用の自己対戦ロールアウト収集。
 
 MCTS(`mcts/selfplay.py`)と違い、探索を行わずネットワークの方策から直接サンプリングして
-1手ずつ進める。1手あたりのネット評価が1回で済むため、MCTS自己対戦(`SEARCH_COUNT`回評価)
+1手ずつ進める。1手あたりのネット評価が1回で済むため、MCTS自己対戦(1手ごとに探索回数分の評価)
 より大幅に軽い。探索を行わないので、隠れ情報を仮定する`determinize.py`も不要で、
 実際の`Observation`をそのまま使う。
 
@@ -22,7 +22,7 @@ from ..common.sparse_features import (  # noqa: E402
     get_decoder_input,
     get_encoder_input,
 )
-from ..mcts.search import _enumerate_actions  # noqa: E402
+from ..mcts.search import enumerate_actions  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "data" / "sample_submission" / "sample_submission"))
 from cg.api import to_observation_class  # noqa: E402
@@ -69,7 +69,7 @@ def evaluate_policy(network, obs, deck: list[int]):
             (列挙済みの行動一覧, 方策の生ロジット(形状`(n_actions,)`), 価値推定`V(s)`,
             盤面の疎ベクトル, 行動群の疎ベクトル)。
     """
-    actions = _enumerate_actions(obs.select)
+    actions = enumerate_actions(obs.select)
     encoder_sv = get_encoder_input(obs, deck)
     decoder_sv = get_decoder_input(obs, actions)
     index_enc, value_enc, offset_enc = encoder_sv.to_tensors()

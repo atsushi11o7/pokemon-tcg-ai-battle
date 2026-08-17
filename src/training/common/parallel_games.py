@@ -59,6 +59,7 @@ class _Worker:
     game_index: int | None = None
     started_at: float | None = None
     last_rss_bytes: int | None = None
+    connection_lost: bool = False
 
 
 def run_parallel_games(
@@ -105,6 +106,10 @@ def run_parallel_games(
     completed = 0
     failed = 0
     exhausted = False
+    # 試合を受け取る前に死んだワーカーの連続数。初期化が常に失敗する状況
+    # (importエラー等)では、これを数えないとラウンド上限まで再生成し続けてしまう。
+    startup_failures = 0
+    max_startup_failures = 2 * num_workers
 
     def worker_fields(worker: _Worker) -> dict[str, Any]:
         rss = _rss_bytes(worker.process.pid)
@@ -168,9 +173,6 @@ def run_parallel_games(
             workers.append(start_worker())
 
         while completed + failed < num_games:
-            for worker in workers:
-                worker_fields(worker)
-
             if time.monotonic() >= deadline:
                 remaining = num_games - completed - failed
                 for worker in workers:
@@ -182,6 +184,10 @@ def run_parallel_games(
                             reason="round_timeout",
                         )
                         on_failure(worker.game_index, "round timeout")
+                # まだ着手していない試合も呼び出し側へ通知する。通知しないと
+                # 呼び出し側の失敗集計と`failed`がずれ、部分的な標本で判定しかねない。
+                for game_index in pending:
+                    on_failure(game_index, "round timeout")
                 failed += remaining
                 emit("round_timeout", remaining_games=remaining)
                 break
@@ -201,17 +207,30 @@ def run_parallel_games(
                 stop_worker(worker, terminate=False, reason="unexpected_exit")
                 workers.pop(index)
                 if game_index is not None:
+                    startup_failures = 0
                     failed += 1
                     on_failure(game_index, f"worker exited with code {exitcode}")
+                else:
+                    startup_failures += 1
+                    if startup_failures >= max_startup_failures:
+                        raise RuntimeError(
+                            f"{startup_failures} workers died before receiving a game "
+                            f"(last exit code {exitcode}); worker initialization is failing"
+                        )
                 if not exhausted and completed + failed < num_games:
                     workers.append(start_worker())
 
-            connections = [worker.connection for worker in workers]
+            connections = [w.connection for w in workers if not w.connection_lost]
             for connection in wait(connections, timeout=0.1) if connections else []:
                 worker = next(w for w in workers if w.connection is connection)
                 try:
                     message = connection.recv()
                 except (EOFError, OSError):
+                    # 接続だけ先に閉じ、プロセスはまだ終了しきっていない状態。
+                    # ここで取り除くと死因と担当試合が失われるので、監視対象から
+                    # 外すだけにして、後段のプロセス終了検出に失敗通知を任せる
+                    # (放置するとwait()が即座に返り続けて空回りする)。
+                    worker.connection_lost = True
                     continue
                 kind = message[0]
                 if kind == "ready":

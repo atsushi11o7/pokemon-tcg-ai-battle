@@ -1,0 +1,43 @@
+run:
+  name: bc_grimmsnarl_v2
+  output_dir: outputs/runs/bc_grimmsnarl_v2
+
+algorithm: bc
+
+model:
+  # v2から始める。同時に提出した対照で v2ep9=941.5 に対し v3=876〜910 と、v2が上と確定した。
+  # #34(1080.2)はv3ベースでも対照を139点上回っており、土台をv2にすれば更に上を狙える。
+  initial_checkpoint: outputs/runs/bc_toplayers_v2/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  # 全エポックを残す。データが全体の1/3しかないので途中でピークを打つ可能性があり、
+  # 後から検証精度の最良点を選べるようにしておく。
+  keep_last_checkpoints: 0
+
+training:
+  # Grimmsnarl系の構築(Jaccard 0.5以上)で、勝者が銀圏以上(907.3)のエピソードだけ。
+  # 上位者は「主力デッキに近い構築だけで模倣学習する」と述べており、121アーキタイプを
+  # 混ぜた汎用モデルは混合分布のぶん一貫性を欠く。提出するのはこのデッキだけなので、
+  # 他のデッキを学ぶ必要がない。
+  shard_dir: data/bc/decks/grimmsnarl
+  # 検証を最新日(2026-08-14、2シャード)へ移し、8/13の3シャードを学習に使う。
+  # holdoutを2にしないと8/14の一部が学習に混ざり、同じ日の別試合を見た状態で
+  # 測ることになる(時間リーク)。デッキ特化では1日2〜3枚なので規模を合わせる。
+  val_shards: 2
+  holdout_shards: 2
+  loser_policy_weight: 0.0
+  # v2のピーク3e-4に対して1/3。12エポックのコサインで5e-6まで絞り切る。
+  # データがGrimmsnarlへ大きく偏るので、特化の効果を出すには十分に動かす必要がある。
+  learning_rate: 0.0001
+  # 138シャード(約690万サンプル)×12エポック。v2と同じエポック数で約4時間。
+  rounds: 12
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 500

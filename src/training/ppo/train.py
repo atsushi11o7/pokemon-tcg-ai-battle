@@ -39,6 +39,7 @@ from ..common.checkpoints import (
     restore_optimizer_state,
 )
 from ..common.evaluation_plan import build_fixed_matchups
+from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
@@ -205,7 +206,9 @@ def _ppo_loss(
         returns,
     ) = (t.to(device) for t in batch)
 
-    values, scores = network(index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec)
+    values, scores = network(
+        index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec, mask
+    )
 
     masked_scores = scores.masked_fill(~mask, float("-inf"))
     log_probs = functional.log_softmax(masked_scores, dim=-1)
@@ -233,6 +236,11 @@ def _ppo_loss(
         clip_fraction = ((ratio - 1.0).abs() > clip_epsilon).float().mean()
 
     return loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction
+
+
+# 何ミニバッチごとにKLを確認するか。細かすぎるとノイズで止まり、粗すぎると
+# 上限を超えてから止まることになる。
+KL_CHECK_WINDOW = 16
 
 
 def train_one_round(
@@ -276,13 +284,20 @@ def train_one_round(
 
     network.train()
     epochs = settings.epochs_per_round
+    # KLはミニバッチ単位で見る。エポック末までまとめて見ていると、1ラウンド数万
+    # サンプルでは1エポックで数百〜千回のstepが走り切ってしまい、上限を大きく
+    # 超えてからしか止められない。
+    stopped = False
     for epoch in range(epochs):
+        if stopped:
+            break
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
         total_approx_kl = 0.0
         total_clip_fraction = 0.0
         n = 0
+        recent_kl: list[float] = []
         for batch in loader:
             loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction = _ppo_loss(
                 network, batch, device, settings
@@ -293,23 +308,34 @@ def train_one_round(
             optimizer.step()
 
             batch_size = batch[6].shape[0]  # mask
+            recent_kl.append(approx_kl.item())
+            if len(recent_kl) >= KL_CHECK_WINDOW:
+                window_kl = sum(recent_kl) / len(recent_kl)
+                recent_kl.clear()
+                if window_kl > settings.target_kl:
+                    print(
+                        f"  early stopping PPO update mid-epoch: "
+                        f"approx_kl={window_kl:.4f} > {settings.target_kl:.4f}"
+                    )
+                    stopped = True
             total_policy_loss += policy_loss.item() * batch_size
             total_value_loss += value_loss.item() * batch_size
             total_entropy += entropy.item() * batch_size
             total_approx_kl += approx_kl.item() * batch_size
             total_clip_fraction += clip_fraction.item() * batch_size
             n += batch_size
+            if stopped:
+                break
 
+        if n == 0:
+            break
         print(
             f"  epoch {epoch + 1}/{epochs}  policy_loss={total_policy_loss / n:.4f}  "
             f"approx_kl={total_approx_kl / n:.4f}  clip_fraction={total_clip_fraction / n:.4f}  "
-            f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}"
+            f"value_loss={total_value_loss / n:.4f}  entropy={total_entropy / n:.4f}  "
+            f"samples_used={n}/{len(dataset)}"
         )
-        mean_kl = total_approx_kl / n
-        if mean_kl > settings.target_kl:
-            print(
-                f"  early stopping PPO update: approx_kl={mean_kl:.4f} > {settings.target_kl:.4f}"
-            )
+        if total_approx_kl / n > settings.target_kl:
             break
     network.to("cpu")
     network.eval()
@@ -350,6 +376,8 @@ def _init_selfplay_worker(state_dict: dict, context: _SelfplayWorkerContext) -> 
     """
     global _worker_context, _worker_network
     torch.set_num_threads(1)
+    # spawnワーカーはこのmoduleを再importするため、親の設定は引き継がれない。
+    # レイアウトが食い違うと埋め込み行列の形状が変わり、意味の違う重みを読むことになる。
     configure_sampling_snapshot(context.sampling_snapshot)
     _worker_network = build_policy_value_net(state_dict, assign=True)
     _worker_context = context
@@ -453,7 +481,10 @@ def run_training_loop(
             mode=settings.selfplay_mode,
             gamma=settings.gamma,
             gae_lambda=settings.gae_lambda,
-            seed=settings.seed,
+            # ラウンド番号ぶんずらす。ずらさないと`seed + game_index`が毎ラウンド
+            # 同じ値になり、デッキの組み合わせが全ラウンドで固定される
+            # (generalistは相手デッキの多様性が目的なので致命的)。
+            seed=settings.seed + round_num * settings.games_per_round,
             sampling_snapshot=settings.sampling_snapshot,
         )
         all_samples, results = run_selfplay_round(
@@ -474,10 +505,10 @@ def run_training_loop(
         print(f"=== round {round_num}/{settings.n_rounds}: PPO update ===")
         train_one_round(network, optimizer, all_samples, settings, device)
 
-        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs random ===")
-        vs_random = evaluate_networks_parallel(
+        print(f"=== round {round_num}/{settings.n_rounds}: fixed-matchup eval vs first-index ===")
+        vs_baseline = evaluate_networks_parallel(
             network,
-            [("random", None)],
+            [("first_index", None)],
             opponent_deck_pool,
             matchups,
             agent_factory=make_ppo_eval_agent,
@@ -491,10 +522,10 @@ def run_training_loop(
                 "algorithm": "ppo",
                 "round": round_num,
                 "mode": settings.selfplay_mode,
-                "stage": "random_eval",
+                "stage": "baseline_eval",
             },
-        )["random"]
-        print(f"  vs random: {vs_random}")
+        )["first_index"]
+        print(f"  vs first-index: {vs_baseline}")
 
         saved_path = checkpoint_path(settings.checkpoint_dir, settings.selfplay_mode, round_num)
         torch.save(network.state_dict(), saved_path)
@@ -508,6 +539,14 @@ def run_training_loop(
             settings.checkpoint_dir, settings.selfplay_mode, settings.keep_last_checkpoints
         )
         print(f"  saved checkpoint to {saved_path}")
+        append_round_metrics(
+            settings.output_dir / "metrics.jsonl",
+            round_num,
+            algorithm="ppo",
+            selfplay_results=results,
+            samples=len(all_samples),
+            vs_baseline=vs_baseline,
+        )
 
     return network
 

@@ -58,21 +58,48 @@ def _remaining_deck(full_deck: list[int], known_cards: list[int]) -> list[int] |
     return list(remaining.elements())
 
 
+_deck_counter_cache: dict[int, list[Counter]] = {}
+
+
+def _deck_counters(candidates: list[list[int]]) -> list[Counter]:
+    """候補デッキのCounterを一度だけ作って使い回す。
+
+    デッキプールはrunを通して不変なのに、以前は候補ごと・呼び出しごとに
+    `Counter(deck)`を作り直しており、決定化の時間のほとんどを占めていた。
+    """
+    key = id(candidates)
+    cached = _deck_counter_cache.get(key)
+    if cached is None or len(cached) != len(candidates):
+        cached = [Counter(deck) for deck in candidates]
+        _deck_counter_cache[key] = cached
+    return cached
+
+
 def _choose_compatible_deck(
     candidates: list[list[int]], known_cards: list[int], required_hidden: int
 ) -> tuple[list[int], list[int]]:
-    """公開カードを含み、必要な隠れ枚数を確保できる実在デッキを選ぶ。"""
-    compatible: list[tuple[list[int], list[int]]] = []
-    for deck in candidates:
-        remaining = _remaining_deck(deck, known_cards)
-        if remaining is not None and len(remaining) >= required_hidden:
-            compatible.append((deck, remaining))
+    """公開カードを含み、必要な隠れ枚数を確保できる実在デッキを選ぶ。
+
+    候補は最大159通りあるので、選ばれなかったデッキの残り札は展開しない
+    (`elements()`は選んだ1つだけに対して呼ぶ)。
+    """
+    known = Counter(known_cards)
+    known_total = len(known_cards)
+    compatible: list[int] = []
+    for index, deck_counter in enumerate(_deck_counters(candidates)):
+        if len(candidates[index]) - known_total < required_hidden:
+            continue
+        if all(deck_counter[card] >= count for card, count in known.items()):
+            compatible.append(index)
     if not compatible:
         raise ValueError(
             "no opponent deck candidate is compatible with the observed public cards "
-            f"(known={Counter(known_cards)}, required_hidden={required_hidden})"
+            f"(known={known}, required_hidden={required_hidden})"
         )
-    return random.choice(compatible)
+    chosen = random.choice(compatible)
+    remaining = _deck_counters(candidates)[chosen].copy()
+    remaining.subtract(known)
+    return candidates[chosen], list(remaining.elements())
 
 
 def determinize_for_search(

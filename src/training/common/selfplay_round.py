@@ -29,6 +29,7 @@ def run_selfplay_round(
     game_timeout_seconds: float,
     round_timeout_seconds: float,
     event_log_path: Path,
+    min_completion_rate: float = 0.8,
 ) -> tuple[list, dict[int, int]]:
     """自己対戦を並列実行し、`(全試合分のサンプル, 勝敗内訳)`を返す。
 
@@ -48,6 +49,10 @@ def run_selfplay_round(
         game_timeout_seconds: 1試合あたりの上限。
         round_timeout_seconds: ラウンド全体の上限。
         event_log_path: ワーカーイベントのJSONL出力先。
+        min_completion_rate: この割合を下回る完走率なら例外にする。cgエンジンは
+            まれにネイティブクラッシュするため少数の失敗は許容するが、大半が
+            失敗したまま更新して次のラウンドへ進むと、偏った少数サンプルで
+            方策を壊したまま学習が続いてしまう。
 
     Returns:
         tuple[list, dict[int, int]]: (全試合分のサンプル, `{0: , 1: , 2(引分): }`)。
@@ -85,4 +90,10 @@ def run_selfplay_round(
     )
     if skipped:
         print(f"  skipped {skipped}/{num_games} failed or timed-out games")
+    completion_rate = (num_games - skipped) / num_games if num_games else 1.0
+    if completion_rate < min_completion_rate:
+        raise RuntimeError(
+            f"only {completion_rate:.0%} of games completed "
+            f"({num_games - skipped}/{num_games}); refusing to train on a biased sample"
+        )
     return all_samples, results

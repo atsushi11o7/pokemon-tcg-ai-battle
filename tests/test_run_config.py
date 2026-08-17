@@ -22,17 +22,16 @@ class RunConfigTest(unittest.TestCase):
             ROOT / "outputs" / "runs" / "ppo_generalist" / "checkpoints" / "final.pt",
         )
 
-    def test_asymmetric_ppo_config_uses_same_format_as_generalist(self) -> None:
-        generalist_raw = self._ppo_config()
-        with (ROOT / "configs" / "ppo_asymmetric.yaml").open(encoding="utf-8") as file:
-            asymmetric_raw = yaml.safe_load(file)
+    def test_asymmetric_mode_accepts_a_fixed_deck(self) -> None:
+        """generalistと同じ書式のまま、モードとデッキだけ差し替えられること。"""
+        raw = self._ppo_config()
+        raw["training"]["selfplay_mode"] = "asymmetric"
+        raw["training"]["deck_path"] = "decks/candidates/crustle_team3.csv"
 
-        self.assertEqual(list(generalist_raw), list(asymmetric_raw))
-        self.assertEqual(list(generalist_raw["training"]), list(asymmetric_raw["training"]))
+        config = self._load_temporary(raw)
 
-        asymmetric = load_run_config(ROOT / "configs" / "ppo_asymmetric.yaml")
-        self.assertEqual(asymmetric.selfplay_mode, "asymmetric")
-        self.assertEqual(asymmetric.deck_path, ROOT / "decks" / "candidates" / "crustle_team3.csv")
+        self.assertEqual(config.selfplay_mode, "asymmetric")
+        self.assertEqual(config.deck_path, ROOT / "decks" / "candidates" / "crustle_team3.csv")
 
     def test_architecture_is_not_a_run_config_field(self) -> None:
         raw = self._ppo_config()

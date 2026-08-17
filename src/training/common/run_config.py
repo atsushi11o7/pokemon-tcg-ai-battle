@@ -14,12 +14,14 @@ from .deck import parse_deck_csv
 from .selfplay_modes import SelfplayMode
 
 ROOT = Path(__file__).resolve().parents[3]
-Algorithm = Literal["ppo", "mcts"]
+Algorithm = Literal["ppo", "mcts", "bc"]
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    initial_checkpoint: Path
+    # Noneならランダム初期化から学習する。入力仕様やD_MODELを変えると
+    # 既存チェックポイントは形状不一致で読めなくなるため、その場合はNoneにする。
+    initial_checkpoint: Path | None
 
 
 @dataclass(frozen=True)
@@ -125,7 +127,12 @@ def _resolve(path: str | None) -> Path | None:
 
 
 def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> SelfplayMode:
-    common_fields = {"selfplay_mode", "deck_path", "games_per_round", "rounds"}
+    # BCはリプレイからの教師あり学習で自己対戦を行わないため、対局まわりの項目を持たない。
+    common_fields = (
+        {"rounds"}
+        if algorithm == "bc"
+        else {"selfplay_mode", "deck_path", "games_per_round", "rounds"}
+    )
     algorithm_fields = {
         "ppo": {
             "learning_rate",
@@ -147,17 +154,62 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
             "batch_size",
             "epochs_per_round",
             "eval_games_per_round",
+            "baseline_eval_games",
             "gating_win_rate",
             "checkpoint_pool_size",
             "gating_pool_sample",
             "replay_buffer_rounds",
+            "freeze_policy",
+        },
+        "bc": {
+            "shard_dir",
+            "val_shards",
+            "holdout_shards",
+            "min_shard_day",
+            "val_day",
+            "loser_policy_weight",
+            "freeze_policy",
+            "learning_rate",
+            "batch_size",
+            "value_loss_coef",
+            "warmup_steps",
         },
     }[algorithm]
     _reject_unknown(training, common_fields | algorithm_fields, "training")
-    required = (common_fields - {"deck_path"}) | algorithm_fields
+    # 省略可能な項目。既定はeval_games_per_roundと同数(従来どおりの挙動)。
+    optional_fields = {
+        "deck_path",
+        "baseline_eval_games",
+        "value_loss_coef",
+        "warmup_steps",
+        "freeze_policy",
+        "holdout_shards",
+        "min_shard_day",
+        "val_day",
+    }
+    required = (common_fields | algorithm_fields) - optional_fields
     missing = required - set(training)
     if missing:
         raise ValueError(f"missing training field(s): {', '.join(sorted(missing))}")
+
+    _positive_int(training["rounds"], "training.rounds")
+    _positive(training["learning_rate"], "training.learning_rate")
+
+    if algorithm == "bc":
+        _positive_int(training["batch_size"], "training.batch_size")
+        # 0は「検証せず全シャードを学習に使う」。汎化の指標は取れなくなるので、
+        # 既に指標が揃っていてデータ量を優先する場合にだけ選ぶこと。
+        _non_negative_int(training["val_shards"], "training.val_shards")
+        _required_text(training["shard_dir"], "training.shard_dir")
+        if "value_loss_coef" in training:
+            _non_negative(training["value_loss_coef"], "training.value_loss_coef")
+        if "warmup_steps" in training:
+            _non_negative_int(training["warmup_steps"], "training.warmup_steps")
+        # 敗者の手を模倣する強さ。必須にしているのは、敗者のone-hotを含むシャードへ
+        # 設定を向けたまま書き忘れると、黙って全面模倣に変わってしまうため。
+        # 何を学ばせているかは設定ファイルだけで読み取れる必要がある。
+        _probability(training["loser_policy_weight"], "training.loser_policy_weight")
+        return "generalist"
 
     mode = training["selfplay_mode"]
     if mode not in ("generalist", "asymmetric", "mirror"):
@@ -168,12 +220,19 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
     games_per_round = _positive_int(training["games_per_round"], "training.games_per_round")
     if mode == "asymmetric" and games_per_round % 2 != 0:
         raise ValueError("training.games_per_round must be even for selfplay_mode='asymmetric'")
-    _positive_int(training["rounds"], "training.rounds")
-    _positive(training["learning_rate"], "training.learning_rate")
     _positive_int(training["epochs_per_round"], "training.epochs_per_round")
     eval_games = _positive_int(training["eval_games_per_round"], "training.eval_games_per_round")
     if eval_games % 4 != 0:
         raise ValueError("training.eval_games_per_round must be a multiple of 4")
+
+    if algorithm == "mcts" and "baseline_eval_games" in training:
+        baseline_games = training["baseline_eval_games"]
+        if not isinstance(baseline_games, int) or baseline_games < 0 or baseline_games % 4 != 0:
+            raise ValueError("training.baseline_eval_games must be 0 (disabled) or a multiple of 4")
+        if baseline_games > eval_games:
+            raise ValueError(
+                "training.baseline_eval_games must not exceed training.eval_games_per_round"
+            )
 
     if algorithm == "ppo":
         _positive_int(training["minibatch_size"], "training.minibatch_size")
@@ -203,6 +262,9 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
         if pool_sample > pool_size:
             raise ValueError("training.gating_pool_sample cannot exceed checkpoint_pool_size")
         _positive_int(training["replay_buffer_rounds"], "training.replay_buffer_rounds")
+        if "freeze_policy" in training and not isinstance(training["freeze_policy"], bool):
+            # bool()で受けると、YAMLに引用符付きで"false"と書いた場合にTrueになる。
+            raise ValueError("training.freeze_policy must be a boolean")
     return mode
 
 
@@ -235,12 +297,16 @@ def load_run_config(path: Path) -> RunConfig:
     )
 
     algorithm = raw.get("algorithm")
-    if algorithm not in ("ppo", "mcts"):
-        raise ValueError("algorithm must be either 'ppo' or 'mcts'")
+    if algorithm not in ("ppo", "mcts", "bc"):
+        raise ValueError("algorithm must be one of: ppo, mcts, bc")
     mode = _validate_training(training, algorithm)
 
-    checkpoint_value = _required_text(model.get("initial_checkpoint"), "model.initial_checkpoint")
-    checkpoint = ROOT / checkpoint_value
+    # 入力仕様やD_MODELを変えると既存チェックポイントは形状不一致で読めなくなる。
+    # その場合はnullを指定してランダム初期化から学習する。
+    checkpoint_value = model.get("initial_checkpoint")
+    if checkpoint_value is not None:
+        checkpoint_value = _required_text(checkpoint_value, "model.initial_checkpoint")
+    checkpoint = ROOT / checkpoint_value if checkpoint_value is not None else None
 
     workers = _positive_int(
         runtime.get("workers", max(1, (os.cpu_count() or 4) - 2)), "runtime.workers"
@@ -291,5 +357,29 @@ def validate_algorithm(config: RunConfig, expected: Algorithm) -> None:
 
 
 def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
+    """run configと、そのrunで使ったネットワーク構成を出力先に記録する。
+
+    入力仕様やD_MODELを変えるとチェックポイントの互換性が切れるため、
+    「この重みはどの構成で学習されたか」を後から辿れるようにする。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(config_path, output_dir / "run_config.yaml")
+
+    from . import model_config
+
+    architecture = {
+        name: getattr(model_config, name)
+        for name in (
+            "D_MODEL",
+            "NUM_HEADS",
+            "D_FEEDFORWARD",
+            "NUM_LAYERS_ENCODER",
+            "NUM_LAYERS_DECODER",
+            "HAND_TOKENS",
+            "DECODER_SELF_ATTENTION",
+            "DROPOUT",
+        )
+    }
+    (output_dir / "architecture.yaml").write_text(
+        yaml.safe_dump(architecture, sort_keys=False), encoding="utf-8"
+    )

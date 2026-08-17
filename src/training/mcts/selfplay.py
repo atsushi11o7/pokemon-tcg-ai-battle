@@ -53,7 +53,7 @@ class Sample:
         self.label: float | None = None  # 価値の教師信号。ゲーム終了後に`_assign_labels`で埋める
 
 
-def make_eval_fn(network, decks: list[list[int]]):
+def make_eval_fn(network, decks: list[list[int]], leaf_value: float | None = None):
     """`PolicyValueNet`をラップして、`search.create_node`が要求する`eval_fn`にする。
 
     探索木は複数ターンにまたがりうるため、ノードごとに「今まさに手番を選んでいる側
@@ -65,6 +65,18 @@ def make_eval_fn(network, decks: list[list[int]]):
         decks: `[player0の60枚デッキ, player1の60枚デッキ]`。本番推論時は
             `[自分のデッキ, 自分のデッキ]`のように同じものを渡してよい
             (相手の本当のデッキは分からないため)。
+        leaf_value: 指定すると葉の評価を価値ヘッドではなくこの定数にする。
+            ラダー実績1046.1の#34の価値ヘッドは、実測で自分の勝ち局面の符号正答率94.1%・
+            負け局面16.1%(平均+0.850)と、ほぼ常に+1を返すだけのものだった。
+            `create_node`は手番が根の側でなければ符号を反転するので、定数+1は
+            「葉が自分の手番なら+1、相手の手番なら-1」となり、実質「自分の手番が
+            多く回る手順を選ぶ」低分散なヒューリスティックとして働いていた。
+            価値ヘッドを正しく学習し直した#39(符号正答率68.8%)は、探索が貪欲方策を
+            上書きする割合が2.7%から11.0%へ増え、ラダーは1005.4から614.0へ落ちた。
+            50シミュレーション/仮説では終局までほとんど届かず、探索は実質1手先の
+            価値評価にしかならない。方策(精度約80%)の方が着手の順位付けとしては
+            優れているため、定数に固定して探索を#34の挙動へ戻せるようにする。
+            終局ノードは`create_node`が実際の勝敗を使うので、ここでは変えない。
 
     Returns:
         Callable[[Observation, list[list[int]]], tuple[list[float], float]]: `eval_fn`。
@@ -81,7 +93,7 @@ def make_eval_fn(network, decks: list[list[int]]):
                 index_enc, value_enc, offset_enc, index_dec, value_dec, offset_dec
             )
         probs = torch.softmax(scores[0], dim=-1).tolist()
-        return probs, float(value.item())
+        return probs, float(value.item()) if leaf_value is None else leaf_value
 
     return eval_fn
 
@@ -96,8 +108,12 @@ def run_determinized_mcts(
     num_determinizations: int = NUM_DETERMINIZATIONS,
     add_root_noise: bool = False,
     temperature: float | None = None,
+    leaf_value: float | None = None,
 ) -> tuple[list[int], list[float], float, list[list[int]]]:
-    """複数の隠れ情報仮説へ探索予算を分配し、根の方策と価値を集約する。"""
+    """複数の隠れ情報仮説へ探索予算を分配し、根の方策と価値を集約する。
+
+    `leaf_value`を渡すと葉の評価を価値ヘッドではなく定数にする(`make_eval_fn`参照)。
+    """
     hypothesis_count = min(max(1, num_determinizations), max(1, search_count))
     base_budget, remainder = divmod(search_count, hypothesis_count)
     aggregate_policy: list[float] | None = None
@@ -108,7 +124,7 @@ def run_determinized_mcts(
     for hypothesis_index in range(hypothesis_count):
         budget = base_budget + int(hypothesis_index < remainder)
         kwargs, assumed_decks = determinize_for_search(obs, own_deck, opponent_deck_pool)
-        eval_fn = make_eval_fn(network, assumed_decks)
+        eval_fn = make_eval_fn(network, assumed_decks, leaf_value)
         root_state = search_begin(obs, **kwargs)
         try:
             _select, policy, value, actions = run_mcts(

@@ -16,6 +16,7 @@ from .common.run_config import RunConfig, load_run_config  # noqa: E402
 TRAINER_MODULES = {
     "ppo": "training.ppo.train",
     "mcts": "training.mcts.train",
+    "bc": "training.bc.train",
 }
 NATIVE_CRASH_EXIT_CODES = {134, 137, 139}
 

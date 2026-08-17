@@ -1,0 +1,40 @@
+run:
+  name: bc_drag_any
+  output_dir: outputs/runs/bc_drag_any
+
+algorithm: bc
+
+model:
+  # #36(907.5)の土台になった広めのDragapult特化重み(stage1のepoch11)。
+  # #36はこの後に金帯の単一構築(Jaccard>=0.9)で仕上げたものだが、今回のデータは
+  # Jaccard>=0.5の広い集合なので、幅の合う stage1 側から始める。
+  initial_checkpoint: outputs/runs/bc_dragapult/checkpoints/generalist_round11.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  # `--side any --policy-on-deck`で抽出した81シャード(7/16〜8/15)。Grimmsnarlと同じく、
+  # 負けた試合からも自分のデッキの指し手を教師にできる。旧集合(勝ちのみ49シャード)の
+  # 約1.7倍。Grimmsnarlと逆にシャード数は日を追って増えており(7/16は1枚、8/15は8枚)、
+  # 金帯の37.9%を占める現在のメタデッキという事実と一致する。
+  shard_dir: data/bc/decks/drag_any
+  # 既定は1.0。0.0にすると`label<0`の方策教師が消え、今回集めた負け試合が無駄になる。
+  loser_policy_weight: 1.0
+  freeze_policy: false
+  val_day: "20260812"
+  val_shards: 2
+  holdout_shards: 1
+  learning_rate: 0.0001
+  # 81シャードなので1エポック約12分。Grimmsnarlの学習が終わってから回す。
+  rounds: 8
+  batch_size: 256
+  value_loss_coef: 0.3
+  warmup_steps: 500
