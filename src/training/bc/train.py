@@ -203,16 +203,17 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
             raise RuntimeError(
                 f"holdout_shards={holdout} leaves no training shards ({len(shards)} available)"
             )
-        val_paths = shards[-holdout:][: settings.val_shards]
-        train_paths = shards[:-holdout]
+        # `holdout=0`は「検証せず全シャードを学習に使う」。`shards[:-0]`は空リストに
+        # なるので、スライスに任せず分岐する。締切間際に手持ちを全部入れる場合など、
+        # 既に指標が揃っていて検証よりデータ量を優先したいときに使う。
+        val_paths = shards[-holdout:][: settings.val_shards] if holdout else []
+        train_paths = shards[:-holdout] if holdout else list(shards)
     if not train_paths:
         raise RuntimeError("no training shards left after the split")
     # 検証データは常駐させず、エポック末の評価時だけ読む。20万サンプルを親プロセスに
     # 抱えたままだと、fork したDataLoaderワーカーがコピーオンライトで複製してしまう。
-    print(
-        f"shards: train={len(train_paths)} val={len(val_paths)} "
-        f"({val_paths[0].name}..{val_paths[-1].name})"
-    )
+    span = f" ({val_paths[0].name}..{val_paths[-1].name})" if val_paths else " (検証なし)"
+    print(f"shards: train={len(train_paths)} val={len(val_paths)}{span}")
 
     # 保存済みエポックがあればそこから、無ければ設定の初期重みから始める。
     # PPO/MCTSと同じ共通処理を使う(ネイティブクラッシュ後にCLIが再起動したとき、

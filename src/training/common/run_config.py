@@ -197,8 +197,9 @@ def _validate_training(training: dict[str, Any], algorithm: Algorithm) -> Selfpl
 
     if algorithm == "bc":
         _positive_int(training["batch_size"], "training.batch_size")
-        # 検証シャードが0だと汎化の指標が取れない。学習は進むが判断材料が無くなる。
-        _positive_int(training["val_shards"], "training.val_shards")
+        # 0は「検証せず全シャードを学習に使う」。汎化の指標は取れなくなるので、
+        # 既に指標が揃っていてデータ量を優先する場合にだけ選ぶこと。
+        _non_negative_int(training["val_shards"], "training.val_shards")
         _required_text(training["shard_dir"], "training.shard_dir")
         if "value_loss_coef" in training:
             _non_negative(training["value_loss_coef"], "training.value_loss_coef")
