@@ -26,8 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Kaggle本番のPythonバージョン。提出#19のログ(episode 91943786)で確認した。
-# ローカルは3.12なので、3.12以降の構文を書いてもビルドまでは通ってしまう。
+# Kaggle本番のPythonバージョン。ローカルは3.12なので、3.12以降の構文を書いても
+# ビルドまでは通ってしまう。
 TARGET_PYTHON = (3, 11)
 
 ROOT = Path(__file__).resolve().parents[1]

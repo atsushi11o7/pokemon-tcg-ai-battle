@@ -1,15 +1,12 @@
 """Determinized MCTSの自己対戦(selfplay.py)で集めたデータで、価値・方策ネットワークを学習する。
 
 自己対戦→学習→(更新したネットワークで)自己対戦、を繰り返すAlphaZero的なループ。
-自己対戦と固定matchup評価はspawn workerで並列実行し、1試合単位のタイムアウト/例外は
-その試合だけ諦める(cgエンジンはまれにネイティブクラッシュすることがあるため)。
-プロセスごと落ちた場合は統一training CLIが再起動し、保存済みの最新ラウンドの
-チェックポイントから自動で再開する。
+自己対戦と固定matchup評価はspawn workerで並列実行し、1試合単位のタイムアウトや例外は
+その試合だけ諦める。プロセスごと落ちた場合はCLIが再起動し、最新ラウンドから再開する。
 
 設定はすべて`MctsSettings`に入れて引数で引き回す。spawn workerはこのmoduleを
-まっさらに再importするため、module levelの可変状態に設定を置くと、workerだけが
-定義時の既定値を見るという追跡困難なズレが生じる。workerへ渡すものは
-`_SelfplayWorkerContext`に集約し、spawn境界を1箇所に閉じ込める。
+まっさらに再importするため、module levelの可変状態に設定を置くとworkerだけが
+既定値を見ることになる。workerへ渡すものは`_SelfplayWorkerContext`に集約する。
 
 このmoduleは内部trainer。表向きの実行入口は `python -m training.cli`。
 """
