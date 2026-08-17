@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from evaluation.match_runner import evaluate_fixed_matchups
-from training.common.evaluation_plan import build_fixed_matchups
+from training.common.parallel import build_fixed_matchups
 
 
 def deck_agent_factory(deck: list[int]):

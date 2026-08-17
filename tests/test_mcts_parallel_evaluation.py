@@ -55,7 +55,7 @@ class MctsParallelEvaluationTest(unittest.TestCase):
             return len(games) - 1, 1
 
         with patch(
-            "training.common.parallel_evaluation.run_parallel_games",
+            "training.common.parallel.run_parallel_games",
             side_effect=fake_parallel_games,
         ):
             results = evaluate_mcts_networks_parallel(

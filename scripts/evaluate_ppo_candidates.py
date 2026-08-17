@@ -17,7 +17,6 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from evaluation.match_runner import evaluate_fixed_matchups  # noqa: E402
 from training.common.deck_pool import load_weighted_deck_pool  # noqa: E402
-from training.common.evaluation_plan import build_fixed_matchups  # noqa: E402
 from training.common.model_config import (  # noqa: E402
     D_FEEDFORWARD,
     D_MODEL,
@@ -26,6 +25,7 @@ from training.common.model_config import (  # noqa: E402
     NUM_LAYERS_ENCODER,
 )
 from training.common.network import PolicyValueNet  # noqa: E402
+from training.common.parallel import build_fixed_matchups  # noqa: E402
 from training.ppo.selfplay import make_ppo_eval_agent  # noqa: E402
 
 CANDIDATE_CARDS = {

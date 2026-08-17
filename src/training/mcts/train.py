@@ -24,39 +24,36 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
-from ..common.checkpoints import (
-    checkpoint_path,
-    optimizer_path,
-    prune_checkpoints,
-    resolve_resume_point,
-    restore_optimizer_state,
-)
+from ..common.deck import SelfplayMode, fixed_deck_seat_for_game
 from ..common.deck_pool import (
     configure_sampling_snapshot,
     load_opponent_deck_pool,
     seed_opponent_deck_pool_cache,
 )
-from ..common.evaluation_plan import build_fixed_matchups
-from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
     load_policy_value_net,
 )
+from ..common.parallel import build_fixed_matchups, run_selfplay_round
 from ..common.run_config import (
     RunConfig,
     load_run_config,
     save_config_snapshot,
     validate_algorithm,
 )
-from ..common.selfplay_modes import SelfplayMode, fixed_deck_seat_for_game
-from ..common.selfplay_round import run_selfplay_round
 from ..common.training_utils import (
     ListDataset,
+    append_round_metrics,
+    checkpoint_path,
     collate_samples,
     configure_trainable_parameters,
     masked_policy_loss,
     move_optimizer_state_to,
+    optimizer_path,
+    prune_checkpoints,
+    resolve_resume_point,
+    restore_optimizer_state,
     seed_game,
     training_device,
 )
