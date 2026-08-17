@@ -83,6 +83,7 @@ class SubmissionAgent:
         weights_name: str = "policy.pt",
         deck_name: str = "deck.csv",
         opponent_decks_name: str = "opponent_decks.json",
+        leaf_value: float | None = None,
     ) -> None:
         """
         Args:
@@ -92,6 +93,8 @@ class SubmissionAgent:
             weights_name: 重みファイル名。
             deck_name: デッキファイル名。
             opponent_decks_name: 探索時の相手デッキ候補(探索する場合のみ必要)。
+            leaf_value: 探索の葉を価値ヘッドではなくこの定数で評価する
+                (`mcts.selfplay.make_eval_fn`に理由を書いた)。Noneなら価値ヘッドを使う。
         """
         self.network = load_policy_value_net(resource_path(weights_name, base_dir))
         self.deck = parse_deck_csv(resource_path(deck_name, base_dir))
@@ -99,6 +102,7 @@ class SubmissionAgent:
         self.num_determinizations = num_determinizations
         # 本番の上限は1エージェント600秒。読み込みや例外処理の余地を残して低めに置く。
         self.time_budget_seconds = time_budget_seconds
+        self.leaf_value = leaf_value
         self.spent_seconds = 0.0
         self.opponent_decks: list[list[int]] = []
         if search_count > 0:
@@ -162,5 +166,6 @@ class SubmissionAgent:
             self.opponent_decks,
             count,
             num_determinizations=self.num_determinizations,
+            leaf_value=self.leaf_value,
         )
         return select
