@@ -103,7 +103,7 @@ class CompletionRateGateTest(unittest.TestCase):
     """大半が失敗したラウンドで学習を進めないこと。"""
 
     def test_low_completion_rate_raises(self) -> None:
-        from training.common.selfplay_round import run_selfplay_round
+        from training.common.parallel import run_selfplay_round
 
         with self.assertRaises(RuntimeError) as caught:
             run_selfplay_round(

@@ -8,7 +8,7 @@
 推測で段階を切ると外す。実測してから配分を変える。
 
 Usage:
-    uv run python scripts/measure_search_value.py --checkpoint <ckpt> --deck <csv> --games 20
+    uv run python scripts/probe_search_value.py --checkpoint <ckpt> --deck <csv> --games 20
 """
 
 from __future__ import annotations

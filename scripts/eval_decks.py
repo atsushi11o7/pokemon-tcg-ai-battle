@@ -6,7 +6,7 @@
 分散を消し、少ない試合数でもデッキ間の差を見やすくする。
 
 Usage:
-    uv run python scripts/evaluate_decks.py \
+    uv run python scripts/eval_decks.py \
         --checkpoint outputs/runs/bc_toplayers/checkpoints/final.pt \
         --games 200 --workers 12 --top-archetypes 8
 """

@@ -10,8 +10,7 @@ from typing import Any, Literal
 
 import yaml
 
-from .deck import parse_deck_csv
-from .selfplay_modes import SelfplayMode
+from .deck import SelfplayMode, parse_deck_csv
 
 ROOT = Path(__file__).resolve().parents[3]
 Algorithm = Literal["ppo", "mcts", "bc"]
@@ -376,7 +375,6 @@ def save_config_snapshot(config_path: Path, output_dir: Path) -> None:
             "NUM_LAYERS_ENCODER",
             "NUM_LAYERS_DECODER",
             "HAND_TOKENS",
-            "DECODER_SELF_ATTENTION",
             "DROPOUT",
         )
     }

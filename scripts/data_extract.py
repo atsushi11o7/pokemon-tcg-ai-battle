@@ -26,9 +26,7 @@ from training.bc.dataset import (  # noqa: E402
 def deck_similarity(a: Counter, b: Counter) -> float:
     """2つの60枚デッキのJaccard係数(枚数込み)。
 
-    同じアーキタイプでも数枚は違うので、完全一致で絞ると取りこぼす。実測では
-    閾値0.5と0.9で該当率が31.1%と27.8%しか変わらず、Grimmsnarl系は構築の
-    ばらつきが小さい。緩めても別デッキはほとんど混ざらない。
+    同じアーキタイプでも数枚は違うので、完全一致で絞ると取りこぼす。
     """
     union = sum((a | b).values())
     return sum((a & b).values()) / union if union else 0.0
@@ -37,8 +35,8 @@ def deck_similarity(a: Counter, b: Counter) -> float:
 def load_ratings(path: Path | None) -> dict[str, float]:
     """リーダーボードCSVからチーム名→スコアの表を作る。
 
-    リプレイJSONにレーティングは入っていないが、チーム名は入っている。実測で97.8%が
-    照合できる。ただし取れるのは「現在」のスコアで、その試合の時点の値ではない。
+    リプレイJSONにレーティングは入っていないが、チーム名は入っている。
+    取れるのは「現在」のスコアで、その試合の時点の値ではない。
     """
     if path is None:
         return {}

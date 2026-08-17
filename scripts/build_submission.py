@@ -26,8 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Kaggle本番のPythonバージョン。提出#19のログ(episode 91943786)で確認した。
-# ローカルは3.12なので、3.12以降の構文を書いてもビルドまでは通ってしまう。
+# Kaggle本番のPythonバージョン。ローカルは3.12なので、3.12以降の構文を書いても
+# ビルドまでは通ってしまう。
 TARGET_PYTHON = (3, 11)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +40,6 @@ CONCATENATED_MODULES = (
     "common/sparse_features.py",
     "common/network.py",
     "common/deck.py",
-    "common/selfplay_modes.py",
     "mcts/search.py",
     "mcts/determinize.py",
     "mcts/selfplay.py",
@@ -65,7 +64,6 @@ model_config = _types.SimpleNamespace(
     NUM_LAYERS_DECODER=NUM_LAYERS_DECODER,
     HAND_TOKENS=HAND_TOKENS,
     BENCH_SLOTS=BENCH_SLOTS,
-    DECODER_SELF_ATTENTION=DECODER_SELF_ATTENTION,
     DROPOUT=DROPOUT,
 )
 """

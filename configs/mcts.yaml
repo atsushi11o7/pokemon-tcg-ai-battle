@@ -1,11 +1,11 @@
 run:
-  name: mcts_deep
-  output_dir: outputs/runs/mcts_deep
+  name: mcts
+  output_dir: outputs/runs/mcts
 
 algorithm: mcts
 
 model:
-  initial_checkpoint: outputs/runs/mcts_generalist/checkpoints/final.pt
+  initial_checkpoint: null
 
 data:
   sampling_snapshot: data/meta/derived/sampling_snapshot.json
@@ -23,12 +23,15 @@ training:
   selfplay_mode: generalist
   deck_path: null
   games_per_round: 100
-  rounds: 20
+  rounds: 30
   search_count: 200
   num_determinizations: 2
+  # trueにすると価値ヘッド(encoder_fc)だけを更新し、方策は初期重みのまま不変になる。
+  # 模倣学習の方策を保ったまま価値だけ鍛えたいときに使う。
+  freeze_policy: false
   learning_rate: 0.0003
   batch_size: 64
-  epochs_per_round: 1
+  epochs_per_round: 3
   eval_games_per_round: 32
   baseline_eval_games: 8
   gating_win_rate: 0.5

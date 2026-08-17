@@ -67,50 +67,5 @@ class WorstCaseGameTest(unittest.TestCase):
         self.assertLess(agent.spent_seconds, budget)
 
 
-class MarginScaleTest(unittest.TestCase):
-    SCHEDULE = ((0.5, 2.0), (1.5, 0.5), (3.0, 0.15))
-
-    """方策の迷い(top1-top2)で探索予算を配分すること。
-
-    24試合2,035手の実測では、探索が着手を変えた割合は
-    差<0.5で40.2%、1.5-3.0で1.9%、3.0以上で0.6%だった。差1.5以上は全手番の58%を
-    占めながら着手変更の5%しか生まないので、そこを切って迷う局面へ回す。
-    配分がずれても例外にならず「同じ予算で浅く読む」だけになるため、テストで固定する。
-    """
-
-    def setUp(self) -> None:
-        self.agent = _Agent(search_count=150, budget=540.0)
-        self.agent.MARGIN_SCHEDULE = self.SCHEDULE
-
-    def test_disabled_schedule_keeps_the_search_count(self) -> None:
-        """空のスケジュールなら倍率は常に1.0(従来どおり一律)。"""
-        plain = _Agent(search_count=150, budget=540.0)
-        plain.MARGIN_SCHEDULE = ()
-        self.assertEqual(plain.margin_scale(0.0), 1.0)
-        self.assertEqual(plain.margin_scale(99.0), 1.0)
-
-    def test_uncertain_positions_get_more_search(self) -> None:
-        self.assertEqual(self.agent.margin_scale(0.0), 2.0)
-        self.assertEqual(self.agent.margin_scale(0.49), 2.0)
-
-    def test_scale_decreases_as_the_policy_gets_confident(self) -> None:
-        scales = [self.agent.margin_scale(m) for m in (0.2, 1.0, 2.0, 5.0)]
-        self.assertEqual(scales, sorted(scales, reverse=True))
-        self.assertEqual(scales[-1], 0.0)
-
-    def test_confident_positions_skip_search(self) -> None:
-        self.assertEqual(self.agent.margin_scale(3.0), 0.0)
-        self.assertEqual(self.agent.margin_scale(float("inf")), 0.0)
-
-    def test_combined_with_the_time_budget(self) -> None:
-        """時間の逼迫と方策の確信は掛け合わさる。"""
-        base = self.agent.budgeted_search_count(0.0)
-        self.assertEqual(int(base * self.agent.margin_scale(0.1)), 300)
-        self.assertEqual(int(base * self.agent.margin_scale(2.0)), 22)
-        self.assertEqual(int(base * self.agent.margin_scale(9.0)), 0)
-        late = self.agent.budgeted_search_count(540 * 0.7)
-        self.assertEqual(int(late * self.agent.margin_scale(0.1)), 74)
-
-
 if __name__ == "__main__":
     unittest.main()

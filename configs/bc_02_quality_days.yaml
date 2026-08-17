@@ -1,0 +1,33 @@
+run:
+  name: bc_02_quality_days
+  output_dir: outputs/runs/bc_02_quality_days
+
+algorithm: bc
+
+model:
+  # bc_01の最終重みから続ける。optimizerのモーメントとスケジューラは初期化される。
+  initial_checkpoint: outputs/runs/bc_01_generalist/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  shard_dir: data/bc/shards_dated
+  # 7/06より前は勝者レートの中央値が低く、手本の質が落ちるので混ぜない。
+  min_shard_day: "20260706"
+  loser_policy_weight: 0.0
+  val_shards: 4
+  holdout_shards: 14
+  # 既存の重みへ追加分を吸収させるだけなので、bc_01の1/6に落とす。
+  learning_rate: 0.00005
+  rounds: 3
+  batch_size: 256
+  value_loss_coef: 0.1
+  warmup_steps: 500

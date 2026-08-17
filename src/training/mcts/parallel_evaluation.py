@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 
 from ..common.network import PolicyValueNet  # noqa: E402
-from ..common.parallel_evaluation import (  # noqa: E402
+from ..common.parallel import (  # noqa: E402
     EvaluationGame,
     build_evaluation_games,
     evaluate_networks_parallel,

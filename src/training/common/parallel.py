@@ -1,28 +1,151 @@
-"""固定matchup評価を、監視可能なspawn workerで並列実行する。
+"""自己対戦のラウンド実行と、固定matchupによる候補評価。
 
-直列版(`evaluation.match_runner.evaluate_fixed_matchups`)と同じ組み合わせ・同じseedの
-試合を、1試合=1タスクに展開してワーカーへ流す。ネイティブエンジンのクラッシュやハングを
-trainer本体から隔離し、1試合単位のタイムアウトを効かせるのが目的。
-
-MCTS/PPOのどちらでも使えるよう、agentの作り方だけ`agent_factory`で差し替える。
+どちらも`parallel_games.run_parallel_games`の上に乗る。低レベルの
+プロセスプール側はtorchや評価モジュールに依存させないため、分けてある。
 """
 
 from __future__ import annotations
 
+import random
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 
+from .deck import SelfplayMode, sample_deck  # noqa: E402
+from .deck_pool import configure_sampling_snapshot, seed_opponent_deck_pool_cache  # noqa: E402
 from .network import PolicyValueNet, build_policy_value_net  # noqa: E402
-from .opponent_pool import configure_sampling_snapshot, seed_opponent_deck_pool_cache  # noqa: E402
 from .parallel_games import run_parallel_games  # noqa: E402
 from .training_utils import seed_game  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "src" / "evaluation"))
 from match_runner import first_index_agent_factory, play_one_match  # noqa: E402
+
+# ---- 自己対戦のラウンド -------------------------------------------------
+
+
+PROGRESS_INTERVAL = 20  # 何試合ごとに進捗を出すか
+
+
+def run_selfplay_round(
+    *,
+    algorithm: str,
+    round_num: int,
+    mode: SelfplayMode,
+    num_games: int,
+    num_workers: int,
+    initializer: Callable[..., None],
+    initargs: tuple[Any, ...],
+    task: Callable[[int], Any],
+    game_timeout_seconds: float,
+    round_timeout_seconds: float,
+    event_log_path: Path,
+    min_completion_rate: float = 0.8,
+) -> tuple[list, dict[int, int]]:
+    """自己対戦を並列実行し、`(全試合分のサンプル, 勝敗内訳)`を返す。
+
+    `task`は`(サンプルのリスト, 勝者のplayerIndex)`を返すこと。ハングやネイティブ
+    クラッシュで落ちた試合はスキップ扱いにして、ラウンド全体は続行する。
+
+    Args:
+        algorithm: イベントログに残す識別子("mcts"/"ppo")。
+        round_num: 進捗表示とイベントログ用のラウンド番号。
+        mode: 自己対戦モード(イベントログ用)。
+        num_games: このラウンドで行う試合数。
+        num_workers: 並列プロセス数。
+        initializer: ワーカー初期化関数(プロセスごとに1回)。
+        initargs: `initializer`へ渡す引数。spawn境界を越えるのはここだけなので、
+            ワーカーが必要とする設定はすべてこれに含めること。
+        task: 試合番号を受け取り`(samples, winner)`を返す関数。
+        game_timeout_seconds: 1試合あたりの上限。
+        round_timeout_seconds: ラウンド全体の上限。
+        event_log_path: ワーカーイベントのJSONL出力先。
+        min_completion_rate: この割合を下回る完走率なら例外にする。cgエンジンは
+            まれにネイティブクラッシュするため少数の失敗は許容するが、大半が
+            失敗したまま更新して次のラウンドへ進むと、偏った少数サンプルで
+            方策を壊したまま学習が続いてしまう。
+
+    Returns:
+        tuple[list, dict[int, int]]: (全試合分のサンプル, `{0: , 1: , 2(引分): }`)。
+    """
+    all_samples: list = []
+    results = {0: 0, 1: 0, 2: 0}
+    processed = 0
+
+    def on_result(_game_index: int, result) -> None:
+        nonlocal processed
+        samples, winner = result
+        all_samples.extend(samples)
+        results[winner] += 1
+        processed += 1
+        if processed % PROGRESS_INTERVAL == 0 or processed == num_games:
+            print(f"  games processed={processed}/{num_games}  results_so_far={results}")
+
+    def on_failure(game_index: int, reason: str) -> None:
+        nonlocal processed
+        processed += 1
+        print(f"  game {game_index + 1}/{num_games} failed: {reason}")
+
+    _completed, skipped = run_parallel_games(
+        num_games=num_games,
+        num_workers=num_workers,
+        initializer=initializer,
+        initargs=initargs,
+        task=task,
+        game_timeout_seconds=game_timeout_seconds,
+        round_timeout_seconds=round_timeout_seconds,
+        on_result=on_result,
+        on_failure=on_failure,
+        event_log_path=event_log_path,
+        event_context={"algorithm": algorithm, "round": round_num, "mode": mode},
+    )
+    if skipped:
+        print(f"  skipped {skipped}/{num_games} failed or timed-out games")
+    completion_rate = (num_games - skipped) / num_games if num_games else 1.0
+    if completion_rate < min_completion_rate:
+        raise RuntimeError(
+            f"only {completion_rate:.0%} of games completed "
+            f"({num_games - skipped}/{num_games}); refusing to train on a biased sample"
+        )
+    return all_samples, results
+
+
+# ---- 固定matchupの評価 --------------------------------------------------
+
+
+def build_fixed_matchups(
+    mode: SelfplayMode,
+    deck: list[int],
+    opponent_deck_pool: list[list[int]],
+    n_games: int,
+    seed: int,
+) -> list[tuple[list[int], list[int]]]:
+    """4試合ブロック用のmatchupを、学習側の乱数状態を変えずに先に固定する。"""
+    if n_games <= 0 or n_games % 4 != 0:
+        raise ValueError("evaluation games must be a positive multiple of 4")
+
+    random_state = random.getstate()
+    try:
+        random.seed(seed)
+        if mode == "generalist":
+            return [
+                (
+                    sample_deck(opponent_deck_pool, "learner"),
+                    sample_deck(opponent_deck_pool, "opponent"),
+                )
+                for _ in range(n_games // 4)
+            ]
+        if mode == "asymmetric":
+            return [
+                (deck, sample_deck(opponent_deck_pool, "opponent")) for _ in range(n_games // 4)
+            ]
+        return [(deck, deck) for _ in range(n_games // 4)]
+    finally:
+        random.setstate(random_state)
+
 
 # agentの作り方。(network, deck) -> agent。spawn境界を越えるのでpickle可能であること
 # (module levelの関数か、そのfunctools.partial)。

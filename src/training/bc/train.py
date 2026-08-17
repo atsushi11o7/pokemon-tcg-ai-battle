@@ -1,6 +1,6 @@
 """上位プレイヤーのリプレイを模倣して、価値・方策ネットワークを学習する。
 
-自己対戦は行わない。`scripts/extract_bc_samples.py`が作ったシャードを読み、
+自己対戦は行わない。`scripts/data_extract.py`が作ったシャードを読み、
 方策は「実際に選ばれた手」のone-hot、価値は「その試合の勝敗」を教師にする。
 
 MCTSとはSampleの作り方が違うだけで、ネットワーク・バッチ化・損失は共通のものを使う
@@ -23,23 +23,21 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
-from ..common.checkpoints import (
-    checkpoint_path,
-    optimizer_path,
-    prune_checkpoints,
-    resolve_resume_point,
-    restore_optimizer_state,
-)
-from ..common.metrics import append_round_metrics
 from ..common.network import PolicyValueNet, build_policy_value_net, load_policy_value_net
 from ..common.run_config import RunConfig, load_run_config, save_config_snapshot, validate_algorithm
 from ..common.training_utils import (
     LengthBucketSampler,
     ListDataset,
+    append_round_metrics,
+    checkpoint_path,
     collate_samples,
     configure_trainable_parameters,
     masked_policy_loss,
     move_optimizer_state_to,
+    optimizer_path,
+    prune_checkpoints,
+    resolve_resume_point,
+    restore_optimizer_state,
     training_device,
 )
 from .dataset import load_shard, load_shard_paths, shard_sample_counts
@@ -116,9 +114,8 @@ def policy_accuracy(scores: torch.Tensor, mask: torch.Tensor, targets: torch.Ten
 def mask_loser_targets(targets: torch.Tensor, labels: torch.Tensor, weight: float) -> torch.Tensor:
     """敗者の局面の方策教師を`weight`倍する。
 
-    シャードには敗者の手もone-hotで入っている(`--imitate-loser`で抽出)。何倍で使うかを
-    学習時に決められるようにして、抽出をやり直さずに 0.0(勝者のみ)〜1.0(同等)を比較する。
     敗者かどうかは価値の教師で判別する(`label`は勝ち+1・負け-1で、引き分けは抽出時に除外)。
+    0.0なら勝者の手だけ、1.0なら敗者の手も同等に模倣する。
     """
     if weight == 1.0:
         return targets
@@ -129,8 +126,7 @@ def mask_loser_targets(targets: torch.Tensor, labels: torch.Tensor, weight: floa
 def evaluate(network: PolicyValueNet, samples: list, batch_size: int, device) -> dict:
     """検証シャードで方策精度と損失を測る。
 
-    方策の指標は常に勝者の手だけで測る。`loser_policy_weight`を動かしても指標の定義が
-    変わらないようにするため(定義が動くと、良くなったのか測り方が変わったのか分からない)。
+    `loser_policy_weight`の値によらず、方策の指標は常に勝者の手だけで測る。
     """
     if not samples:
         return {}
@@ -174,20 +170,12 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
     if len(shards) <= settings.val_shards:
         raise RuntimeError(f"not enough shards in {settings.shard_dir}: {len(shards)}")
 
-    # 末尾を検証に使う。シャード名に日付が入っており`sorted`が時系列順になるので、
-    # 末尾＝最新日になる。古いデータで学習して新しいデータで測る形にすると、
-    # メタが動くこのコンペで「これから当たる相手にどれだけ通じるか」に近い指標になる。
-    #
+    # シャード名に日付が入っており`sorted`が時系列順になるので、末尾が最新日になる。
     # `holdout_shards`は学習から外す枚数、`val_shards`はそのうち実際に読む枚数。
-    # 分けているのは、最新日を丸ごと学習から外しつつ、検証は一部だけ読むため。
-    # 同じにすると最新日の残りが学習に入り、同日の別エピソードを見た状態で
-    # 測ることになる(先頭を検証にしていた頃と同じ形の時間リーク)。
-    # 全部読まないのはメモリの都合(1日ぶん約70万サンプルは載り切らない)。
+    # 最新日を丸ごと学習から外しつつ、検証は一部だけ読むために分けてある。
     if settings.val_day:
-        # 検証日を明示する。既定は「末尾＝最新日」だが、最新日まで学習に使いたい
-        # 仕上げ工程では、少し前の日を検証に回して残りを全部学習へ入れる。
-        # 検証日より後のデータで学習することになるので、時系列としては逆転する。
-        # 「壊れていないか」を見る用途に限り、汎化性能の指標としては読まない。
+        # 検証日を明示する。最新日まで学習に使いたいときに、少し前の日を検証へ回す。
+        # 検証日より後のデータで学習するため、汎化性能の指標にはならない。
         val_paths = [p for p in shards if p.name.split("_")[1] == settings.val_day][
             : settings.val_shards
         ]
@@ -203,9 +191,8 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
             raise RuntimeError(
                 f"holdout_shards={holdout} leaves no training shards ({len(shards)} available)"
             )
-        # `holdout=0`は「検証せず全シャードを学習に使う」。`shards[:-0]`は空リストに
-        # なるので、スライスに任せず分岐する。締切間際に手持ちを全部入れる場合など、
-        # 既に指標が揃っていて検証よりデータ量を優先したいときに使う。
+        # `holdout=0`は検証せず全シャードを学習に使う。`shards[:-0]`は空リストに
+        # なるので、スライスに任せず分岐する。
         val_paths = shards[-holdout:][: settings.val_shards] if holdout else []
         train_paths = shards[:-holdout] if holdout else list(shards)
     if not train_paths:
@@ -230,7 +217,7 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
         network = build_policy_value_net()
     # `freeze_policy`のときは`encoder_fc`だけを更新する。方策側はエンコーダ出力全体へ
     # 交差注意し、`encoder_fc`はCLSトークンから価値を読むだけなので、方策の出力は
-    # ビット単位で不変になる。ラダーで実績のある方策を壊さずに価値だけ鍛えられる。
+    # ビット単位で不変になり、方策を壊さずに価値だけ鍛えられる。
     trainable = configure_trainable_parameters(network, settings.freeze_policy)
     optimizer = torch.optim.Adam(trainable, lr=settings.learning_rate)
     if resume.optimizer_checkpoint is not None:
@@ -240,9 +227,7 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
             learning_rate=settings.learning_rate,
         )
     resume_round = resume.start_round - 1
-    # 全ステップ数が事前に分かるので、warmup後にコサインで下げ切る。教師あり学習では
-    # 終盤に学習率を絞らないと最適解の周りを跳ね回って収束しきらない。
-    # post-normのTransformerは初期の勾配が不安定なのでwarmupも入れる。
+    # 全ステップ数が事前に分かるので、warmup後にコサインで下げ切る。
     steps_per_epoch = sum(
         (count + settings.batch_size - 1) // settings.batch_size
         for count in shard_sample_counts(train_paths, settings.shard_dir)
@@ -272,9 +257,8 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
             network.train()
         policy_seen = value_seen = 0
         policy_sum = value_sum = 0.0
-        # シャードは抽出順(=日付順)に並んでいる。固定順で回すとエポックの終端が常に
-        # 最新日のデータになり、保存する重みがそこへ偏る。毎エポック順序を変える。
-        # (シャード内の並びは`LengthBucketSampler`が別途シャッフルする)
+        # シャードは日付順に並ぶので、固定順だとエポックの終端が常に最新日になる。
+        # 毎エポック順序を変える(シャード内は`LengthBucketSampler`がシャッフルする)。
         epoch_paths = list(train_paths)
         random.Random(settings.seed + round_num).shuffle(epoch_paths)
         # シャードを1つずつ載せる。全部同時に持つと数十GBになる。
@@ -285,10 +269,8 @@ def run_training_loop(settings: BcSettings, initial_checkpoint: Path | None) -> 
                 ListDataset(samples),
                 batch_sampler=LengthBucketSampler(lengths, settings.batch_size),
                 collate_fn=collate_samples,
-                # collateはPythonループなので、GPU処理と直列にすると待ちが乗る。
                 # `persistent_workers`は使わない。ローダはシャードごとに作り直して
-                # 1回しか回さないので常駐化の利点が無く、破棄が遅れたワーカーが
-                # 積み上がる。387シャード×8エポックでは、これが原因でOOM(exit -9)した。
+                # 1回しか回さないので、常駐化すると破棄の遅れたワーカーが積み上がる。
                 num_workers=settings.loader_workers,
             )
             for batch in loader:

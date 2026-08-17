@@ -1,0 +1,35 @@
+run:
+  name: bc_01_generalist
+  output_dir: outputs/runs/bc_01_generalist
+
+algorithm: bc
+
+model:
+  initial_checkpoint: null
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  # DataLoaderのワーカー数。BCは自己対戦をしないので対局まわりの項目は読まれない。
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  # 全エポックを残し、後から検証精度のピークを選べるようにする。
+  keep_last_checkpoints: 0
+
+training:
+  # 全デッキ混合のシャード。
+  shard_dir: data/bc/shards_dated
+  # シャード名の日付で`sorted`が時系列順になるので、末尾が最新日。
+  # 最新日の14枚を丸ごと学習から外し、うち先頭4枚だけを検証に読む。
+  val_shards: 4
+  holdout_shards: 14
+  # 敗者の手を模倣する強さ(0.0=勝者のみ / 1.0=勝者と同等)。
+  loser_policy_weight: 0.0
+  rounds: 12
+  batch_size: 256
+  learning_rate: 0.0003
+  value_loss_coef: 0.1
+  warmup_steps: 500

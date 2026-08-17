@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-from .common.checkpoints import latest_checkpoint_round  # noqa: E402
 from .common.run_config import RunConfig, load_run_config  # noqa: E402
+from .common.training_utils import latest_checkpoint_round  # noqa: E402
 
 TRAINER_MODULES = {
     "ppo": "training.ppo.train",

@@ -1,4 +1,4 @@
-"""sampling snapshotを学習コード向けのlist互換デッキプールへ変換する。"""
+"""sampling snapshotから重み付きデッキプールを読み込み、プロセス内で使い回す。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ class WeightedDeckPool(list[list[int]]):
         }
 
     def sample(self, role: str) -> list[int]:
+        """`role`("learner"/"opponent")の混合比に従ってデッキを1つ抽選する。"""
         mixture = self.mixtures.get(role)
         if mixture is None:
             raise ValueError(f"unknown deck sampling role: {role!r}")
@@ -46,14 +47,36 @@ class WeightedDeckPool(list[list[int]]):
         return random.choices(self, weights=self.weights[component], k=1)[0]
 
 
-def load_weighted_deck_pool(
-    snapshot_path: Path = SAMPLING_SNAPSHOT_PATH,
-) -> WeightedDeckPool:
+def load_weighted_deck_pool(snapshot_path: Path = SAMPLING_SNAPSHOT_PATH) -> WeightedDeckPool:
     if not snapshot_path.exists():
         raise RuntimeError(
-            f"sampling snapshot not found: {snapshot_path}; run collect_kaggle_meta.py and "
-            "build_deck_registry.py first"
+            f"sampling snapshot not found: {snapshot_path}; run meta_collect.py and "
+            "meta_build_registry.py first"
         )
     with snapshot_path.open(encoding="utf-8") as file:
         snapshot = json.load(file)
     return WeightedDeckPool(snapshot)
+
+
+_opponent_deck_pool: WeightedDeckPool | list[list[int]] | None = None
+_sampling_snapshot_path = SAMPLING_SNAPSHOT_PATH
+
+
+def configure_sampling_snapshot(path: Path) -> None:
+    """次回loadで使用するsampling snapshotを指定し、既存cacheを破棄する。"""
+    global _sampling_snapshot_path, _opponent_deck_pool
+    _sampling_snapshot_path = path
+    _opponent_deck_pool = None
+
+
+def load_opponent_deck_pool() -> WeightedDeckPool | list[list[int]]:
+    global _opponent_deck_pool
+    if _opponent_deck_pool is None:
+        _opponent_deck_pool = load_weighted_deck_pool(_sampling_snapshot_path)
+    return _opponent_deck_pool
+
+
+def seed_opponent_deck_pool_cache(decks: list[list[int]]) -> None:
+    """MCTS spawnワーカーへ計算済みデッキプールを注入する。"""
+    global _opponent_deck_pool
+    _opponent_deck_pool = decks

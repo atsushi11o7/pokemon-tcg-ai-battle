@@ -260,26 +260,14 @@ def _decoder_card_offset() -> int:
 
 # --- カード表のレイアウト ---------------------------------------------------
 # 出現箇所をまたいでカード表を共有する。同じカードは手札でもトラッシュでも同じ
-# 埋め込みを引く(役割はトークン単位のowner/zone埋め込みが区別する)。
+# 埋め込みを引き、役割はトークン単位のowner/zone埋め込みが区別する。
 #
-# 以前は出現箇所ごとに独立した表を持つ`per_role`も選べたが、同条件のA/Bで
-# 62.5%対69.3%と明確に劣ったため削除した。カード表が5倍(2.6M→13.9M)に膨らみ、
-# 1エントリあたりの学習機会が減るのが原因と見られる。
+# 共有できるのは「同一トークン内で同時に出現しない」役割だけ。`EmbeddingBag`はsumなので、
+# 1トークンに複数のカードが入ると全て足され、どのカードがどの役割だったかは復元できない。
 #
-# 共有してよいのは「同一トークン内で同時に出現しない」役割だけ。`EmbeddingBag`はsumなので、
-# 1トークンに複数のカードが入ると全部足され、どのカードがどの役割だったかの対応は失われる
-# (役割ベクトルを足しても加算は交換法則が成り立つため結合できない)。
-# 逆に別トークンにあるものは、network側のowner/zone埋め込みがトークン単位で区別するので
-# 安全に共有できる。
-#
-#   本体 / 道具 / エネルギー … 同じポケモンのトークン内で同居するため分ける(3ブロック)
-#                              ただし4つのポケモン枠(自他 × アクティブ/ベンチ)は
-#                              別トークンなので、枠をまたいで共有する
+#   本体 / 道具 / エネルギー … 同じポケモンのトークン内で同居するため3ブロックに分ける
+#                              (4つのポケモン枠は別トークンなので枠をまたいで共有する)
 #   手札 / デッキ / トラッシュ / スタジアム … すべて別トークンなので1ブロックに統合
-#
-# 結果、エンコーダのカードブロックは17 → 4に減る。
-# レイアウトが変わると`encoder_size`/`decoder_size`が変わるため、学習時と推論時で
-# 食い違えば`load_state_dict`が形状不一致で必ず落ちる(黙って誤動作しない)。
 
 # エンコーダのカード役割。0〜2は同一トークン内で同居しうるので別ブロック、
 # 3は別トークンにしか現れない役割をまとめたもの。
@@ -330,9 +318,7 @@ def _decoder_context_role_offset() -> int:
     return _decoder_card_offset() + _decoder_card_block_count() * card_count()
 
 
-# 残りHP比のバケット数。スカラー1本だと「HPが2割を切ったか」のような閾値的な判断が
-# 表現しにくい(埋め込み行のスカラー倍=1本の直線方向にしかならない)ため、
-# 生のスカラーと併用する形で離散化した表現も与える。
+# 残りHP比のバケット数。生のスカラーと併用する。
 HP_RATIO_BUCKETS = 10
 
 # ターン数のバケット境界。`state.turn`は半ターン単位で進むため、等間隔で切ると
@@ -612,11 +598,8 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         add_energy_type(sv, card.resistance)
         sv.add_single(card.retreatCost / 4)
 
-        # 現在HPの絶対値だけでは、同じ0.3でもHP70のポケモンが満タンなのか
-        # HP340のポケモンが瀕死なのか区別できない。最大HPと残り比率を明示的に渡す。
-        # 最大HPは道具や効果で印刷値から変わるため、KO判定には盤面側の`maxHp`を使う。
-        # 印刷値も渡す。カードの静的属性は出現の少ないカードの汎化に効き、両者の差は
-        # 「HP強化がかかっている」という盤面の状態を表す。
+        # 現在HP・最大HP・残り比率・印刷値のHPを書く。最大HPは道具や効果で印刷値から
+        # 変わるため、KO判定には盤面側の`maxHp`を使う。
         printed_hp = float(card.hp or 0)
         max_hp = float(poke.maxHp or printed_hp)
         sv.add_single(max_hp / 400)
@@ -636,9 +619,7 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         sv.add_single(card.aceSpec)
         sv.add_single(card.tera)
 
-        # タイプ別の付与エネルギー個数。カードIDの重み付き和だけだと「炎が2個以上あるか」
-        # のような閾値がスカラー1方向でしか表現できず、技のコストを満たせるかの判断に
-        # 直結する情報が潰れる。デコーダはアクティブについて既に同じ情報を渡している。
+        # タイプ別の付与エネルギー個数。技のコストを満たせるかの判断に使う。
         _add_energy_counts(sv, 0, energy_unit_counts(poke.energies))
         sv.add_pos(energy_type_count())
 
@@ -655,9 +636,7 @@ def add_pokemon(sv: SparseVector, poke: "Pokemon | None") -> None:
         # このポケモンの技の最大打点。相手側の枠なら脅威度の指標になる。
         sv.add_single(_max_attack_damage(poke.id) / 400)
 
-        # 持っている技そのもの。選択肢として提示された技はデコーダ側で識別できるが、
-        # 盤面としては最大打点しか渡っておらず、相手が何をしてくるかが分からなかった。
-        # 1体の技は同じ役割なので、1ブロックにまとめて書ける。
+        # 持っている技そのもの。1体の技は同じ役割なので1ブロックにまとめて書く。
         for attack_id in card.attacks or []:
             sv.add_absolute(_encoder_attack_offset() + attack_id, 1)
 
@@ -793,9 +772,7 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
     add_unseen(sv, state.players[your_index], your_deck)
 
     # 手札の並び順はルール上意味を持たないので、カードIDでソートして決定的にする。
-    # 最後のスロットは溢れた分の合算。LayerNormが各トークンを正規化するため、
-    # 「和である」ことは大きさからは読み取れない。何枚分かを明示的に書く。
-    # HAND_TOKENS=1のときは、この経路がそのまま「全札を1トークンに合算」になる。
+    # 最後のスロットは溢れた分の合算で、何枚分かを明示的に書く。
     ordered = sorted(state.players[your_index].hand or [], key=lambda card: card.id)
     last = model_config.HAND_TOKENS - 1
     for slot in range(model_config.HAND_TOKENS):
@@ -1033,8 +1010,7 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
             elif o.type == OptionType.SPECIAL_CONDITION:
                 sv.add(_HEAD_SPECIAL_CONDITION + int(o.specialConditionType), 1)
             elif o.type == OptionType.NUMBER:
-                # 個数はバケットと生値の両方。以前は4以上を1つにまとめており、
-                # 「4個捨てる」と「7個捨てる」が同じ表現になっていた。
+                # 個数はバケットと生値の両方を書く。
                 sv.add(_HEAD_NUMBER + min(o.number, NUMBER_BUCKETS - 1), 1)
                 sv.add(_HEAD_NUMBER_RAW, min(o.number, 20) / 20)
             elif o.type == OptionType.ATTACK:
@@ -1042,9 +1018,7 @@ def get_decoder_input(obs: Observation, actions: list[list[int]]) -> SparseVecto
                 attack = attack_table()[o.attackId]
                 numeric_offset = _decoder_attack_numeric_offset()
                 sv.add(numeric_offset + _DECODER_ATTACK_DAMAGE_INDEX, attack.damage / 400)
-                # 素のダメージはデコーダ側、相手の残りHPはエンコーダ側にあり、
-                # 両者を突き合わせる比較は注意機構で学習するしかない形になっていた。
-                # 決定的に計算できるのでここで済ませる。
+                # 弱点・抵抗力を適用した実効ダメージと、それがKOに届くかを書く。
                 opponent = obs.current.players[1 - your_index]
                 defender = opponent.active[0] if opponent.active else None
                 if defender is not None:

@@ -1,15 +1,12 @@
 """Determinized MCTSの自己対戦(selfplay.py)で集めたデータで、価値・方策ネットワークを学習する。
 
 自己対戦→学習→(更新したネットワークで)自己対戦、を繰り返すAlphaZero的なループ。
-自己対戦と固定matchup評価はspawn workerで並列実行し、1試合単位のタイムアウト/例外は
-その試合だけ諦める(cgエンジンはまれにネイティブクラッシュすることがあるため)。
-プロセスごと落ちた場合は統一training CLIが再起動し、保存済みの最新ラウンドの
-チェックポイントから自動で再開する。
+自己対戦と固定matchup評価はspawn workerで並列実行し、1試合単位のタイムアウトや例外は
+その試合だけ諦める。プロセスごと落ちた場合はCLIが再起動し、最新ラウンドから再開する。
 
 設定はすべて`MctsSettings`に入れて引数で引き回す。spawn workerはこのmoduleを
-まっさらに再importするため、module levelの可変状態に設定を置くと、workerだけが
-定義時の既定値を見るという追跡困難なズレが生じる。workerへ渡すものは
-`_SelfplayWorkerContext`に集約し、spawn境界を1箇所に閉じ込める。
+まっさらに再importするため、module levelの可変状態に設定を置くとworkerだけが
+既定値を見ることになる。workerへ渡すものは`_SelfplayWorkerContext`に集約する。
 
 このmoduleは内部trainer。表向きの実行入口は `python -m training.cli`。
 """
@@ -24,39 +21,36 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
-from ..common.checkpoints import (
-    checkpoint_path,
-    optimizer_path,
-    prune_checkpoints,
-    resolve_resume_point,
-    restore_optimizer_state,
+from ..common.deck import SelfplayMode, fixed_deck_seat_for_game
+from ..common.deck_pool import (
+    configure_sampling_snapshot,
+    load_opponent_deck_pool,
+    seed_opponent_deck_pool_cache,
 )
-from ..common.evaluation_plan import build_fixed_matchups
-from ..common.metrics import append_round_metrics
 from ..common.network import (
     PolicyValueNet,
     build_policy_value_net,
     load_policy_value_net,
 )
-from ..common.opponent_pool import (
-    configure_sampling_snapshot,
-    load_opponent_deck_pool,
-    seed_opponent_deck_pool_cache,
-)
+from ..common.parallel import build_fixed_matchups, run_selfplay_round
 from ..common.run_config import (
     RunConfig,
     load_run_config,
     save_config_snapshot,
     validate_algorithm,
 )
-from ..common.selfplay_modes import SelfplayMode, fixed_deck_seat_for_game
-from ..common.selfplay_round import run_selfplay_round
 from ..common.training_utils import (
     ListDataset,
+    append_round_metrics,
+    checkpoint_path,
     collate_samples,
     configure_trainable_parameters,
     masked_policy_loss,
     move_optimizer_state_to,
+    optimizer_path,
+    prune_checkpoints,
+    resolve_resume_point,
+    restore_optimizer_state,
     seed_game,
     training_device,
 )

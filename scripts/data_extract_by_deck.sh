@@ -2,13 +2,13 @@
 # 候補デッキごとの学習データを、1日=1ジョブで並列抽出する。
 #
 # デッキの数だけ走査を繰り返すとJSONの解析が重複する(候補5件で8時間)。
-# extract_bc_samples.py の --deck-spec で1回の走査から全デッキへ振り分けるので、
+# data_extract.py の --deck-spec で1回の走査から全デッキへ振り分けるので、
 # ここは日付方向の並列だけを担う。
 #
 # 出力は <OUT>/<デッキ名>/shard_YYYYMMDD_NNNN.pt。学習側は日付順に並ぶ前提で
 # 末尾(最新日)を検証に使うため、シャード名に日付を入れておく必要がある。
 #
-# Usage: ./scripts/extract_decks.sh <出力先> <並列数> <リーダーボードCSV> <最低スコア> <デッキ名...>
+# Usage: ./scripts/data_extract_by_deck.sh <出力先> <並列数> <リーダーボードCSV> <最低スコア> <デッキ名...>
 set -u
 OUT=${1:?出力先}
 JOBS=${2:-3}
@@ -33,7 +33,7 @@ run_one() {
     echo "$(date +%T) skip $date"; return
   fi
   echo "$(date +%T) start $date"
-  if uv run python -u scripts/extract_bc_samples.py \
+  if uv run python -u scripts/data_extract.py \
       --zips "$zip" --output "$out" --shard-size 50000 --shard-prefix "$stamp" \
       --min-jaccard 0.5 --ratings "$ratings" --min-winner-rating "$min_rating" \
       "$@" > "$out/.log_$stamp" 2>&1; then

@@ -5,7 +5,7 @@
 set -u
 OUT=${1:-data/bc/shards_dated}
 JOBS=${2:-4}
-# 3番目以降は extract_bc_samples.py へそのまま渡す(例: --imitate-loser)。
+# 3番目以降は data_extract.py へそのまま渡す(例: --imitate-loser)。
 shift 2 2>/dev/null || true
 EXTRA=("$@")
 # 環境変数で日付範囲を絞れる。質の低い期間(6月は勝者レート中央値637〜835で、
@@ -25,7 +25,7 @@ run_one() {
   fi
   rm -rf "$tmp"; mkdir -p "$tmp"
   echo "$(date +%T) start $date"
-  if uv run python -u scripts/extract_bc_samples.py --zips "$zip" --output "$tmp" --shard-size 50000 "$@" \
+  if uv run python -u scripts/data_extract.py --zips "$zip" --output "$tmp" --shard-size 50000 "$@" \
       > "$out/.log_$stamp" 2>&1; then
     local i=0
     for f in "$tmp"/shard_*.pt; do
