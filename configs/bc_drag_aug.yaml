@@ -1,0 +1,56 @@
+run:
+  name: bc_drag_aug
+  output_dir: outputs/runs/bc_drag_aug
+
+algorithm: bc
+
+model:
+  # 広めのDragapult特化(stage1)の重み。8/12の検証で勝ち局面75.49%と、
+  # #36の実提出重み(bc_dragapult_gold round4、ラダー907.5)の75.03%をわずかに上回る。
+  # #36は金帯の単一構築(Jaccard>=0.9)で仕上げたものだが、今回は8月全体の広い集合を
+  # 学習するので、幅の合うstage1側から始める。
+  initial_checkpoint: outputs/runs/bc_dragapult/checkpoints/generalist_round11.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  shard_dir: data/bc/decks/drag_any
+  # 8月のみ(8/01〜8/15、56シャード)。7月を落とすのはメタが動いているため。
+  # 金帯のDragapultは8/14の37.9%から8/15の45.3%へ拡大しており、直近ほど手本として近い。
+  min_shard_day: "20260801"
+  # 勝ち試合のみを方策の教師にする。`label<0`(自分が負けた局面)のone-hotを0倍するので、
+  # 残るのはDragapultが勝った試合の指し手だけになる。負けた試合の局面は価値の教師
+  # としては残る(方策の勾配は出ない)。
+  #
+  # 直前のbc_drag_anyは負け試合も方策の教師にしたが、8エポック回して一度も
+  # 開始時を超えなかった。勝ち局面の精度が75.49%->72.5%へ落ちる一方、
+  # 負け局面は69.71%->69.71%とほぼ動かず、失っただけで得るものが無かった。
+  # Grimmsnarl(方策ほぼ横ばい、価値43.4%->76.8%)とは結果が異なる。
+  loser_policy_weight: 0.0
+  freeze_policy: false
+  # 検証を行わず、56シャードすべてを学習に入れる。指標は既に揃っており、
+  # 締切までの時間ではデータ量を優先する。`val_shards: 0`で`holdout`が0になり、
+  # 分割せず全シャードが学習側へ回る。
+  val_shards: 0
+  holdout_shards: 0
+  # 直前の1e-4は検証損失が0.77->0.92->0.85と振動した。シャード数が
+  # Grimmsnarl(266枚)の1/5なので半分に落とす。検証が無い分、安全側に倒す。
+  learning_rate: 0.00005
+  rounds: 8
+  batch_size: 256
+  # 探索を実質無効化して提出するので、価値ヘッドは使わない。損失の3割を価値へ割くと
+  # 共有トランクの容量がそちらへ移り、方策が薄まる。直前のbc_drag_any(0.3)は
+  # まさにその形で、方策75.49%->72.5%と引き換えに価値62.3%->73.9%になっていた。
+  # #34(1046.1)も、この重みの出所であるbc_dragapultも0.1。同じ値に戻す。
+  # 0にしないのは、価値ヘッドを現在のほぼ定数(+1)の状態から動かさないため。
+  # その状態のMCTSは「自分の手番が多く回る手順を選ぶ」無害な挙動に留まる。
+  value_loss_coef: 0.1
+  warmup_steps: 300

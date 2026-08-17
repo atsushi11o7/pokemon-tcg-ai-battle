@@ -1,0 +1,48 @@
+run:
+  name: bc_grimm_win
+  output_dir: outputs/runs/bc_grimm_win
+
+algorithm: bc
+
+model:
+  # #41(提出済み、1.5時間時点で910.4)の重み。270シャード・1,280万サンプルと、
+  # これまでで最も多くの試合を学習した重みで、そこは残したい。
+  # #41は#38(1043.3)を下回っている。疑わしいのは(1)負け試合の方策教師と
+  # (2)価値ヘッド経由の探索の2つ。ここでは(1)を勝ち試合だけの再調整で潰し、
+  # (2)は提出時に探索を切って潰す。
+  # なお方策精度で見る限り(1)の害は出ていない(#38 81.68% / #41 81.63%)。
+  # 指標が捉えていない変化の可能性があるので、指標ではなくラダーで判定する。
+  initial_checkpoint: outputs/runs/bc_grimm_any/checkpoints/final.pt
+
+data:
+  sampling_snapshot: data/meta/derived/sampling_snapshot.json
+
+runtime:
+  seed: 0
+  workers: 2
+  max_restarts: 5
+  retry_delay_seconds: 5
+  keep_last_checkpoints: 0
+
+training:
+  shard_dir: data/bc/decks/grimm_any
+  # 期間で絞らず7/16〜8/15の全270シャードを使う。勝ち試合のみにすると方策の教師が
+  # 約半分になる(grimm_anyは教師の49%が負け試合由来)ので、実質135シャード相当。
+  # #34(1046.1)の138シャードとほぼ同等の量になる。8月だけに絞ると57シャード相当まで
+  # 落ちるため、量を優先した。Grimmsnarlの金帯3構築は参照リストとJaccard 0.875で
+  # 骨格が変わっておらず、7月のリプレイも「このデッキの操縦」の教師としては今も有効。
+  # 勝ち試合のみを方策の教師にする。負けた局面は価値の教師としてのみ残る。
+  loser_policy_weight: 0.0
+  freeze_policy: false
+  # 検証を行わず全シャードを学習に入れる。
+  val_shards: 0
+  holdout_shards: 0
+  # 既に6エポック回した重みの手直しなので、本学習(1e-4)の1/5に留める。
+  # 目的は「負け試合の手に引かれた分を勝ち試合側へ戻す」ことで、作り直しではない。
+  learning_rate: 0.00002
+  rounds: 3
+  batch_size: 256
+  # 探索を切って提出するので価値ヘッドは使わない。共有トランクを揺らさないよう
+  # #34の学習時と同じ0.1まで下げ、方策を守る。
+  value_loss_coef: 0.1
+  warmup_steps: 200
