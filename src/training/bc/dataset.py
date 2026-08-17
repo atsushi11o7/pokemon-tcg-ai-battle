@@ -79,7 +79,12 @@ def iter_decisions(
 
 
 def extract_episode(
-    replay: dict, stats: Counter, *, winner_only: bool = True, imitate_loser: bool = False
+    replay: dict,
+    stats: Counter,
+    *,
+    winner_only: bool = True,
+    imitate_loser: bool = False,
+    policy_seats: frozenset[int] | None = None,
 ) -> list[Sample]:
     """1エピソードのリプレイから学習サンプルを作る。
 
@@ -97,6 +102,11 @@ def extract_episode(
         stats: 除外理由の内訳を積む集計用カウンタ。
         winner_only: Trueなら敗者の局面自体を集めない(価値の教師も+1だけになる)。
         imitate_loser: Trueなら敗者の手もone-hotで模倣する。
+        policy_seats: 指定するとその席にだけ方策の教師を付ける(勝敗を問わない)。
+            「このデッキの操縦を学ぶ」ためのモード。負けた試合から集めるとき、
+            既定では勝者=相手のデッキに教師が付いてしまい、別のデッキの操縦を
+            覚えることになる。席を指定すれば、勝ち負け両方から同じデッキの
+            指し手だけを取り出せる。ミラー戦では両席を渡せば2通り分取れる。
 
     Returns:
         list[Sample]: 方策の教師は勝者one-hot/敗者ゼロ、価値の教師は勝敗(+1/-1)。
@@ -137,7 +147,8 @@ def extract_episode(
 
         won = seat == winner
         policy_target = [0.0] * len(actions)
-        if won or imitate_loser:
+        teach = (seat in policy_seats) if policy_seats is not None else (won or imitate_loser)
+        if teach:
             policy_target[target_index] = 1.0
             stats["policy_samples"] += 1
         else:

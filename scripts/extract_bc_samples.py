@@ -56,20 +56,39 @@ def accept_episode(
     min_rating: float,
     stats: Counter,
     *,
-    loser_side: bool = False,
+    side: str = "winner",
 ) -> bool:
     """デッキ類似度とレーティングでエピソードを採否する。
 
-    既定では勝者側を見る。`loser_side`のときは「そのデッキで負けた試合」を採る。
+    `side`は見る席の決め方。`winner`は勝者、`loser`は「そのデッキで負けた試合」、
+    `any`は勝敗を問わずそのデッキが現れた試合すべて。
+
     勝った試合しか集めないと、自分のデッキが劣勢にある局面をモデルが一度も見ない。
-    価値ヘッドにその局面を教えるための集合をここで切り出す(方策の教師には使わない)。
+    `any`と`--policy-on-deck`を組み合わせると、勝ち負け両方から同じデッキの指し手を
+    1回の走査で集められる。
     """
     if deck is None and min_rating <= 0:
+        return True
+    if side == "any":
+        seats = deck_seats(replay, deck, min_jaccard)
+        if deck is not None and not seats:
+            stats["skip_deck_mismatch"] += 1
+            return False
+        if min_rating > 0:
+            names = (replay.get("info") or {}).get("TeamNames", [None, None])
+            scores = [ratings.get(names[s]) for s in sorted(seats)]
+            best = max((s for s in scores if s is not None), default=None)
+            if best is None:
+                stats["skip_rating_unknown"] += 1
+                return False
+            if best < min_rating:
+                stats["skip_rating_low"] += 1
+                return False
         return True
     winner = winning_seat(replay)
     if winner is None:
         return True  # 引き分けはextract_episode側で落ちる
-    seat = (1 - winner) if loser_side else winner
+    seat = (1 - winner) if side == "loser" else winner
     if min_rating > 0:
         score = ratings.get((replay.get("info") or {}).get("TeamNames", [None, None])[seat])
         if score is None:
@@ -86,6 +105,25 @@ def accept_episode(
             stats["skip_deck_mismatch"] += 1
             return False
     return True
+
+
+def deck_seats(replay: dict, deck: Counter | None, min_jaccard: float) -> frozenset[int]:
+    """基準デッキを握っている席をすべて返す。該当なしなら空集合。
+
+    負けた試合を教師にするとき、既定の「勝者にone-hot」では相手のデッキの操縦を
+    覚えてしまう。席を特定して、勝敗を問わずそのデッキの指し手だけを集める。
+
+    ミラー戦では両席とも該当する。最も似た1席だけを選ぶと、同じ試合から取れる
+    2通りの指し手のうち片方を捨てることになるので、閾値を満たす席をすべて返す。
+    """
+    if deck is None:
+        return frozenset()
+    decks = episode_decks(replay.get("steps") or [])
+    if decks is None:
+        return frozenset()
+    return frozenset(
+        seat for seat, d in enumerate(decks) if deck_similarity(deck, Counter(d)) >= min_jaccard
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,14 +145,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-winner-rating", type=float, default=0.0)
     parser.add_argument(
+        "--side",
+        choices=("winner", "loser", "any"),
+        default="winner",
+        help="--deck-likeで見る席。anyは勝敗を問わずそのデッキが現れた試合をすべて採る",
+    )
+    parser.add_argument(
         "--deck-spec",
         action="append",
         default=[],
-        metavar="NAME=CSV",
-        help="複数デッキを1回の走査で振り分ける。出力は<output>/<NAME>/。--deck-likeとは併用しない",
+        metavar="NAME=CSV[:jaccard[:rating[:side]]]",
+        help="複数デッキを1回の走査で振り分ける。出力は<output>/<NAME>/。"
+        "sideはwinner(既定)/loser/any。--deck-likeとは併用しない",
     )
     parser.add_argument(
         "--shard-prefix", default=None, help="シャード名に入れる識別子(例: 20260813)"
+    )
+    parser.add_argument(
+        "--policy-on-deck",
+        action="store_true",
+        help="勝敗を問わず、基準デッキを握る席にだけ方策の教師を付ける",
     )
     return parser.parse_args()
 
@@ -132,18 +182,22 @@ def main() -> int:
             # 量を稼ぐ広い集合と仕上げ用の狭い集合を1回の走査で同時に作る。
             name, _, rest = spec.partition("=")
             parts = rest.split(":")
-            loser = len(parts) > 3 and parts[3] == "loser"
+            side = parts[3] if len(parts) > 3 and parts[3] else "winner"
+            if side not in ("winner", "loser", "any"):
+                raise SystemExit(f"--deck-spec の側指定が不正: {side!r}")
             jaccard = float(parts[1]) if len(parts) > 1 and parts[1] else args.min_jaccard
             rating = float(parts[2]) if len(parts) > 2 and parts[2] else args.min_winner_rating
             deck = Counter(int(x) for x in Path(parts[0]).read_text().split() if x.strip())
-            buckets.append((name, deck, args.output / name, jaccard, rating, loser))
+            buckets.append((name, deck, args.output / name, jaccard, rating, side))
     else:
         reference = None
         if args.deck_like is not None:
             reference = Counter(int(x) for x in args.deck_like.read_text().split() if x.strip())
-        buckets.append(("", reference, args.output, args.min_jaccard, args.min_winner_rating))
+        buckets.append(
+            ("", reference, args.output, args.min_jaccard, args.min_winner_rating, args.side)
+        )
 
-    for _name, _deck, out, _j, _r, _l in buckets:
+    for _name, _deck, out, _j, _r, _side in buckets:
         out.mkdir(parents=True, exist_ok=True)
     stats: Counter = Counter()
     per: dict[str, Counter] = {b[0]: Counter() for b in buckets}
@@ -159,17 +213,28 @@ def main() -> int:
         if args.max_episodes and stats["episodes"] >= args.max_episodes:
             break
         samples = None
-        for name, deck, out, jaccard, rating, loser in buckets:
-            if not accept_episode(
-                replay, deck, jaccard, ratings, rating, per[name], loser_side=loser
-            ):
+        for name, deck, out, jaccard, rating, side in buckets:
+            if not accept_episode(replay, deck, jaccard, ratings, rating, per[name], side=side):
                 continue
             # 採用されたバケツが1つでもあれば局面を作る。複数に入る場合も作り直さない。
-            if samples is None:
-                samples = extract_episode(
-                    replay, stats, winner_only=args.winner_only, imitate_loser=args.imitate_loser
+            # `--policy-on-deck`はバケツごとに席が変わるので、共有せず都度作る。
+            if args.policy_on_deck:
+                made = extract_episode(
+                    replay,
+                    stats,
+                    winner_only=args.winner_only,
+                    policy_seats=deck_seats(replay, deck, jaccard),
                 )
-            buffers[name].extend(samples)
+            else:
+                if samples is None:
+                    samples = extract_episode(
+                        replay,
+                        stats,
+                        winner_only=args.winner_only,
+                        imitate_loser=args.imitate_loser,
+                    )
+                made = samples
+            buffers[name].extend(made)
             per[name]["episodes"] += 1
             while len(buffers[name]) >= args.shard_size:
                 torch.save(buffers[name][: args.shard_size], out / shard_name(indices[name]))
@@ -180,7 +245,7 @@ def main() -> int:
                     flush=True,
                 )
 
-    for name, _deck, out, _j, _r, _l in buckets:
+    for name, _deck, out, _j, _r, _side in buckets:
         if buffers[name]:
             torch.save(buffers[name], out / shard_name(indices[name]))
             indices[name] += 1
