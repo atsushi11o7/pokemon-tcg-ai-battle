@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from training.common.metrics import append_round_metrics
+from training.common.training_utils import append_round_metrics
 
 
 class MetricsTest(unittest.TestCase):

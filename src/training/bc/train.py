@@ -23,23 +23,21 @@ import torch
 import torch.nn.functional as functional
 from torch.utils.data import DataLoader
 
-from ..common.checkpoints import (
-    checkpoint_path,
-    optimizer_path,
-    prune_checkpoints,
-    resolve_resume_point,
-    restore_optimizer_state,
-)
-from ..common.metrics import append_round_metrics
 from ..common.network import PolicyValueNet, build_policy_value_net, load_policy_value_net
 from ..common.run_config import RunConfig, load_run_config, save_config_snapshot, validate_algorithm
 from ..common.training_utils import (
     LengthBucketSampler,
     ListDataset,
+    append_round_metrics,
+    checkpoint_path,
     collate_samples,
     configure_trainable_parameters,
     masked_policy_loss,
     move_optimizer_state_to,
+    optimizer_path,
+    prune_checkpoints,
+    resolve_resume_point,
+    restore_optimizer_state,
     training_device,
 )
 from .dataset import load_shard, load_shard_paths, shard_sample_counts

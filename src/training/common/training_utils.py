@@ -1,8 +1,17 @@
-"""trainer(MCTS/PPO/BC)とspawnワーカーが共通で使う、学習まわりの小さなユーティリティ。"""
+"""trainer(MCTS/PPO/BC)とspawnワーカーが共通で使う、学習まわりのユーティリティ。
+
+デバイスと乱数、バッチ化と損失、チェックポイントの入出力、ラウンド指標の記録をまとめる。
+"""
 
 from __future__ import annotations
 
+import json
 import random
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as functional
@@ -12,21 +21,16 @@ from .network import PolicyValueNet, collate_encoder_decoder
 
 
 def training_device() -> torch.device:
-    """学習(train_one_round)に使うデバイスを返す。
+    """学習に使うデバイスを返す。
 
-    module import時ではなく呼び出し時に判定する。trainerモジュールはspawnワーカーで
-    毎回まるごと再importされるため、import時に`torch.cuda.is_available()`を評価すると
-    ワーカーが使いもしないCUDA初期化を1プロセスにつき1回払うことになる。
+    spawnワーカーはtrainerモジュールを毎回再importするため、import時ではなく
+    呼び出し時に判定して、使わないCUDA初期化を避ける。
     """
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def seed_game(seed: int) -> None:
-    """1試合分の乱数を再シードする。
-
-    Python側(デッキ抽選・隠れ情報のサンプリング)とtorch側(方策からのサンプリング)の
-    両方を揃えて振り直し、どのワーカーがその試合を引いても結果が変わらないようにする。
-    """
+    """1試合分の乱数を、Python側とtorch側の両方で再シードする。"""
     random.seed(seed)
     torch.manual_seed(seed)
 
@@ -34,9 +38,8 @@ def seed_game(seed: int) -> None:
 def move_optimizer_state_to(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
     """optimizerのモーメント推定を`device`へ移す。
 
-    checkpointから復元した状態は保存時のデバイスに乗っていることがある
-    (例: GPUで保存 → CPU上のnetworkでoptimizerを作ってからload_state_dict)。
-    network側のパラメータとデバイスを揃えないとstep()で失敗する。
+    checkpointから復元した状態は保存時のデバイスに乗っていることがあり、
+    networkのパラメータとデバイスが揃っていないとstep()で失敗する。
     """
     for state in optimizer.state.values():
         for key, value in state.items():
@@ -45,10 +48,7 @@ def move_optimizer_state_to(optimizer: torch.optim.Optimizer, device: torch.devi
 
 
 class ListDataset(Dataset):
-    """学習サンプルのリストをそのまま`DataLoader`へ渡すためのDataset。
-
-    バッチ化は`collate_fn`側が行うため、ここでは要素をそのまま返すだけでよい。
-    """
+    """学習サンプルのリストをそのまま`DataLoader`へ渡すためのDataset。"""
 
     def __init__(self, samples: list) -> None:
         self.samples = samples
@@ -62,9 +62,6 @@ class ListDataset(Dataset):
 
 def collate_samples(batch: list):
     """`Sample`のリストをバッチ化する。MCTS・BCで共通。
-
-    `Sample.policy_target`は方策の教師分布。MCTSでは訪問回数の正規化、BCでは
-    実際に選ばれた手のone-hotが入る。どちらも「合法手上の分布」なので同じ扱いでよい。
 
     Args:
         batch: `Sample`のリスト。`label`(価値の教師)が埋まっている必要がある。
@@ -105,9 +102,7 @@ def masked_policy_loss(
 ) -> torch.Tensor:
     """パディングを除外した上で、方策の教師分布に対する交差エントロピーを返す。
 
-    BCは価値だけを学ばせたいサンプル(敗者の局面)の`policy_target`を全ゼロにする。
-    バッチ全体で平均すると、それらが分母にだけ入って方策の勾配が薄まるため、
-    教師を持つサンプル数で割る。MCTSは全サンプルが教師を持つので挙動は変わらない。
+    教師が全ゼロのサンプル(価値だけ学ばせる局面)は分母から外す。
 
     Args:
         scores: 形状`(batch, max_actions)`の生スコア。
@@ -116,7 +111,8 @@ def masked_policy_loss(
     """
     masked_scores = scores.masked_fill(~mask, float("-inf"))
     log_probs = functional.log_softmax(masked_scores, dim=-1)
-    log_probs = log_probs.masked_fill(~mask, 0.0)  # -inf*0のnan化を防ぐ(教師も0なので影響なし)
+    # -inf * 0 のnan化を防ぐ。教師も0なので値には影響しない。
+    log_probs = log_probs.masked_fill(~mask, 0.0)
     per_sample = -(policy_targets * log_probs).sum(dim=-1)
     supervised = policy_targets.sum(dim=-1) > 0
     n = int(supervised.sum().item())
@@ -128,11 +124,7 @@ def masked_policy_loss(
 class LengthBucketSampler(Sampler):
     """行動数が近いサンプルを同じバッチにまとめ、デコーダのパディングを減らす。
 
-    行動数は中央値5・平均7に対して最大64まで開く。無作為に256件集めると
-    バッチ内の最大がほぼ常に64になり、実測でパディング率86%、学習1ステップは
-    max_actions=8のときの約1.5倍かかっていた。
-
-    バッチ内の順序と、バッチ自体の出現順はエポックごとにシャッフルするので、
+    バッチ内の順序とバッチ自体の出現順はエポックごとにシャッフルするので、
     確率的勾配降下としての性質は保たれる。
     """
 
@@ -144,7 +136,8 @@ class LengthBucketSampler(Sampler):
     def __iter__(self):
         order = list(range(len(self.lengths)))
         if self.shuffle:
-            random.shuffle(order)  # 同じ長さの中での並びを毎エポック変える
+            # 同じ長さの中での並びを毎エポック変える。
+            random.shuffle(order)
         order.sort(key=lambda i: self.lengths[i])
         batches = [order[i : i + self.batch_size] for i in range(0, len(order), self.batch_size)]
         if self.shuffle:
@@ -160,15 +153,13 @@ def configure_trainable_parameters(
 ) -> list[torch.nn.Parameter]:
     """`requires_grad`を設定し、更新対象のパラメータを返す。
 
-    `freeze_policy`のとき`encoder_fc`だけを更新する。方策側は`encoder`の出力全体へ交差注意し、
-    `encoder_fc`はCLSトークンから価値を読むだけなので、ここだけ動かせば方策の出力は
-    ビット単位で不変になる。模倣学習で得た方策を保ったまま、価値の精度だけ上げたいときに使う。
+    `freeze_policy`のときは`encoder_fc`(価値ヘッド)だけを更新する。方策側は
+    `encoder`の出力全体へ交差注意し、`encoder_fc`はCLSトークンから価値を読むだけなので、
+    ここだけ動かせば方策の出力はビット単位で不変になる。
 
-    optimizerへ渡す集合を絞るだけでは足りない。`requires_grad`が立ったままだと autograd が
-    encoder/decoder の計算グラフを保持して逆伝播し、`optimizer.zero_grad()`の対象外である
-    それらの`.grad`がバッチをまたいで溜まり続ける。更新はされないので出力は変わらず、
-    計算とメモリだけを捨てることになる。設定と選択を1つの関数に閉じ込めて、
-    optimizerを作るたびに必ず両方が揃うようにしている。
+    `requires_grad`を落とさずoptimizerへ渡す集合を絞るだけでは、autogradが
+    encoder/decoderの計算グラフを保持したまま逆伝播し、計算とメモリを無駄に払う。
+    設定と選択を1つの関数に閉じ込めて、両方が必ず揃うようにしている。
     """
     for parameter in network.parameters():
         parameter.requires_grad_(not freeze_policy)
@@ -177,3 +168,157 @@ def configure_trainable_parameters(
     for parameter in network.encoder_fc.parameters():
         parameter.requires_grad_(True)
     return list(network.encoder_fc.parameters())
+
+
+def latest_checkpoint_round(checkpoint_dir: Path, selfplay_mode: str) -> int | None:
+    """``{mode}_roundN.pt``のうち最大のNを返す。optimizer/finalは除外する。"""
+    pattern = re.compile(rf"{re.escape(selfplay_mode)}_round(\d+)\.pt$")
+    rounds = [
+        int(match.group(1))
+        for path in checkpoint_dir.glob(f"{selfplay_mode}_round*.pt")
+        if (match := pattern.match(path.name))
+    ]
+    return max(rounds) if rounds else None
+
+
+def restore_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: Path,
+    *,
+    learning_rate: float,
+) -> None:
+    """optimizerの履歴を復元し、実行中の設定でlearning rateを上書きする。
+
+    保存されたoptimizer stateには当時のlearning rateも含まれるため、
+    上書きしないとrun configの変更が再開時に反映されない。
+    """
+    optimizer.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+
+def checkpoint_path(checkpoint_dir: Path, selfplay_mode: str, round_num: int) -> Path:
+    """ラウンド末に保存するネットワーク重みのパス。"""
+    return checkpoint_dir / f"{selfplay_mode}_round{round_num}.pt"
+
+
+def optimizer_path(checkpoint_dir: Path, selfplay_mode: str, round_num: int) -> Path:
+    """`checkpoint_path`に対応するoptimizer状態のパス。"""
+    return checkpoint_dir / f"{selfplay_mode}_round{round_num}_optimizer.pt"
+
+
+@dataclass(frozen=True)
+class ResumePoint:
+    """再開時にどの重み・どのラウンドから始めるか。"""
+
+    initial_checkpoint: Path | None
+    optimizer_checkpoint: Path | None
+    start_round: int
+
+
+def resolve_resume_point(
+    checkpoint_dir: Path,
+    selfplay_mode: str,
+    run_name: str,
+    configured_initial: Path | None,
+    *,
+    rollback_to: int | None = None,
+) -> ResumePoint:
+    """保存済みチェックポイントがあれば再開点を、無ければ初期チェックポイントを返す。
+
+    Args:
+        checkpoint_dir: `{mode}_round{N}.pt`を保存しているディレクトリ。
+        selfplay_mode: チェックポイント名に含まれる自己対戦モード。
+        run_name: ログ出力に使うrun名。
+        configured_initial: run configの`model.initial_checkpoint`。
+        rollback_to: これより新しいチェックポイントを信用せず巻き戻す先のラウンド。
+            MCTSはチェックポイント保存とtraining state保存の間で落ちうるため、
+            training state側の完了ラウンドを渡して整合するところまで戻す。
+
+    Returns:
+        ResumePoint: 再開に使う重み・optimizer・開始ラウンド。
+    """
+    latest_round = latest_checkpoint_round(checkpoint_dir, selfplay_mode)
+    if (
+        latest_round is not None
+        and rollback_to is not None
+        and rollback_to < latest_round
+        and checkpoint_path(checkpoint_dir, selfplay_mode, rollback_to).exists()
+    ):
+        print(
+            f"warning: round {latest_round} checkpoint has no matching training state; "
+            f"rolling back resume to atomic round {rollback_to}"
+        )
+        latest_round = rollback_to
+
+    if latest_round is not None:
+        optimizer_candidate = optimizer_path(checkpoint_dir, selfplay_mode, latest_round)
+        print(f"resuming {run_name} from round {latest_round} (start_round={latest_round + 1})")
+        return ResumePoint(
+            initial_checkpoint=checkpoint_path(checkpoint_dir, selfplay_mode, latest_round),
+            optimizer_checkpoint=optimizer_candidate if optimizer_candidate.exists() else None,
+            start_round=latest_round + 1,
+        )
+
+    if configured_initial is not None and not configured_initial.exists():
+        raise FileNotFoundError(f"initial checkpoint does not exist: {configured_initial}")
+    print(f"starting {run_name} from initial checkpoint {configured_initial}")
+    return ResumePoint(
+        initial_checkpoint=configured_initial, optimizer_checkpoint=None, start_round=1
+    )
+
+
+def prune_checkpoints(checkpoint_dir: Path, selfplay_mode: str, keep_last: int) -> int:
+    """直近`keep_last`ラウンド分だけ残し、それより古いラウンドの重みを削除する。
+
+    `final.pt`とtraining state(replay/pool)は対象外。
+
+    Args:
+        checkpoint_dir: チェックポイントの保存先。
+        selfplay_mode: チェックポイント名に含まれる自己対戦モード。
+        keep_last: 残す最新ラウンド数(0以下なら何も削除しない)。
+
+    Returns:
+        int: 削除したファイル数。
+    """
+    if keep_last <= 0:
+        return 0
+    pattern = re.compile(rf"{re.escape(selfplay_mode)}_round(\d+)\.pt$")
+    rounds = sorted(
+        int(match.group(1))
+        for path in checkpoint_dir.glob(f"{selfplay_mode}_round*.pt")
+        if (match := pattern.match(path.name))
+    )
+    removed = 0
+    for round_num in rounds[:-keep_last]:
+        for path in (
+            checkpoint_path(checkpoint_dir, selfplay_mode, round_num),
+            optimizer_path(checkpoint_dir, selfplay_mode, round_num),
+        ):
+            if path.exists():
+                path.unlink()
+                removed += 1
+    return removed
+
+
+def append_round_metrics(path: Path, round_num: int, **fields: Any) -> None:
+    """1ラウンド分の指標を1行のJSONとして`metrics.jsonl`へ追記する。
+
+    学習を止めたくないので、書き込みに失敗しても例外は投げず警告だけ出す。
+
+    Args:
+        path: 追記先の`metrics.jsonl`。
+        round_num: ラウンド番号。
+        **fields: 記録したい値(勝敗内訳、損失、採用可否など)。
+    """
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "round": round_num,
+        **fields,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError as exc:
+        print(f"  warning: could not append metrics to {path}: {exc}")

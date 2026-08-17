@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from training.common.checkpoints import latest_checkpoint_round, restore_optimizer_state
+from training.common.training_utils import latest_checkpoint_round, restore_optimizer_state
 
 
 class CheckpointDiscoveryTest(unittest.TestCase):
